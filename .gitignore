@@ -1,0 +1,8 @@
+zig-out/
+zig-cache/
+.zig-cache/
+ghostty-lib/libghostty.so
+ghostty-lib/ghostty.h
+.claude/
+.session
+.session.swp

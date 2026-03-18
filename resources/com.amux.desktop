@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=amux
+Comment=Terminal multiplexer powered by Ghostty
+Exec=amux
+Icon=com.amuxterm.linux
+Terminal=false
+Type=Application
+Categories=System;TerminalEmulator;
+StartupWMClass=com.amuxterm.linux

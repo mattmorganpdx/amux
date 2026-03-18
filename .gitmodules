@@ -1,0 +1,4 @@
+[submodule "ghostty"]
+	path = ghostty
+	url = https://github.com/mattmorganpdx/ghostty.git
+	branch = matt/linux-embedded-apprt

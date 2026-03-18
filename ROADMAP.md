@@ -118,6 +118,23 @@ The sidebar already shows metadata, but the agent can't easily see its own state
 - [ ] **Workspace templates** — create workspaces with pre-configured splits and titles (e.g., "SSH session" template with two panes)
 - [ ] **Auto-workspace naming** — infer workspace name from the first command sent or the working directory
 
+### Terminal history & audit trail
+
+One of the key values of watching an agent work in amux is seeing what it does. These features make that observable history persistent and browsable — so you can review any session after the fact, not just while it's live.
+
+**Scrollback persistence**
+- [ ] **Save full scrollback on exit** — when a terminal pane closes (or amux exits), persist the complete scrollback buffer to disk
+- [ ] **Load scrollback on restore** — when session restore reopens a pane, reload its scrollback so you can scroll up and see everything from the previous run
+- [ ] **Configurable retention** — max scrollback lines to persist per pane, with a sensible default (e.g., 50k lines)
+
+**Session history browser**
+- [ ] **Terminal session log** — maintain an index of every terminal session that has existed: surface ID, workspace name, start time, end time, working directory, shell
+- [ ] **`amux-cli history list`** — CLI command to list past sessions with timestamps and metadata
+- [ ] **`amux-cli history show <session>`** — retrieve the full saved scrollback for a past session
+- [ ] **`amux-cli history search <pattern>`** — search across all saved session scrollbacks (grep through history)
+- [ ] **In-app history browser** — GUI panel to browse past sessions, preview scrollback, and optionally restore a session's working directory in a new pane
+- [ ] **Session tagging** — tag sessions with labels (e.g., "deploy 2026-03-18", "debug auth bug") for easier retrieval
+
 ### Reliability
 
 - [ ] **`workspace next`/`previous` wrap-around** — currently errors at boundaries, should optionally wrap

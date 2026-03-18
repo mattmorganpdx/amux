@@ -138,4 +138,4 @@ Built by Matt Morgan and Claude.
 
 ## License
 
-TBD
+[MIT](LICENSE)

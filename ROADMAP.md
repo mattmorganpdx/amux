@@ -99,16 +99,33 @@ The Bash routing hook (Phase 1 complete) proved the concept: intercepting comman
 - [ ] Handle "command is done" detection via prompt pattern matching
 - [ ] Timeout fallback with partial output
 
-**Phase 3: Smart command classification**
-- [ ] Classify commands by behavior: pure reads (direct Bash), builds (dedicated pane), interactive (amux pane)
-- [ ] Learn from timeouts — if a command times out via Bash, auto-route through amux next time
-- [ ] Per-workspace routing: builds go to "build" pane, SSH to "remote" pane
-
 **`amux-cli run` command**
 - [x] New CLI command that combines send + poll + return output in one call
 - [x] Handles the polling loop server-side for reliability
 - [x] Configurable timeout (`--timeout`) and prompt detection (`--prompt-pattern`)
 - [ ] This is the key primitive that makes transparent routing work — integrate with agent hooks
+
+**Phase 3: Smart Wake (event-driven polling replacement)**
+
+Currently when an agent runs a long command (like `apt upgrade`), it has to sleep for a fixed interval and re-poll terminal state — wasting turns and tokens on dead reads where nothing changed. But a pure completion-callback model won't work either: the agent needs to **see** the terminal because commands can launch unexpected TUIs (dpkg config prompts, interactive installers) that require navigation. Smart Wake moves the polling loop from the agent into amux. amux watches the terminal buffer on a fast local loop (cheap) and wakes the agent (expensive) only when something interesting happens.
+
+- [ ] **`surface.watch` socket method** — register a surface for event monitoring, returns a stream of wake events
+- [ ] **Output stall detection** — content was flowing but stopped for N seconds (likely waiting for input)
+- [ ] **Alternate screen / TUI detection** — cursor position jumps, fullscreen redraw, or terminal enters alternate screen mode (ncurses-style TUI launched)
+- [ ] **Interactive prompt patterns** — detect `[Y/n]`, `(yes/no)`, password prompts, `sudo` prompts, etc.
+- [ ] **Screen geometry shift** — content changes shape inconsistent with normal line-by-line scrolling
+- [ ] **Command completion** — shell prompt returns after a command was running (extends `surface.run` prompt detection)
+- [ ] **Wake reason classification** — each wake event includes a `wake_reason` field (`output_stalled`, `tui_detected`, `prompt_waiting`, `command_complete`) so the agent can orient without re-reading everything
+- [ ] **Periodic fallback timeout** — configurable max silence interval so the agent still gets woken up as a safety net
+- [ ] **`amux-cli watch` command** — CLI interface that blocks until a wake event, prints the event + current terminal state
+- [ ] **Multi-pane watch** — monitor multiple surfaces simultaneously, wake the agent about whichever one needs attention first
+
+This is the key architectural shift from "agent drives the event loop" to "amux drives the event loop and the agent is the handler." It preserves the agent's ability to react to anything on screen while eliminating wasted polling turns.
+
+**Phase 4: Smart command classification**
+- [ ] Classify commands by behavior: pure reads (direct Bash), builds (dedicated pane), interactive (amux pane)
+- [ ] Learn from timeouts — if a command times out via Bash, auto-route through amux next time
+- [ ] Per-workspace routing: builds go to "build" pane, SSH to "remote" pane
 
 ### Agent awareness
 

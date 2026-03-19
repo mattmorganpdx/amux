@@ -9,6 +9,7 @@ const Sidebar = @import("sidebar.zig");
 const CommandPalette = @import("command_palette.zig");
 const SearchOverlay = @import("search_overlay.zig");
 const session = @import("session.zig");
+const history = @import("history.zig");
 
 const log = std.log.scoped(.window);
 
@@ -53,6 +54,10 @@ command_palette: *CommandPalette,
 /// The terminal search overlay.
 search_overlay: *SearchOverlay,
 
+/// Map from pane ID to the last saved history entry ID.
+/// Populated by saveTerminalHistory, consumed by session capture.
+pane_history_ids: std.AutoHashMap(PaneTree.NodeId, []const u8),
+
 /// Allocator
 alloc: Allocator,
 
@@ -93,6 +98,7 @@ pub fn create(gtk_app: *c.GtkApplication, app: *App) !*Window {
         .node_widgets = std.AutoHashMap(PaneTree.NodeId, *c.GtkWidget).init(alloc),
         .content_stack = content_stack,
         .workspace_boxes = std.AutoHashMap(Workspace.WorkspaceId, *c.GtkBox).init(alloc),
+        .pane_history_ids = std.AutoHashMap(PaneTree.NodeId, []const u8).init(alloc),
         .sidebar = undefined, // will be set below
         .command_palette = undefined, // will be set below
         .search_overlay = undefined, // will be set below
@@ -184,6 +190,7 @@ pub fn createFromSession(gtk_app: *c.GtkApplication, app: *App, snap: *const ses
         .node_widgets = std.AutoHashMap(PaneTree.NodeId, *c.GtkWidget).init(alloc),
         .content_stack = content_stack,
         .workspace_boxes = std.AutoHashMap(Workspace.WorkspaceId, *c.GtkBox).init(alloc),
+        .pane_history_ids = std.AutoHashMap(PaneTree.NodeId, []const u8).init(alloc),
         .sidebar = undefined,
         .command_palette = undefined,
         .search_overlay = undefined,
@@ -244,6 +251,11 @@ pub fn createFromSession(gtk_app: *c.GtkApplication, app: *App, snap: *const ses
                 // Fall back to a fresh root pane
                 _ = ws.pane_tree.createRoot() catch {};
             };
+
+            // Extract history IDs from the snapshot layout
+            if (ws_snap.layout) |layout| {
+                self.extractHistoryIds(&layout);
+            }
 
             try self.tab_manager.workspaces.append(alloc, ws);
         }
@@ -374,6 +386,16 @@ fn buildNodeWidget(self: *Window, ws: *Workspace, node_id: PaneTree.NodeId) !*c.
             const main_mod = @import("main.zig");
             const sock_path: ?[*:0]const u8 = if (main_mod.global_server) |srv| srv.getSocketPathZ() else null;
             const tw = try TerminalWidget.create(self.app, ws.getCwd(), node_id, ws.id, sock_path);
+
+            // If there's a saved history for this pane, set up a command to restore scrollback
+            if (self.pane_history_ids.get(node_id)) |hist_id| {
+                const cmd = self.buildHistoryRestoreCommand(hist_id);
+                if (cmd) |c_str| {
+                    tw.command = c_str;
+                    log.info("Restoring history {s} for pane {d}", .{ hist_id, node_id });
+                }
+            }
+
             try self.pane_widgets.put(node_id, tw);
             const widget = tw.widget();
             try self.node_widgets.put(node_id, widget);
@@ -565,6 +587,130 @@ pub fn splitFocused(self: *Window, direction: PaneTree.SplitDirection) !void {
     log.info("Split created: pane {d} -> new pane {d}", .{ focused, new_pane_id });
 }
 
+/// Build a shell command that cats the history file then execs the user's shell.
+fn buildHistoryRestoreCommand(self: *Window, hist_id: []const u8) ?[*:0]const u8 {
+    // Resolve the history file path
+    var path_buf: [4096]u8 = undefined;
+    const path = history.entryFilePathPub(&path_buf, hist_id) orelse return null;
+
+    // Verify the file exists
+    std.fs.cwd().access(path, .{}) catch return null;
+
+    // Build: sh -c 'cat "/path/to/file"; exec "$SHELL"'
+    var cmd_buf: [4096]u8 = undefined;
+    const cmd = std.fmt.bufPrintZ(&cmd_buf, "sh -c 'cat \"{s}\"; exec \"$SHELL\"'", .{path}) catch return null;
+    // Dupe to heap so it survives this stack frame
+    const duped = self.alloc.dupeZ(u8, cmd) catch return null;
+    return duped.ptr;
+}
+
+/// Extract history IDs from a layout snapshot into pane_history_ids map.
+fn extractHistoryIds(self: *Window, layout: *const session.LayoutSnapshot) void {
+    switch (layout.*) {
+        .pane => |p| {
+            if (p.history_id.len > 0) {
+                const duped = self.alloc.dupe(u8, p.history_id) catch return;
+                self.pane_history_ids.put(p.id, duped) catch {
+                    self.alloc.free(duped);
+                };
+            }
+        },
+        .split => |s| {
+            self.extractHistoryIds(s.first);
+            self.extractHistoryIds(s.second);
+        },
+    }
+}
+
+/// Save scrollback history for a single terminal pane.
+/// Must be called on the GTK main thread (before the terminal is destroyed).
+pub fn saveTerminalHistory(self: *Window, ws: *Workspace, pane_id: PaneTree.NodeId, reason: []const u8) void {
+    const tw = self.pane_widgets.get(pane_id) orelse {
+        log.warn("History: pane {d} not in pane_widgets", .{pane_id});
+        return;
+    };
+    if (tw.surface == null) {
+        log.warn("History: pane {d} surface is null", .{pane_id});
+        return;
+    }
+
+    // Read scrollback via Ghostty API (safe: we're on GTK main thread)
+    const point_tag = c.GHOSTTY_POINT_SCREEN;
+
+    var selection: c.ghostty_selection_s = std.mem.zeroes(c.ghostty_selection_s);
+    selection.top_left.tag = point_tag;
+    selection.top_left.coord = c.GHOSTTY_POINT_COORD_TOP_LEFT;
+    selection.top_left.x = 0;
+    selection.top_left.y = 0;
+    selection.bottom_right.tag = point_tag;
+    selection.bottom_right.coord = c.GHOSTTY_POINT_COORD_BOTTOM_RIGHT;
+    selection.bottom_right.x = 0;
+    selection.bottom_right.y = 0;
+    selection.rectangle = true;
+
+    var text: c.ghostty_text_s = std.mem.zeroes(c.ghostty_text_s);
+    if (c.ghostty_surface_read_text(tw.surface, selection, &text)) {
+        defer c.ghostty_surface_free_text(tw.surface, &text);
+        if (text.text != null and text.text_len > 0) {
+            const slice = text.text[0..text.text_len];
+            log.info("History: pane {d} read {d} bytes", .{ pane_id, slice.len });
+            const title = ws.title[0..ws.title_len];
+            const cwd = ws.cwd_buf[0..ws.cwd_len];
+            const saved_id = history.saveScrollback(
+                self.alloc,
+                slice,
+                ws.id,
+                title,
+                pane_id,
+                cwd,
+                reason,
+            ) catch |err| {
+                log.warn("Failed to save history for pane {d}: {}", .{ pane_id, err });
+                return;
+            };
+            if (saved_id) |hid| {
+                // Free any previous history ID for this pane
+                if (self.pane_history_ids.get(pane_id)) |old| {
+                    self.alloc.free(old);
+                }
+                self.pane_history_ids.put(pane_id, hid) catch {};
+            }
+        } else {
+            log.warn("History: pane {d} read_text returned empty", .{pane_id});
+        }
+    } else {
+        log.warn("History: pane {d} ghostty_surface_read_text failed", .{pane_id});
+    }
+}
+
+/// Save scrollback history for all panes in a workspace.
+pub fn saveWorkspaceHistory(self: *Window, ws: *Workspace, reason: []const u8) void {
+    // Collect pane IDs from the tree
+    self.collectAndSavePanes(ws, ws.pane_tree.root, reason);
+}
+
+fn collectAndSavePanes(self: *Window, ws: *Workspace, node_id_opt: ?PaneTree.NodeId, reason: []const u8) void {
+    const node_id = node_id_opt orelse return;
+    const node = ws.pane_tree.getNode(node_id) orelse return;
+    switch (node) {
+        .pane => {
+            self.saveTerminalHistory(ws, node_id, reason);
+        },
+        .split => |s| {
+            self.collectAndSavePanes(ws, s.first, reason);
+            self.collectAndSavePanes(ws, s.second, reason);
+        },
+    }
+}
+
+/// Save scrollback history for all panes across all workspaces.
+pub fn saveAllHistory(self: *Window, reason: []const u8) void {
+    log.info("Saving history for {d} workspaces (reason: {s})", .{ self.tab_manager.workspaces.items.len, reason });
+    for (self.tab_manager.workspaces.items) |ws| {
+        self.saveWorkspaceHistory(ws, reason);
+    }
+}
+
 /// Close the focused pane.
 pub fn closeFocused(self: *Window) !void {
     const ws = self.tab_manager.selectedWorkspace() orelse return;
@@ -575,6 +721,9 @@ pub fn closeFocused(self: *Window) !void {
 
     // Get the terminal widget for cleanup
     const tw = self.pane_widgets.get(focused) orelse return;
+
+    // Save scrollback before destroying the terminal
+    self.saveTerminalHistory(ws, focused, "pane_close");
 
     // Get parent info before closing
     const pane_node = ws.pane_tree.getNode(focused) orelse return;
@@ -918,6 +1067,14 @@ pub fn lastWorkspace(self: *Window) void {
 
 /// Close a workspace by ID, cleaning up its widget tree from the stack.
 pub fn closeWorkspaceById(self: *Window, ws_id: Workspace.WorkspaceId) bool {
+    // Save scrollback history for all panes in this workspace before closing
+    for (self.tab_manager.workspaces.items) |ws| {
+        if (ws.id == ws_id) {
+            self.saveWorkspaceHistory(ws, "workspace_close");
+            break;
+        }
+    }
+
     self.removeWorkspaceFromStack(ws_id);
     const closed = self.tab_manager.closeWorkspaceById(ws_id);
     if (closed) {

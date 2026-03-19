@@ -36,6 +36,7 @@ pub const LayoutSnapshot = union(enum) {
 
 pub const PaneLayoutSnapshot = struct {
     id: u64,
+    history_id: []const u8 = "",
 };
 
 pub const SplitLayoutSnapshot = struct {
@@ -50,12 +51,18 @@ pub const SplitLayoutSnapshot = struct {
 // Capture (runtime state -> snapshot)
 // ------------------------------------------------------------------
 
+const HistoryMap = std.AutoHashMap(PaneTree.NodeId, []const u8);
+
 pub fn captureSession(alloc: Allocator, tm: *TabManager) !SessionSnapshot {
+    return captureSessionWithHistory(alloc, tm, null);
+}
+
+pub fn captureSessionWithHistory(alloc: Allocator, tm: *TabManager, history_ids: ?*const HistoryMap) !SessionSnapshot {
     var ws_snapshots: std.ArrayListUnmanaged(WorkspaceSnapshot) = .{};
     defer ws_snapshots.deinit(alloc);
 
     for (tm.workspaces.items) |ws| {
-        const snap = try captureWorkspace(alloc, ws);
+        const snap = try captureWorkspace(alloc, ws, history_ids);
         try ws_snapshots.append(alloc, snap);
     }
 
@@ -67,9 +74,9 @@ pub fn captureSession(alloc: Allocator, tm: *TabManager) !SessionSnapshot {
     };
 }
 
-fn captureWorkspace(alloc: Allocator, ws: *Workspace) !WorkspaceSnapshot {
+fn captureWorkspace(alloc: Allocator, ws: *Workspace, history_ids: ?*const HistoryMap) !WorkspaceSnapshot {
     const layout = if (ws.pane_tree.root) |root_id|
-        try captureLayout(alloc, &ws.pane_tree, root_id)
+        try captureLayout(alloc, &ws.pane_tree, root_id, history_ids)
     else
         null;
 
@@ -85,17 +92,21 @@ fn captureWorkspace(alloc: Allocator, ws: *Workspace) !WorkspaceSnapshot {
     };
 }
 
-fn captureLayout(alloc: Allocator, tree: *const PaneTree, node_id: PaneTree.NodeId) !LayoutSnapshot {
+fn captureLayout(alloc: Allocator, tree: *const PaneTree, node_id: PaneTree.NodeId, history_ids: ?*const HistoryMap) !LayoutSnapshot {
     const node = tree.getNode(node_id) orelse return error.InvalidTree;
     switch (node) {
         .pane => |p| {
-            return .{ .pane = .{ .id = p.id } };
+            const hist_id = if (history_ids) |hm| (hm.get(p.id) orelse "") else "";
+            return .{ .pane = .{
+                .id = p.id,
+                .history_id = try alloc.dupe(u8, hist_id),
+            } };
         },
         .split => |s| {
             const first = try alloc.create(LayoutSnapshot);
-            first.* = try captureLayout(alloc, tree, s.first);
+            first.* = try captureLayout(alloc, tree, s.first, history_ids);
             const second = try alloc.create(LayoutSnapshot);
-            second.* = try captureLayout(alloc, tree, s.second);
+            second.* = try captureLayout(alloc, tree, s.second, history_ids);
             return .{ .split = .{
                 .id = s.id,
                 .orientation = s.orientation,
@@ -171,6 +182,10 @@ fn serializeLayout(alloc: Allocator, buf: *Buf, layout: *const LayoutSnapshot) !
         .pane => |p| {
             try buf.appendSlice(alloc, "{\"type\":\"pane\",\"id\":");
             try appendInt(alloc, buf, p.id);
+            if (p.history_id.len > 0) {
+                try buf.appendSlice(alloc, ",\"history_id\":");
+                try appendJsonString(alloc, buf, p.history_id);
+            }
             try buf.append(alloc, '}');
         },
         .split => |s| {
@@ -288,7 +303,11 @@ fn deserializeLayout(alloc: Allocator, val: std.json.Value) !LayoutSnapshot {
 
     if (std.mem.eql(u8, type_str, "pane")) {
         const id: u64 = @intCast(getJsonInt(val, "id") orelse return error.MissingId);
-        return .{ .pane = .{ .id = id } };
+        const hist_id = getJsonString(val, "history_id") orelse "";
+        return .{ .pane = .{
+            .id = id,
+            .history_id = try alloc.dupe(u8, hist_id),
+        } };
     } else if (std.mem.eql(u8, type_str, "split")) {
         const id: u64 = @intCast(getJsonInt(val, "id") orelse return error.MissingId);
         const orient_str = getJsonString(val, "orientation") orelse return error.MissingOrientation;
@@ -464,7 +483,7 @@ pub fn onAutosave(userdata: c.gpointer) callconv(.c) c.gboolean {
     const window: *Window = @ptrCast(@alignCast(userdata));
 
     const alloc = std.heap.c_allocator;
-    const snap = captureSession(alloc, &window.tab_manager) catch |err| {
+    const snap = captureSessionWithHistory(alloc, &window.tab_manager, &window.pane_history_ids) catch |err| {
         log.warn("Failed to capture session: {}", .{err});
         return 1; // keep firing
     };
@@ -491,7 +510,9 @@ pub fn freeSessionSnapshot(alloc: Allocator, snap: *const SessionSnapshot) void 
 
 fn freeLayout(alloc: Allocator, layout: *const LayoutSnapshot) void {
     switch (layout.*) {
-        .pane => {},
+        .pane => |p| {
+            if (p.history_id.len > 0) alloc.free(p.history_id);
+        },
         .split => |s| {
             freeLayout(alloc, s.first);
             alloc.destroy(s.first);

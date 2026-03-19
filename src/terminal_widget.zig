@@ -27,6 +27,9 @@ pane_id: ?u64 = null,
 workspace_id: ?u64 = null,
 socket_path: ?[*:0]const u8 = null,
 
+/// Optional command to run instead of the default shell (e.g. for history restore).
+command: ?[*:0]const u8 = null,
+
 /// Last known widget dimensions for detecting resize changes.
 /// Updated by the tick callback to catch maximize/unmaximize events
 /// that the GtkGLArea "resize" signal can miss.
@@ -268,6 +271,7 @@ fn onRealize(gl_area: *c.GtkGLArea, userdata: c.gpointer) callconv(.c) void {
     surface_config.scale_factor = scale;
     surface_config.userdata = @ptrCast(self);
     surface_config.working_directory = self.working_directory;
+    surface_config.command = self.command;
 
     // Set environment variables so scripts know which terminal they're in
     var env_vars_buf: [3]c.ghostty_env_var_s = undefined;

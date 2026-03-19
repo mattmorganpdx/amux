@@ -52,7 +52,7 @@ Everything below was completed while amux was still the `linux/` directory of th
 
 ### Phase 5: CLI Tool
 - [x] Standalone `amux-cli` binary (no GTK dependency, libc only)
-- [x] All 42 socket methods exposed as CLI commands
+- [x] All socket methods exposed as CLI commands (including history)
 - [x] Socket path from `AMUX_SOCKET` / `AMUX_SOCKET_PATH` / default `/tmp/amux.sock`
 - [x] JSON response output
 - [x] `--surface <id>` targeting on all surface-interacting commands
@@ -80,6 +80,7 @@ Everything below was completed while amux was still the `linux/` directory of th
 - [x] Synchronous dispatch for all mutating socket operations — ResetEvent pattern
 - [x] GTK widget tree crash in break/join/close — safe unparent with GType checking
 - [x] Stale sidebar pane count after split/close — missing sidebar.rebuild() calls
+- [x] Socket-created workspaces not appearing in sidebar — missing sidebar.rebuild() in doWorkspaceSwitch
 - [x] Various CLI usability fixes (flag parsing, usage text, workspace rename with ID)
 
 ---
@@ -123,15 +124,16 @@ The sidebar already shows metadata, but the agent can't easily see its own state
 One of the key values of watching an agent work in amux is seeing what it does. These features make that observable history persistent and browsable — so you can review any session after the fact, not just while it's live.
 
 **Scrollback persistence**
-- [ ] **Save full scrollback on exit** — when a terminal pane closes (or amux exits), persist the complete scrollback buffer to disk
-- [ ] **Load scrollback on restore** — when session restore reopens a pane, reload its scrollback so you can scroll up and see everything from the previous run
-- [ ] **Configurable retention** — max scrollback lines to persist per pane, with a sensible default (e.g., 50k lines)
+- [x] **Save full scrollback on exit** — when a terminal pane closes (or amux exits), persist the complete scrollback buffer to disk (`~/.config/cmux/history/`)
+- [x] **Load scrollback on restore** — when session restore reopens a pane, replay its scrollback via `command` field so you can scroll up and see everything from the previous run
+- [x] **Configurable retention** — max entries (`CMUX_HISTORY_MAX_ENTRIES`, default 100), max bytes per entry (`CMUX_HISTORY_MAX_BYTES`, default 10MB), disable with `CMUX_HISTORY_DISABLED=1`
 
 **Session history browser**
-- [ ] **Terminal session log** — maintain an index of every terminal session that has existed: surface ID, workspace name, start time, end time, working directory, shell
-- [ ] **`amux-cli history list`** — CLI command to list past sessions with timestamps and metadata
-- [ ] **`amux-cli history show <session>`** — retrieve the full saved scrollback for a past session
-- [ ] **`amux-cli history search <pattern>`** — search across all saved session scrollbacks (grep through history)
+- [x] **Terminal session log** — index at `~/.config/cmux/history/index.json` tracks every terminal session: pane ID, workspace name/ID, close time, line/byte counts, working directory, close reason
+- [x] **`amux-cli history list`** — CLI command to list past sessions with timestamps and metadata (supports `--workspace` and `--limit` filters)
+- [x] **`amux-cli history show <id>`** — retrieve the full saved scrollback for a past session
+- [x] **`amux-cli history search <query>`** — search across all saved session scrollbacks and metadata
+- [x] **`amux-cli history delete <id>`** — remove a history entry
 - [ ] **In-app history browser** — GUI panel to browse past sessions, preview scrollback, and optionally restore a session's working directory in a new pane
 - [ ] **Session tagging** — tag sessions with labels (e.g., "deploy 2026-03-18", "debug auth bug") for easier retrieval
 
@@ -170,4 +172,4 @@ One of the key values of watching an agent work in amux is seeing what it does. 
 
 ## Current state
 
-As of 2026-03-18: amux is a fully functional agent-first terminal multiplexer with 42 socket API methods, a complete CLI, session persistence, Claude Code integration, and a Phase 1 Bash routing hook. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by an AI agent using amux as its own development environment.
+As of 2026-03-19: amux is a fully functional agent-first terminal multiplexer with 46 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit, and restored on session reload. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by an AI agent using amux as its own development environment.

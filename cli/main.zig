@@ -20,6 +20,7 @@ const usage_text =
     \\  send          Send text to a surface (--surface <id>, --enter)
     \\  notification  Notification management (create, list, clear)
     \\  palette       Command palette (list, execute)
+    \\  history       Terminal history (list, show, search, delete)
     \\  claude-hook   Claude Code integration (session-start, stop, notification, prompt-submit)
     \\
     \\Options:
@@ -703,6 +704,77 @@ pub fn main() !void {
 
         const params = fbs.getWritten();
         try sendAndPrint(socket_path, "claude.hook", params, stdout, stderr);
+    } else if (std.mem.eql(u8, subcommand, "history")) {
+        const sub = args.next() orelse "list";
+        if (std.mem.eql(u8, sub, "list")) {
+            // Optional: --workspace <id> --limit <n>
+            var params_buf: [4096]u8 = undefined;
+            var params: []const u8 = "{}";
+            // Check for optional flags
+            var ws_id_str: ?[]const u8 = null;
+            var limit_str: ?[]const u8 = null;
+            while (args.next()) |flag| {
+                if (std.mem.eql(u8, flag, "--workspace")) {
+                    ws_id_str = args.next();
+                } else if (std.mem.eql(u8, flag, "--limit")) {
+                    limit_str = args.next();
+                }
+            }
+            if (ws_id_str != null or limit_str != null) {
+                var fbs = std.io.fixedBufferStream(&params_buf);
+                const writer = fbs.writer();
+                try writer.writeByte('{');
+                var first = true;
+                if (ws_id_str) |ws_id| {
+                    try writer.print("\"workspace_id\":{s}", .{ws_id});
+                    first = false;
+                }
+                if (limit_str) |limit| {
+                    if (!first) try writer.writeByte(',');
+                    try writer.print("\"limit\":{s}", .{limit});
+                }
+                try writer.writeByte('}');
+                params = fbs.getWritten();
+            }
+            try sendAndPrint(socket_path, "history.list", params, stdout, stderr);
+        } else if (std.mem.eql(u8, sub, "show")) {
+            const id_str = args.next() orelse {
+                try stderr.writeAll("Usage: amux history show <id>\n");
+                return;
+            };
+            var params_buf: [4096]u8 = undefined;
+            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":\"{s}\"}}", .{id_str}) catch {
+                try stderr.writeAll("ID too long\n");
+                return;
+            };
+            try sendAndPrint(socket_path, "history.show", params, stdout, stderr);
+        } else if (std.mem.eql(u8, sub, "search")) {
+            const query = args.next() orelse {
+                try stderr.writeAll("Usage: amux history search <query>\n");
+                return;
+            };
+            var params_buf: [4096]u8 = undefined;
+            const params = std.fmt.bufPrint(&params_buf, "{{\"query\":\"{s}\"}}", .{query}) catch {
+                try stderr.writeAll("Query too long\n");
+                return;
+            };
+            try sendAndPrint(socket_path, "history.search", params, stdout, stderr);
+        } else if (std.mem.eql(u8, sub, "delete")) {
+            const id_str = args.next() orelse {
+                try stderr.writeAll("Usage: amux history delete <id>\n");
+                return;
+            };
+            var params_buf: [4096]u8 = undefined;
+            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":\"{s}\"}}", .{id_str}) catch {
+                try stderr.writeAll("ID too long\n");
+                return;
+            };
+            try sendAndPrint(socket_path, "history.delete", params, stdout, stderr);
+        } else {
+            try stderr.writeAll("Unknown history subcommand: ");
+            try stderr.writeAll(sub);
+            try stderr.writeAll("\nAvailable: list, show, search, delete\n");
+        }
     } else {
         try stderr.writeAll("Unknown command: ");
         try stderr.writeAll(subcommand);

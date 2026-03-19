@@ -38,10 +38,10 @@ pub fn main() !void {
         @ptrCast(std.os.argv.ptr),
     );
 
-    // Save session before cleanup
+    // Save session before cleanup (include history IDs from the close-request save)
     if (global_window) |window| {
         const alloc = std.heap.c_allocator;
-        if (session.captureSession(alloc, &window.tab_manager)) |snap| {
+        if (session.captureSessionWithHistory(alloc, &window.tab_manager, &window.pane_history_ids)) |snap| {
             defer session.freeSessionSnapshot(alloc, &snap);
             session.writeSessionFile(alloc, &snap) catch |err| {
                 log.warn("Failed to save session on exit: {}", .{err});
@@ -191,10 +191,15 @@ fn copyFile(src: [*:0]const u8, dest: [*:0]const u8) !void {
 /// Returning 0 (FALSE) lets GTK proceed with window destruction; when the last
 /// window is destroyed GtkApplication automatically quits the main loop.
 fn onCloseRequest(_: *c.GtkWindow, _: c.gpointer) callconv(.c) c.gboolean {
-    // Save session before the window is destroyed
+    // Save terminal history before the window is destroyed
+    if (global_window) |window| {
+        window.saveAllHistory("app_exit");
+    }
+
+    // Save session before the window is destroyed (include history IDs)
     if (global_window) |window| {
         const alloc = std.heap.c_allocator;
-        if (session.captureSession(alloc, &window.tab_manager)) |snap| {
+        if (session.captureSessionWithHistory(alloc, &window.tab_manager, &window.pane_history_ids)) |snap| {
             defer session.freeSessionSnapshot(alloc, &snap);
             session.writeSessionFile(alloc, &snap) catch |err| {
                 log.warn("Failed to save session on close: {}", .{err});

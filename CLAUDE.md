@@ -94,7 +94,7 @@ amux-cli palette execute <action>      # execute an action by name
 
 ### Claude Code integration
 
-When the `Resources/bin/claude` wrapper is in PATH before the real `claude` binary, it automatically injects hooks so Claude Code sessions report status to the cmux sidebar.
+When the `bin/claude` wrapper is in PATH before the real `claude` binary, it automatically injects hooks so Claude Code sessions report status to the amux sidebar.
 
 ```bash
 # The wrapper handles this automatically, but you can also manually:

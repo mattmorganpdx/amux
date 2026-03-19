@@ -17,6 +17,7 @@ const usage_text =
     \\  surface       Surface management (list, current, search, read-text, send-key, split, close)
     \\  pane          Pane management (list, break, join, resize, swap)
     \\  window        Window management (list, current)
+    \\  run           Run a command and return output (--surface <id>, --timeout <s>, --prompt-pattern <pat>)
     \\  send          Send text to a surface (--surface <id>, --enter)
     \\  notification  Notification management (create, list, clear)
     \\  palette       Command palette (list, execute)
@@ -469,6 +470,61 @@ pub fn main() !void {
         } else {
             try stderr.writeAll("Unknown pane subcommand. Use: list, break, join, resize, swap\n");
         }
+    } else if (std.mem.eql(u8, subcommand, "run")) {
+        // amux run [--surface <id>] [--timeout <seconds>] [--prompt-pattern <pat>] <command>
+        var surface_id: ?[]const u8 = null;
+        var timeout_str: ?[]const u8 = null;
+        var prompt_pat: ?[]const u8 = null;
+        var run_command: ?[]const u8 = null;
+
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--surface")) {
+                surface_id = args.next() orelse {
+                    try stderr.writeAll("--surface requires a value\n");
+                    return;
+                };
+            } else if (std.mem.eql(u8, arg, "--timeout")) {
+                timeout_str = args.next() orelse {
+                    try stderr.writeAll("--timeout requires a value\n");
+                    return;
+                };
+            } else if (std.mem.eql(u8, arg, "--prompt-pattern")) {
+                prompt_pat = args.next() orelse {
+                    try stderr.writeAll("--prompt-pattern requires a value\n");
+                    return;
+                };
+            } else {
+                run_command = arg;
+            }
+        }
+
+        const cmd = run_command orelse {
+            try stderr.writeAll("Usage: amux run [--surface <id>] [--timeout <s>] [--prompt-pattern <pat>] <command>\n");
+            return;
+        };
+
+        // Build JSON params
+        var params_buf: [8192]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&params_buf);
+        const writer = fbs.writer();
+        try writer.writeAll("{\"command\":\"");
+        try writeJsonEscaped(writer, cmd);
+        try writer.writeByte('"');
+        if (surface_id) |sid| {
+            try writer.print(",\"surface_id\":{s}", .{sid});
+        }
+        if (timeout_str) |t| {
+            try writer.print(",\"timeout\":{s}", .{t});
+        }
+        if (prompt_pat) |pat| {
+            try writer.writeAll(",\"prompt_pattern\":\"");
+            try writeJsonEscaped(writer, pat);
+            try writer.writeByte('"');
+        }
+        try writer.writeByte('}');
+
+        const params = fbs.getWritten();
+        try sendAndPrint(socket_path, "surface.run", params, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "send")) {
         // cmux send [--surface <id>] [--enter] <text>
         var surface_id: ?[]const u8 = null;

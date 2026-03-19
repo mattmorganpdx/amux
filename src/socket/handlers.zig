@@ -72,6 +72,9 @@ pub fn dispatch(alloc: Allocator, server: *Server, req: *const protocol.Request)
     if (std.mem.eql(u8, req.method, "surface.close")) {
         return handleSurfaceClose(alloc, server, req);
     }
+    if (std.mem.eql(u8, req.method, "surface.run")) {
+        return handleSurfaceRun(alloc, server, req);
+    }
 
     // Workspace metadata methods
     if (std.mem.eql(u8, req.method, "workspace.report_git")) {
@@ -275,7 +278,7 @@ fn handleSystemCapabilities(alloc: Allocator, req: *const protocol.Request) ![]c
         \\"workspace.list","workspace.create","workspace.current","workspace.select","workspace.close","workspace.rename",
         \\"workspace.next","workspace.previous","workspace.last",
         \\"workspace.report_git","workspace.set_status","workspace.clear_status","workspace.add_log","workspace.clear_log","workspace.set_progress","workspace.set_pinned","workspace.set_color",
-        \\"surface.list","surface.send_text","surface.current","surface.read_text","surface.send_key","surface.split","surface.close","surface.search",
+        \\"surface.list","surface.send_text","surface.current","surface.read_text","surface.send_key","surface.split","surface.close","surface.search","surface.run",
         \\"pane.list","pane.resize","pane.swap","pane.break","pane.join",
         \\"window.list","window.current",
         \\"notification.create","notification.list","notification.clear",
@@ -1268,6 +1271,205 @@ fn doReadText(userdata: c.gpointer) callconv(.c) c.gboolean {
     }
 
     return c.G_SOURCE_REMOVE;
+}
+
+/// Reusable helper: read terminal text via g_idle_add + ResetEvent.
+/// Returns heap-allocated text (caller must free with c_allocator), or null on failure.
+fn readSurfaceText(surface: c.ghostty_surface_t) ?[]u8 {
+    const ctx = std.heap.c_allocator.create(ReadTextCtx) catch return null;
+    ctx.* = .{ .surface = surface, .include_scrollback = true };
+    _ = c.g_idle_add(&doReadText, @ptrCast(ctx));
+    ctx.done.wait();
+    const text_ptr = ctx.result_text;
+    const text_len = ctx.result_len;
+    const success = ctx.success;
+    std.heap.c_allocator.destroy(ctx);
+    if (!success or text_ptr == null) return null;
+    return @constCast(text_ptr.?[0..text_len]);
+}
+
+// ------------------------------------------------------------------
+// surface.run — send command, wait for prompt, return output
+// ------------------------------------------------------------------
+
+fn handleSurfaceRun(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
+    const window = server.window orelse {
+        return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
+    };
+
+    // 1. Extract params
+    const command = req.getStringParam(alloc, "command") orelse {
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'command' parameter");
+    };
+    defer alloc.free(command);
+
+    const timeout_secs: u64 = if (req.getIntParam(alloc, "timeout")) |t|
+        @intCast(@max(t, 1))
+    else
+        30;
+    const timeout_ns: u64 = timeout_secs * 1_000_000_000;
+
+    const prompt_suffix = req.getStringParam(alloc, "prompt_pattern");
+    defer if (prompt_suffix) |p| alloc.free(p);
+
+    // 2. Resolve target surface
+    var target_pane_id: ?PaneTree.NodeId = null;
+    if (req.getIntParam(alloc, "surface_id")) |sid| {
+        target_pane_id = @intCast(sid);
+    } else {
+        if (window.tab_manager.selectedWorkspace()) |ws| {
+            target_pane_id = ws.pane_tree.focused_pane;
+        }
+    }
+    const pane_id = target_pane_id orelse {
+        return protocol.errorResponse(alloc, req.id, "no_surface", "No target surface found");
+    };
+    const tw = window.pane_widgets.get(pane_id) orelse {
+        return protocol.errorResponse(alloc, req.id, "no_surface", "Surface widget not found");
+    };
+    if (tw.surface == null or !tw.realized) {
+        return protocol.errorResponse(alloc, req.id, "dead_surface", "Surface is not active");
+    }
+
+    // 3. Read "before" snapshot
+    const before_text = readSurfaceText(tw.surface) orelse {
+        return protocol.errorResponse(alloc, req.id, "read_failed", "Failed to read initial terminal text");
+    };
+    defer std.heap.c_allocator.free(before_text);
+
+    // 4. Send command + Enter
+    const cmd_with_newline = try std.fmt.allocPrint(alloc, "{s}\n", .{command});
+    defer alloc.free(cmd_with_newline);
+    const action_str = try encodeBindingActionText(alloc, cmd_with_newline);
+    defer alloc.free(action_str);
+    _ = c.ghostty_surface_binding_action(tw.surface, action_str.ptr, action_str.len);
+
+    // 5. Poll loop — wait for prompt to reappear
+    const poll_interval_ns: u64 = 150_000_000; // 150ms
+    const start_ns: u64 = @intCast(std.time.nanoTimestamp());
+    var timed_out = true;
+    var final_text: ?[]u8 = null;
+
+    while (true) {
+        const elapsed: u64 = @intCast(std.time.nanoTimestamp() - @as(i128, start_ns));
+        if (elapsed >= timeout_ns) break;
+
+        std.Thread.sleep(poll_interval_ns);
+
+        const current = readSurfaceText(tw.surface) orelse continue;
+
+        // Text must have grown beyond the before snapshot + command echo
+        if (current.len > before_text.len) {
+            if (endsWithPrompt(current, prompt_suffix)) {
+                final_text = current;
+                timed_out = false;
+                break;
+            }
+        }
+        std.heap.c_allocator.free(current);
+    }
+
+    // On timeout, do one final read
+    if (timed_out and final_text == null) {
+        final_text = readSurfaceText(tw.surface);
+    }
+
+    // 6. Extract output between command echo and final prompt
+    const output = if (final_text) |ft| blk: {
+        defer std.heap.c_allocator.free(ft);
+        break :blk extractCommandOutput(alloc, before_text, ft, command) catch "";
+    } else "";
+    defer if (output.len > 0) alloc.free(@constCast(output));
+
+    // 7. Build JSON response
+    const escaped_output = try jsonEscapeString(alloc, output);
+    defer alloc.free(escaped_output);
+
+    const result = try std.fmt.allocPrint(alloc,
+        \\{{"output":"{s}","timed_out":{s},"surface_id":{d}}}
+    , .{
+        escaped_output,
+        if (timed_out) "true" else "false",
+        pane_id,
+    });
+    defer alloc.free(result);
+    return protocol.successResponse(alloc, req.id, result);
+}
+
+/// Check if terminal text ends with a shell prompt.
+fn endsWithPrompt(text: []const u8, custom_suffix: ?[]const u8) bool {
+    // Find last non-empty line
+    var end = text.len;
+    while (end > 0 and (text[end - 1] == '\n' or text[end - 1] == '\r')) end -= 1;
+    if (end == 0) return false;
+    var start = end;
+    while (start > 0 and text[start - 1] != '\n') start -= 1;
+    const last_line = std.mem.trimRight(u8, text[start..end], " ");
+    if (last_line.len == 0) return false;
+
+    if (custom_suffix) |pat| {
+        return std.mem.endsWith(u8, last_line, pat);
+    }
+    // Default: common prompt endings
+    const suffixes = [_][]const u8{ "$ ", "# ", "% ", "> ", "$", "#", "%", ">" };
+    for (suffixes) |suffix| {
+        if (std.mem.endsWith(u8, last_line, suffix)) return true;
+    }
+    return false;
+}
+
+/// Extract the command output from terminal text by diffing before/after snapshots.
+/// Returns the text between the command echo line and the final prompt line.
+fn extractCommandOutput(alloc: Allocator, before: []const u8, after: []const u8, command: []const u8) ![]const u8 {
+    // Find where the new content starts — skip the "before" text
+    const new_start = if (after.len > before.len and std.mem.startsWith(u8, after, before))
+        before.len
+    else blk: {
+        // Text may have scrolled — find the command echo in the after text
+        break :blk if (std.mem.indexOf(u8, after, command)) |cmd_pos| cmd_pos else 0;
+    };
+
+    if (new_start >= after.len) return try alloc.dupe(u8, "");
+
+    const new_text = after[new_start..];
+
+    // Skip the command echo line (first line containing the command)
+    var output_start: usize = 0;
+    if (std.mem.indexOf(u8, new_text, command)) |cmd_offset| {
+        // Find end of the line containing the command
+        if (std.mem.indexOfPos(u8, new_text, cmd_offset, "\n")) |nl| {
+            output_start = nl + 1;
+        }
+    }
+
+    // Find the last prompt line and exclude it
+    var output_end = new_text.len;
+    // Trim trailing newlines
+    while (output_end > output_start and (new_text[output_end - 1] == '\n' or new_text[output_end - 1] == '\r')) {
+        output_end -= 1;
+    }
+    // Find the start of the last line
+    var last_line_start = output_end;
+    while (last_line_start > output_start and new_text[last_line_start - 1] != '\n') {
+        last_line_start -= 1;
+    }
+    // If the last line looks like a prompt, exclude it
+    const last_line = std.mem.trimRight(u8, new_text[last_line_start..output_end], " ");
+    const suffixes = [_][]const u8{ "$ ", "# ", "% ", "> ", "$", "#", "%", ">" };
+    for (suffixes) |suffix| {
+        if (std.mem.endsWith(u8, last_line, suffix)) {
+            output_end = last_line_start;
+            break;
+        }
+    }
+
+    // Trim trailing whitespace from output
+    while (output_end > output_start and (new_text[output_end - 1] == '\n' or new_text[output_end - 1] == '\r' or new_text[output_end - 1] == ' ')) {
+        output_end -= 1;
+    }
+
+    if (output_start >= output_end) return try alloc.dupe(u8, "");
+    return try alloc.dupe(u8, new_text[output_start..output_end]);
 }
 
 // ------------------------------------------------------------------

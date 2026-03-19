@@ -105,10 +105,10 @@ The Bash routing hook (Phase 1 complete) proved the concept: intercepting comman
 - [ ] Per-workspace routing: builds go to "build" pane, SSH to "remote" pane
 
 **`amux-cli run` command**
-- [ ] New CLI command that combines send + poll + return output in one call
-- [ ] Handles the polling loop server-side for reliability
-- [ ] Configurable timeout and prompt detection
-- [ ] This is the key primitive that makes transparent routing work
+- [x] New CLI command that combines send + poll + return output in one call
+- [x] Handles the polling loop server-side for reliability
+- [x] Configurable timeout (`--timeout`) and prompt detection (`--prompt-pattern`)
+- [ ] This is the key primitive that makes transparent routing work — integrate with agent hooks
 
 ### Agent awareness
 
@@ -172,4 +172,4 @@ One of the key values of watching an agent work in amux is seeing what it does. 
 
 ## Current state
 
-As of 2026-03-19: amux is a fully functional agent-first terminal multiplexer with 46 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit, and restored on session reload. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by an AI agent using amux as its own development environment.
+As of 2026-03-19: amux is a fully functional agent-first terminal multiplexer with 47 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit, and restored on session reload. The `amux-cli run` command enables agents to send a command and get output back in a single call with prompt detection. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by an AI agent using amux as its own development environment.

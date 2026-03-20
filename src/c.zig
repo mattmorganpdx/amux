@@ -123,6 +123,7 @@ pub const gtk_progress_bar_set_show_text = raw.gtk_progress_bar_set_show_text;
 
 // Pango
 pub const PANGO_ELLIPSIZE_END = raw.PANGO_ELLIPSIZE_END;
+pub const PANGO_ELLIPSIZE_MIDDLE = raw.PANGO_ELLIPSIZE_MIDDLE;
 
 // Event controller propagation
 pub const gtk_event_controller_set_propagation_phase = raw.gtk_event_controller_set_propagation_phase;
@@ -141,6 +142,8 @@ pub const GDK_KEY_E = raw.GDK_KEY_E;
 pub const GDK_KEY_e = raw.GDK_KEY_e;
 pub const GDK_KEY_B = raw.GDK_KEY_B;
 pub const GDK_KEY_b = raw.GDK_KEY_b;
+pub const GDK_KEY_H = raw.GDK_KEY_H;
+pub const GDK_KEY_h = raw.GDK_KEY_h;
 pub const GDK_KEY_Left = raw.GDK_KEY_Left;
 pub const GDK_KEY_Right = raw.GDK_KEY_Right;
 pub const GDK_KEY_Up = raw.GDK_KEY_Up;
@@ -228,6 +231,8 @@ pub const g_application_run = raw.g_application_run;
 pub const g_object_ref = raw.g_object_ref;
 pub const g_object_unref = raw.g_object_unref;
 pub const g_object_set_data = raw.g_object_set_data;
+pub const g_object_set = raw.g_object_set;
+pub const gtk_settings_get_default = raw.gtk_settings_get_default;
 pub const g_object_get_data = raw.g_object_get_data;
 pub const g_signal_connect_data = raw.g_signal_connect_data;
 pub const g_idle_add = raw.g_idle_add;
@@ -238,6 +243,17 @@ pub const g_free = raw.g_free;
 pub const GAsyncResult = raw.GAsyncResult;
 pub const GObject = raw.GObject;
 pub const GError = raw.GError;
+
+// GtkTextView / GtkTextBuffer
+pub const GtkTextBuffer = raw.GtkTextBuffer;
+pub const gtk_text_view_new = raw.gtk_text_view_new;
+pub const gtk_text_view_get_buffer = raw.gtk_text_view_get_buffer;
+pub const gtk_text_view_set_editable = raw.gtk_text_view_set_editable;
+pub const gtk_text_view_set_cursor_visible = raw.gtk_text_view_set_cursor_visible;
+pub const gtk_text_view_set_monospace = raw.gtk_text_view_set_monospace;
+pub const gtk_text_view_set_wrap_mode = raw.gtk_text_view_set_wrap_mode;
+pub const gtk_text_buffer_set_text = raw.gtk_text_buffer_set_text;
+pub const GTK_WRAP_NONE = raw.GTK_WRAP_NONE;
 
 // GDK clipboard
 pub const gdk_display_get_default = raw.gdk_display_get_default;

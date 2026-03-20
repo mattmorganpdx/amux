@@ -40,6 +40,7 @@ const actions = [_]Action{
     .{ .name = "Navigate Up", .description = "Move focus to the pane above", .shortcut = "Ctrl+Shift+Up", .callback = &doNavUp },
     .{ .name = "Navigate Down", .description = "Move focus to the pane below", .shortcut = "Ctrl+Shift+Down", .callback = &doNavDown },
     .{ .name = "Terminal Search", .description = "Find text in the terminal", .shortcut = "Ctrl+Shift+F", .callback = &doSearch },
+    .{ .name = "Show History", .description = "Browse and restore past terminal sessions", .shortcut = "Ctrl+Shift+H", .callback = &doShowHistory },
 };
 
 // Action callbacks
@@ -90,6 +91,9 @@ fn doNavDown(w: *Window) void {
 }
 fn doSearch(w: *Window) void {
     w.showSearch();
+}
+fn doShowHistory(w: *Window) void {
+    w.toggleHistory();
 }
 
 /// The outer container for the palette overlay widget.

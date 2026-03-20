@@ -102,6 +102,34 @@ pub fn saveScrollback(
     }
     if (newline_count <= 1) return null;
 
+    // Deduplicate: if the most recent entry for the same workspace+pane has
+    // identical content size, skip the save. This prevents app_exit from
+    // creating duplicate entries when nothing changed since last save.
+    {
+        var index = loadIndex(alloc) catch HistoryIndex{};
+        defer freeIndex(alloc, &index);
+
+        // Search backwards for the most recent entry matching this workspace+pane
+        var i: usize = index.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = index.entries.items[i];
+            if (e.workspace_id == workspace_id and e.pane_id == pane_id) {
+                // Same byte count is a strong signal of identical content.
+                // For extra safety, also verify by loading the file and comparing.
+                if (e.bytes == save_text.len) {
+                    const prev_text = loadEntryText(alloc, e.id) catch break;
+                    defer alloc.free(prev_text);
+                    if (std.mem.eql(u8, prev_text, save_text)) {
+                        log.info("History: skipping duplicate for ws{d}_p{d} ({d} bytes unchanged)", .{ workspace_id, pane_id, save_text.len });
+                        return null;
+                    }
+                }
+                break; // Only check the most recent match
+            }
+        }
+    }
+
     // Generate entry ID
     const timestamp = std.time.timestamp();
     var id_buf: [128]u8 = undefined;

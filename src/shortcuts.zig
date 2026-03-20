@@ -125,6 +125,12 @@ fn onKeyPressed(
         return 1;
     }
 
+    // Ctrl+Shift+H: History browser
+    if (keyval == c.GDK_KEY_H or keyval == c.GDK_KEY_h) {
+        window.toggleHistory();
+        return 1;
+    }
+
     // Ctrl+Shift+Q: Close workspace
     if (keyval == c.GDK_KEY_Q or keyval == c.GDK_KEY_q) {
         window.closeCurrentWorkspace();

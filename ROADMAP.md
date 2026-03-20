@@ -144,6 +144,7 @@ One of the key values of watching an agent work in amux is seeing what it does. 
 - [x] **Save full scrollback on exit** — when a terminal pane closes (or amux exits), persist the complete scrollback buffer to disk (`~/.config/amux/history/`)
 - [x] **Load scrollback on restore** — when session restore reopens a pane, replay its scrollback via `command` field so you can scroll up and see everything from the previous run
 - [x] **Configurable retention** — max entries (`AMUX_HISTORY_MAX_ENTRIES`, default 100), max bytes per entry (`AMUX_HISTORY_MAX_BYTES`, default 10MB), disable with `AMUX_HISTORY_DISABLED=1`
+- [x] **Content deduplication** — `saveScrollback` compares against the most recent entry for the same workspace+pane; skips save if content is byte-identical, preventing duplicate entries on repeated app exits
 
 **Session history browser**
 - [x] **Terminal session log** — index at `~/.config/amux/history/index.json` tracks every terminal session: pane ID, workspace name/ID, close time, line/byte counts, working directory, close reason
@@ -151,7 +152,7 @@ One of the key values of watching an agent work in amux is seeing what it does. 
 - [x] **`amux-cli history show <id>`** — retrieve the full saved scrollback for a past session
 - [x] **`amux-cli history search <query>`** — search across all saved session scrollbacks and metadata
 - [x] **`amux-cli history delete <id>`** — remove a history entry
-- [ ] **In-app history browser** — GUI panel to browse past sessions, preview scrollback, and optionally restore a session's working directory in a new pane
+- [x] **In-app history browser** — GTK overlay panel (Ctrl+Shift+H) to browse past sessions, preview scrollback, and restore as a new workspace with the original cwd and scrollback replayed
 - [ ] **Session tagging** — tag sessions with labels (e.g., "deploy 2026-03-18", "debug auth bug") for easier retrieval
 
 ### Reliability
@@ -219,4 +220,4 @@ Identified via full code review (2026-03-19). These are correctness and safety i
 
 ## Current state
 
-As of 2026-03-20: amux is a fully functional agent-first terminal multiplexer with 47 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit, and restored on session reload. The `amux-cli run` command enables agents to send a command and get output back in a single call with prompt detection. A full code review identified thread safety, input validation, and protocol hardening issues now tracked in the Hardening section — 8 of these have been fixed (surface_registry mutex, ResetEvent timeouts, @intCast bounds checks, iterator invalidation, UTF-8 truncation safety, parse-once JSON optimization, socket buffer overflow handling, clipboard null check). TERM is forced to xterm-256color to avoid Ghostty's resource directory false-positive on systems with ncurses-provided terminfo. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by AI agents using amux as their own development environment.
+As of 2026-03-20: amux is a fully functional agent-first terminal multiplexer with 47 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit (with content deduplication to avoid redundant saves), and restored on session reload. An in-app history browser (Ctrl+Shift+H) lets users browse, preview, and restore past terminal sessions as new workspaces. The `amux-cli run` command enables agents to send a command and get output back in a single call with prompt detection. A full code review identified thread safety, input validation, and protocol hardening issues now tracked in the Hardening section — 8 of these have been fixed. TERM is forced to xterm-256color and dark mode is enabled by default. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by AI agents using amux as their own development environment.

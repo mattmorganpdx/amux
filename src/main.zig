@@ -90,7 +90,20 @@ const app_css =
     \\.command-palette entry { margin-bottom: 4px; }
     \\
     \\.search-overlay { background-color: rgba(30,30,30,0.95); border-radius: 0 0 8px 8px; padding: 6px 12px; }
+    \\
+    \\.history-browser { background-color: rgba(30,30,30,0.97); border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); }
+    \\.history-browser .history-title { color: @accent_color; font-weight: bold; }
+    \\.history-browser listbox { background-color: transparent; }
+    \\.history-browser listbox row { border-bottom: 1px solid rgba(255,255,255,0.05); }
+    \\.history-browser listbox row:selected { background-color: rgba(255,255,255,0.1); }
+    \\.history-browser textview { background-color: rgba(0,0,0,0.3); color: #cccccc; }
+    \\.history-browser textview text { background-color: transparent; }
 ;
+
+fn setupDarkMode() void {
+    const settings = c.gtk_settings_get_default() orelse return;
+    c.g_object_set(@ptrCast(settings), "gtk-application-prefer-dark-theme", @as(c_int, 1), @as(?*anyopaque, null));
+}
 
 fn setupCssProvider() void {
     const provider = c.gtk_css_provider_new() orelse return;
@@ -218,6 +231,9 @@ fn onActivate(gtk_app: *c.GtkApplication, _: c.gpointer) callconv(.c) void {
 
     // Install icon and .desktop file to XDG paths
     installDesktopFiles();
+
+    // Force dark mode — terminal apps should always be dark
+    setupDarkMode();
 
     // Set up custom CSS theme
     setupCssProvider();

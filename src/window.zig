@@ -8,6 +8,7 @@ const Workspace = @import("workspace.zig");
 const Sidebar = @import("sidebar.zig");
 const CommandPalette = @import("command_palette.zig");
 const SearchOverlay = @import("search_overlay.zig");
+const HistoryBrowser = @import("history_browser.zig");
 const session = @import("session.zig");
 const history = @import("history.zig");
 
@@ -53,6 +54,9 @@ command_palette: *CommandPalette,
 
 /// The terminal search overlay.
 search_overlay: *SearchOverlay,
+
+/// The history browser overlay.
+history_browser: *HistoryBrowser,
 
 /// Map from pane ID to the last saved history entry ID.
 /// Populated by saveTerminalHistory, consumed by session capture.
@@ -102,6 +106,7 @@ pub fn create(gtk_app: *c.GtkApplication, app: *App) !*Window {
         .sidebar = undefined, // will be set below
         .command_palette = undefined, // will be set below
         .search_overlay = undefined, // will be set below
+        .history_browser = undefined, // will be set below
         .alloc = alloc,
     };
 
@@ -115,7 +120,7 @@ pub fn create(gtk_app: *c.GtkApplication, app: *App) !*Window {
     c.gtk_paned_set_end_child(main_paned, @as(*c.GtkWidget, @ptrCast(@alignCast(content_stack))));
     c.gtk_paned_set_position(main_paned, 200);
 
-    // Wrap in overlay for command palette + search overlay
+    // Wrap in overlay for command palette + search overlay + history browser
     const overlay: *c.GtkOverlay = @ptrCast(@alignCast(c.gtk_overlay_new()));
     c.gtk_overlay_set_child(overlay, @as(*c.GtkWidget, @ptrCast(@alignCast(main_paned))));
 
@@ -129,6 +134,11 @@ pub fn create(gtk_app: *c.GtkApplication, app: *App) !*Window {
     search.window = self;
     self.search_overlay = search;
     c.gtk_overlay_add_overlay(overlay, search.widget());
+
+    // Create history browser and add as overlay
+    const hist_browser = try HistoryBrowser.create(alloc, self);
+    self.history_browser = hist_browser;
+    c.gtk_overlay_add_overlay(overlay, hist_browser.widget());
 
     c.gtk_window_set_child(@ptrCast(gtk_window), @as(*c.GtkWidget, @ptrCast(@alignCast(overlay))));
 
@@ -194,6 +204,7 @@ pub fn createFromSession(gtk_app: *c.GtkApplication, app: *App, snap: *const ses
         .sidebar = undefined,
         .command_palette = undefined,
         .search_overlay = undefined,
+        .history_browser = undefined,
         .alloc = alloc,
     };
 
@@ -205,7 +216,7 @@ pub fn createFromSession(gtk_app: *c.GtkApplication, app: *App, snap: *const ses
     c.gtk_paned_set_end_child(main_paned, @as(*c.GtkWidget, @ptrCast(@alignCast(content_stack))));
     c.gtk_paned_set_position(main_paned, 200);
 
-    // Wrap in overlay for command palette + search overlay
+    // Wrap in overlay for command palette + search overlay + history browser
     const overlay: *c.GtkOverlay = @ptrCast(@alignCast(c.gtk_overlay_new()));
     c.gtk_overlay_set_child(overlay, @as(*c.GtkWidget, @ptrCast(@alignCast(main_paned))));
 
@@ -217,6 +228,10 @@ pub fn createFromSession(gtk_app: *c.GtkApplication, app: *App, snap: *const ses
     search.window = self;
     self.search_overlay = search;
     c.gtk_overlay_add_overlay(overlay, search.widget());
+
+    const hist_browser = try HistoryBrowser.create(alloc, self);
+    self.history_browser = hist_browser;
+    c.gtk_overlay_add_overlay(overlay, hist_browser.widget());
 
     c.gtk_window_set_child(@ptrCast(gtk_window), @as(*c.GtkWidget, @ptrCast(@alignCast(overlay))));
 
@@ -299,6 +314,7 @@ pub fn deinit(self: *Window) void {
     self.pane_widgets.deinit();
     self.node_widgets.deinit();
     self.workspace_boxes.deinit();
+    self.history_browser.deinit();
     self.search_overlay.deinit();
     self.command_palette.deinit();
     self.sidebar.deinit();
@@ -313,7 +329,7 @@ pub fn deinit(self: *Window) void {
 /// Build the GTK widget tree for a workspace and add it to the content stack.
 /// Each workspace gets its own wrapper GtkBox inside the GtkStack so that
 /// switching workspaces is just a visibility toggle (no unrealize/realize).
-fn buildWorkspaceWidgets(self: *Window, ws: *Workspace) !void {
+pub fn buildWorkspaceWidgets(self: *Window, ws: *Workspace) !void {
     if (ws.pane_tree.root) |root_id| {
         const root_widget = try self.buildNodeWidget(ws, root_id);
         const box = try self.getOrCreateWorkspaceBox(ws);
@@ -344,7 +360,7 @@ fn wsStackName(buf: *[32]u8, ws_id: Workspace.WorkspaceId) [*:0]const u8 {
 }
 
 /// Show a workspace's box in the content stack.
-fn showWorkspaceInStack(self: *Window, ws_id: Workspace.WorkspaceId) void {
+pub fn showWorkspaceInStack(self: *Window, ws_id: Workspace.WorkspaceId) void {
     var name_buf: [32]u8 = undefined;
     const name = wsStackName(&name_buf, ws_id);
     c.gtk_stack_set_visible_child_name(self.content_stack, name);
@@ -887,6 +903,11 @@ pub fn showSearch(self: *Window) void {
 /// Hide the terminal search overlay.
 pub fn hideSearch(self: *Window) void {
     self.search_overlay.hide();
+}
+
+/// Toggle the history browser overlay.
+pub fn toggleHistory(self: *Window) void {
+    self.history_browser.toggle();
 }
 
 /// Return keyboard focus to the focused terminal pane.

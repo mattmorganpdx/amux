@@ -156,6 +156,7 @@ One of the key values of watching an agent work in amux is seeing what it does. 
 
 ### Reliability
 
+- [x] **Force `TERM=xterm-256color`** — Ghostty's resource directory resolver false-positives on ncurses-shipped terminfo entries (e.g. Arch Linux), setting `TERM=xterm-ghostty` which doesn't exist on most systems, breaking backspace and other keys. Fixed via `resources/ghostty.conf` loaded as amux defaults before user config.
 - [ ] **`workspace next`/`previous` wrap-around** — currently errors at boundaries, should optionally wrap
 - [ ] **Connection health monitoring** — detect when SSH sessions die, notify the agent
 - [ ] **Process status per pane** — track whether the shell is at a prompt or running a command
@@ -166,17 +167,17 @@ One of the key values of watching an agent work in amux is seeing what it does. 
 Identified via full code review (2026-03-19). These are correctness and safety issues in the existing codebase, not new features.
 
 **Safety & thread correctness**
-- [ ] **`surface_registry` mutex** — global HashMap written from GTK callbacks (`onRealize`, `onUnrealize`) and read from Ghostty renderer threads via `actionCallback` with no synchronization (`src/terminal_widget.zig`)
-- [ ] **`ResetEvent.wait()` timeouts** — socket handler threads wait indefinitely for GTK idle callbacks; a GTK thread hang deadlocks the handler forever (`src/socket/handlers.zig`)
+- [x] **`surface_registry` mutex** — added `std.Thread.Mutex` to protect global HashMap from concurrent GTK/Ghostty thread access (`src/terminal_widget.zig`)
+- [x] **`ResetEvent.wait()` timeouts** — all 12 `ctx.done.wait()` calls replaced with `timedWait(10s)`; returns error response on timeout, leaks ctx to avoid use-after-free (`src/socket/handlers.zig`)
 - [ ] **Surface lifetime in handler closures** — surface pointers captured in `g_idle_add` closures can dangle if the widget is destroyed before the idle callback fires; `handleSurfaceRun` polls `readSurfaceText()` from a handler thread where the surface could be destroyed mid-poll
-- [ ] **`@intCast` bounds checks** — 25+ unchecked casts from `i64` → `u64`/`usize` throughout `handlers.zig`; negative JSON values cause undefined behavior
-- [ ] **`claude_session_store` iterator invalidation** — `consume()` modifies HashMap during iteration; build a removal list first, then remove after iteration (`src/claude_session_store.zig`)
-- [ ] **History truncation UTF-8 safety** — `saveScrollback` truncates to `max_bytes` without checking for partial UTF-8 sequences at the boundary (`src/history.zig`)
+- [x] **`@intCast` bounds checks** — all 25+ unchecked `i64`→`u64`/`usize` casts replaced with `toU64()`/`toUsize()` helpers that return null on negative values (`src/socket/handlers.zig`)
+- [x] **`claude_session_store` iterator invalidation** — `consume()` now finds the match key first, then removes after iteration (`src/claude_session_store.zig`)
+- [x] **History truncation UTF-8 safety** — `saveScrollback` now walks forward past UTF-8 continuation bytes at the truncation boundary (`src/history.zig`)
 
 **Protocol hardening**
-- [ ] **Parse JSON once in `protocol.zig`** — every call to `getStringParam()`, `getIntParam()`, etc. re-parses the entire raw JSON line; parse once and cache the params object in `Request`
-- [ ] **Socket request size bounds** — fixed 8192-byte read buffer in `server.zig` silently truncates large requests with no feedback to the client
-- [ ] **Clipboard null dereference** — `gdk_clipboard_read_text_finish` result not checked for null before use (`src/clipboard.zig`)
+- [x] **Parse JSON once in `protocol.zig`** — `Request` now stores a `std.json.Parsed(Value)` and caches the `params` ObjectMap; `getXParam()` methods do simple lookups instead of re-parsing
+- [x] **Socket request size bounds** — `handleClient` now detects when leftover fills the buffer (line > 8KB) and sends `request_too_large` error response (`src/socket/server.zig`)
+- [x] **Clipboard null dereference** — explicit null check on `gdk_clipboard_read_text_finish` result before passing to Ghostty (`src/clipboard.zig`)
 
 **CLI robustness**
 - [ ] **Validate numeric IDs** — command-line arguments used as JSON number fields are never validated as integers; `amux workspace select "abc"` sends malformed JSON (`cli/main.zig`)
@@ -218,4 +219,4 @@ Identified via full code review (2026-03-19). These are correctness and safety i
 
 ## Current state
 
-As of 2026-03-19: amux is a fully functional agent-first terminal multiplexer with 47 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit, and restored on session reload. The `amux-cli run` command enables agents to send a command and get output back in a single call with prompt detection. A full code review identified thread safety, input validation, and protocol hardening issues now tracked in the Hardening section. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by an AI agent using amux as its own development environment.
+As of 2026-03-20: amux is a fully functional agent-first terminal multiplexer with 47 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit, and restored on session reload. The `amux-cli run` command enables agents to send a command and get output back in a single call with prompt detection. A full code review identified thread safety, input validation, and protocol hardening issues now tracked in the Hardening section — 8 of these have been fixed (surface_registry mutex, ResetEvent timeouts, @intCast bounds checks, iterator invalidation, UTF-8 truncation safety, parse-once JSON optimization, socket buffer overflow handling, clipboard null check). TERM is forced to xterm-256color to avoid Ghostty's resource directory false-positive on systems with ncurses-provided terminfo. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by AI agents using amux as their own development environment.

@@ -25,8 +25,32 @@ pub fn init() !*App {
         return error.GhosttyInitFailed;
     }
 
-    // Load configuration
+    // Load configuration.
+    // Order matters: amux defaults first, then user files override, then finalize.
     const config = c.ghostty_config_new();
+
+    // Load amux defaults (e.g. term=xterm-256color) before user config so
+    // the user can override if they want.
+    {
+        var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fs.selfExeDirPath(&exe_dir_buf)) |exe_dir| {
+            var conf_buf: [std.fs.max_path_bytes]u8 = undefined;
+            // Try <exe_dir>/../resources/ghostty.conf (installed layout)
+            if (std.fmt.bufPrintZ(&conf_buf, "{s}/../resources/ghostty.conf", .{exe_dir})) |path| {
+                if (std.fs.cwd().access(path, .{})) |_| {
+                    c.ghostty_config_load_file(config, path.ptr);
+                } else |_| {
+                    // Try <exe_dir>/../../resources/ghostty.conf (zig-out/bin/ dev layout)
+                    if (std.fmt.bufPrintZ(&conf_buf, "{s}/../../resources/ghostty.conf", .{exe_dir})) |path2| {
+                        if (std.fs.cwd().access(path2, .{})) |_| {
+                            c.ghostty_config_load_file(config, path2.ptr);
+                        } else |_| {}
+                    } else |_| {}
+                }
+            } else |_| {}
+        } else |_| {}
+    }
+
     c.ghostty_config_load_default_files(config);
     c.ghostty_config_load_recursive_files(config);
     c.ghostty_config_finalize(config);

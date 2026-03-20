@@ -139,18 +139,25 @@ pub fn consume(
     }
 
     // Fallback: match by workspace_id + surface_id.
+    // Find the matching key first, then remove after iteration to avoid
+    // modifying the HashMap while iterating.
     if (workspace_id) |ws_id| {
+        var match_key: ?[]const u8 = null;
+        var match_record: ?Record = null;
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.workspace_id == ws_id) {
                 if (surface_id == null or entry.value_ptr.surface_id == surface_id.?) {
-                    const record = entry.value_ptr.*;
-                    const key = entry.key_ptr.*;
-                    self.sessions.removeByPtr(entry.key_ptr);
-                    self.alloc.free(key);
-                    return record;
+                    match_key = entry.key_ptr.*;
+                    match_record = entry.value_ptr.*;
+                    break;
                 }
             }
+        }
+        if (match_key) |key| {
+            _ = self.sessions.fetchRemove(key);
+            self.alloc.free(key);
+            return match_record;
         }
     }
 

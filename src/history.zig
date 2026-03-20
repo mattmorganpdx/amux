@@ -83,7 +83,15 @@ pub fn saveScrollback(
     if (isDisabled()) return null;
 
     const max_bytes = getMaxBytes();
-    const save_text = if (text.len > max_bytes) text[text.len - max_bytes ..] else text;
+    const save_text = if (text.len > max_bytes) blk: {
+        // Find a valid UTF-8 boundary to avoid splitting multi-byte sequences.
+        var start = text.len - max_bytes;
+        // Walk forward past any continuation bytes (0b10xxxxxx) at the cut point.
+        while (start < text.len and (text[start] & 0xC0) == 0x80) {
+            start += 1;
+        }
+        break :blk text[start..];
+    } else text;
 
     if (save_text.len == 0) return null;
 

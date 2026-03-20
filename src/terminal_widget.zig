@@ -39,11 +39,16 @@ last_height: c.gint = 0,
 /// Global registry mapping ghostty_surface_t → *TerminalWidget.
 /// Used by the action callback to look up widgets without relying on
 /// ghostty_surface_userdata pointer interpretation.
+/// Protected by surface_registry_mutex for thread safety — GTK callbacks
+/// write from the main thread, Ghostty renderer threads read via fromSurface().
 var surface_registry: std.AutoHashMapUnmanaged(usize, *TerminalWidget) = .empty;
+var surface_registry_mutex: std.Thread.Mutex = .{};
 
 /// Look up a TerminalWidget by its Ghostty surface handle.
 pub fn fromSurface(surface: c.ghostty_surface_t) ?*TerminalWidget {
     if (surface == null) return null;
+    surface_registry_mutex.lock();
+    defer surface_registry_mutex.unlock();
     return surface_registry.get(@intFromPtr(surface));
 }
 
@@ -221,7 +226,11 @@ pub fn deinit(self: *TerminalWidget) void {
 
     // Remove from registry before freeing the surface
     if (self.surface != null) {
-        _ = surface_registry.remove(@intFromPtr(self.surface));
+        {
+            surface_registry_mutex.lock();
+            defer surface_registry_mutex.unlock();
+            _ = surface_registry.remove(@intFromPtr(self.surface));
+        }
         c.ghostty_surface_free(self.surface);
         self.surface = null;
     }
@@ -309,9 +318,13 @@ fn onRealize(gl_area: *c.GtkGLArea, userdata: c.gpointer) callconv(.c) void {
 
     // Register in the global surface → widget map so the action callback
     // can look us up without relying on ghostty_surface_userdata.
-    surface_registry.put(std.heap.c_allocator, @intFromPtr(self.surface), self) catch |err| {
-        log.err("Failed to register surface in registry: {}", .{err});
-    };
+    {
+        surface_registry_mutex.lock();
+        defer surface_registry_mutex.unlock();
+        surface_registry.put(std.heap.c_allocator, @intFromPtr(self.surface), self) catch |err| {
+            log.err("Failed to register surface in registry: {}", .{err});
+        };
+    }
 
     // Mark as realized AFTER surface creation succeeds
     self.realized = true;
@@ -334,6 +347,8 @@ fn onUnrealize(_: *c.GtkGLArea, userdata: c.gpointer) callconv(.c) void {
     // (GTK main thread) and the render action callback (Ghostty thread)
     // that can call gtk_gl_area_queue_render on a destroyed widget.
     if (self.surface != null) {
+        surface_registry_mutex.lock();
+        defer surface_registry_mutex.unlock();
         _ = surface_registry.remove(@intFromPtr(self.surface));
     }
 

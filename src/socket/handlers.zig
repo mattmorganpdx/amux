@@ -14,6 +14,22 @@ const c = @import("../c.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.socket_handlers);
 
+/// Safely cast an i64 to u64, returning null if negative.
+fn toU64(val: i64) ?u64 {
+    if (val < 0) return null;
+    return @intCast(val);
+}
+
+/// Safely cast an i64 to usize, returning null if negative.
+fn toUsize(val: i64) ?usize {
+    if (val < 0) return null;
+    return @intCast(val);
+}
+
+/// Timeout for GTK idle dispatch operations (10 seconds).
+/// GTK callbacks should complete near-instantly; this guards against hangs.
+const gtk_dispatch_timeout_ns: u64 = 10_000_000_000;
+
 /// Dispatch a request to the appropriate handler.
 pub fn dispatch(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     // System methods
@@ -576,7 +592,9 @@ fn handleWorkspaceSelect(alloc: Allocator, server: *Server, req: *const protocol
     var target_index: ?usize = null;
 
     if (req.getIntParam(alloc, "id")) |id| {
-        const ws_id: u64 = @intCast(id);
+        const ws_id = toU64(id) orelse {
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "Workspace ID must be non-negative");
+        };
         for (window.tab_manager.workspaces.items, 0..) |ws, i| {
             if (ws.id == ws_id) {
                 target_index = i;
@@ -587,7 +605,9 @@ fn handleWorkspaceSelect(alloc: Allocator, server: *Server, req: *const protocol
             return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
         }
     } else if (req.getIntParam(alloc, "index")) |index| {
-        const idx: usize = @intCast(index);
+        const idx = toUsize(index) orelse {
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "Index must be non-negative");
+        };
         if (idx >= window.tab_manager.workspaces.items.len) {
             return protocol.errorResponse(alloc, req.id, "not_found", "Invalid workspace index");
         }
@@ -611,7 +631,12 @@ fn handleWorkspaceSelect(alloc: Allocator, server: *Server, req: *const protocol
     _ = c.g_idle_add(&doWorkspaceSwitch, @ptrCast(ctx));
 
     // Block until the GTK main thread completes the switch
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     std.heap.c_allocator.destroy(ctx);
@@ -666,7 +691,9 @@ fn handleWorkspaceClose(alloc: Allocator, server: *Server, req: *const protocol.
     var close_index: ?usize = null;
 
     if (req.getIntParam(alloc, "id")) |id| {
-        const ws_id: u64 = @intCast(id);
+        const ws_id = toU64(id) orelse {
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "Workspace ID must be non-negative");
+        };
         for (window.tab_manager.workspaces.items, 0..) |ws, i| {
             if (ws.id == ws_id) {
                 close_id = ws_id;
@@ -678,7 +705,9 @@ fn handleWorkspaceClose(alloc: Allocator, server: *Server, req: *const protocol.
             return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
         }
     } else if (req.getIntParam(alloc, "index")) |index| {
-        const idx: usize = @intCast(index);
+        const idx = toUsize(index) orelse {
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "Index must be non-negative");
+        };
         if (idx >= window.tab_manager.workspaces.items.len) {
             return protocol.errorResponse(alloc, req.id, "not_found", "Invalid workspace index");
         }
@@ -736,7 +765,10 @@ fn handleWorkspaceRename(alloc: Allocator, server: *Server, req: *const protocol
     // Find workspace by id or use current
     var ws: ?*Workspace = null;
     if (req.getIntParam(alloc, "id")) |id| {
-        ws = window.tab_manager.findById(@intCast(id));
+        const ws_id = toU64(id) orelse {
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "Workspace ID must be non-negative");
+        };
+        ws = window.tab_manager.findById(ws_id);
     } else {
         ws = window.tab_manager.selectedWorkspace();
     }
@@ -757,7 +789,7 @@ fn handleWorkspaceRename(alloc: Allocator, server: *Server, req: *const protocol
 fn resolveWorkspace(server: *Server, alloc: Allocator, req: *const protocol.Request) ?*Workspace {
     const window = server.window orelse return null;
     if (req.getIntParam(alloc, "id")) |id| {
-        return window.tab_manager.findById(@intCast(id));
+        return window.tab_manager.findById(toU64(id) orelse return null);
     }
     return window.tab_manager.selectedWorkspace();
 }
@@ -1040,7 +1072,7 @@ fn handleSurfaceSendText(alloc: Allocator, server: *Server, req: *const protocol
     // Find the target surface: by surface_id param, or use the focused surface
     var target_pane_id: ?PaneTree.NodeId = null;
     if (req.getIntParam(alloc, "surface_id")) |sid| {
-        target_pane_id = @intCast(sid);
+        target_pane_id = toU64(sid);
     } else {
         // Use focused surface in current workspace
         if (window.tab_manager.selectedWorkspace()) |ws| {
@@ -1146,7 +1178,7 @@ fn handleSurfaceReadText(alloc: Allocator, server: *Server, req: *const protocol
     // Resolve target surface
     var target_pane_id: ?PaneTree.NodeId = null;
     if (req.getIntParam(alloc, "surface_id")) |sid| {
-        target_pane_id = @intCast(sid);
+        target_pane_id = toU64(sid);
     } else {
         if (window.tab_manager.selectedWorkspace()) |ws| {
             target_pane_id = ws.pane_tree.focused_pane;
@@ -1178,7 +1210,12 @@ fn handleSurfaceReadText(alloc: Allocator, server: *Server, req: *const protocol
     _ = c.g_idle_add(&doReadText, @ptrCast(ctx));
 
     // Block until the main thread callback completes
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     // Read results (main thread is done writing)
     const success = ctx.success;
@@ -1279,7 +1316,11 @@ fn readSurfaceText(surface: c.ghostty_surface_t) ?[]u8 {
     const ctx = std.heap.c_allocator.create(ReadTextCtx) catch return null;
     ctx.* = .{ .surface = surface, .include_scrollback = true };
     _ = c.g_idle_add(&doReadText, @ptrCast(ctx));
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        log.warn("readSurfaceText: GTK dispatch timed out", .{});
+        // Don't destroy ctx — the GTK callback may still fire and access it.
+        return null;
+    };
     const text_ptr = ctx.result_text;
     const text_len = ctx.result_len;
     const success = ctx.success;
@@ -1304,7 +1345,7 @@ fn handleSurfaceRun(alloc: Allocator, server: *Server, req: *const protocol.Requ
     defer alloc.free(command);
 
     const timeout_secs: u64 = if (req.getIntParam(alloc, "timeout")) |t|
-        @intCast(@max(t, 1))
+        toU64(@max(t, 1)) orelse 30
     else
         30;
     const timeout_ns: u64 = timeout_secs * 1_000_000_000;
@@ -1315,7 +1356,7 @@ fn handleSurfaceRun(alloc: Allocator, server: *Server, req: *const protocol.Requ
     // 2. Resolve target surface
     var target_pane_id: ?PaneTree.NodeId = null;
     if (req.getIntParam(alloc, "surface_id")) |sid| {
-        target_pane_id = @intCast(sid);
+        target_pane_id = toU64(sid);
     } else {
         if (window.tab_manager.selectedWorkspace()) |ws| {
             target_pane_id = ws.pane_tree.focused_pane;
@@ -1346,12 +1387,13 @@ fn handleSurfaceRun(alloc: Allocator, server: *Server, req: *const protocol.Requ
 
     // 5. Poll loop — wait for prompt to reappear
     const poll_interval_ns: u64 = 150_000_000; // 150ms
-    const start_ns: u64 = @intCast(std.time.nanoTimestamp());
+    const start_ns: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
     var timed_out = true;
     var final_text: ?[]u8 = null;
 
     while (true) {
-        const elapsed: u64 = @intCast(std.time.nanoTimestamp() - @as(i128, start_ns));
+        const now_ns: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+        const elapsed: u64 = now_ns -| start_ns; // saturating subtract handles clock weirdness
         if (elapsed >= timeout_ns) break;
 
         std.Thread.sleep(poll_interval_ns);
@@ -1489,7 +1531,7 @@ fn handleSurfaceSendKey(alloc: Allocator, server: *Server, req: *const protocol.
     // Resolve target surface
     var target_pane_id: ?PaneTree.NodeId = null;
     if (req.getIntParam(alloc, "surface_id")) |sid| {
-        target_pane_id = @intCast(sid);
+        target_pane_id = toU64(sid);
     } else {
         if (window.tab_manager.selectedWorkspace()) |ws| {
             target_pane_id = ws.pane_tree.focused_pane;
@@ -1636,7 +1678,12 @@ fn handleSurfaceSplit(alloc: Allocator, server: *Server, req: *const protocol.Re
     ctx.* = .{ .window = window, .direction = direction };
     _ = c.g_idle_add(&doSplit, @ptrCast(ctx));
 
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     const err_code = ctx.err_code;
@@ -1703,7 +1750,12 @@ fn handleSurfaceClose(alloc: Allocator, server: *Server, req: *const protocol.Re
     ctx.* = .{ .window = window };
     _ = c.g_idle_add(&doCloseSurface, @ptrCast(ctx));
 
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     const err_code = ctx.err_code;
@@ -1811,7 +1863,12 @@ fn handleWorkspaceNext(alloc: Allocator, server: *Server, req: *const protocol.R
     };
     ctx.* = .{ .window = window, .index = next_idx };
     _ = c.g_idle_add(&doWorkspaceSwitch, @ptrCast(ctx));
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     std.heap.c_allocator.destroy(ctx);
@@ -1850,7 +1907,12 @@ fn handleWorkspacePrevious(alloc: Allocator, server: *Server, req: *const protoc
     };
     ctx.* = .{ .window = window, .index = prev_idx };
     _ = c.g_idle_add(&doWorkspaceSwitch, @ptrCast(ctx));
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     std.heap.c_allocator.destroy(ctx);
@@ -1899,7 +1961,12 @@ fn handleWorkspaceLast(alloc: Allocator, server: *Server, req: *const protocol.R
     };
     ctx.* = .{ .window = window, .index = idx };
     _ = c.g_idle_add(&doWorkspaceSwitch, @ptrCast(ctx));
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     std.heap.c_allocator.destroy(ctx);
@@ -1958,14 +2025,22 @@ fn handlePaneResize(alloc: Allocator, server: *Server, req: *const protocol.Requ
     };
     ctx.* = .{
         .window = window,
-        .pane_id = @intCast(pane_id_raw),
+        .pane_id = toU64(pane_id_raw) orelse {
+            std.heap.c_allocator.destroy(ctx);
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "pane_id must be non-negative");
+        },
         .direction = direction,
         .delta = amount,
     };
     _ = c.g_idle_add(&doPaneResize, @ptrCast(ctx));
 
     // Block until the main thread callback completes
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     const err_code = ctx.err_code;
@@ -2035,12 +2110,23 @@ fn handlePaneSwap(alloc: Allocator, server: *Server, req: *const protocol.Reques
     };
     ctx.* = .{
         .window = window,
-        .pane_a = @intCast(pane_a_raw),
-        .pane_b = @intCast(pane_b_raw),
+        .pane_a = toU64(pane_a_raw) orelse {
+            std.heap.c_allocator.destroy(ctx);
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "pane_a must be non-negative");
+        },
+        .pane_b = toU64(pane_b_raw) orelse {
+            std.heap.c_allocator.destroy(ctx);
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "pane_b must be non-negative");
+        },
     };
     _ = c.g_idle_add(&doPaneSwap, @ptrCast(ctx));
 
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     const err_code = ctx.err_code;
@@ -2111,10 +2197,21 @@ fn handlePaneBreak(alloc: Allocator, server: *Server, req: *const protocol.Reque
     const ctx = std.heap.c_allocator.create(PaneBreakCtx) catch {
         return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate");
     };
-    ctx.* = .{ .window = window, .pane_id = @intCast(pane_id_raw) };
+    ctx.* = .{
+        .window = window,
+        .pane_id = toU64(pane_id_raw) orelse {
+            std.heap.c_allocator.destroy(ctx);
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "pane_id must be non-negative");
+        },
+    };
     _ = c.g_idle_add(&doPaneBreak, @ptrCast(ctx));
 
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     const err_code = ctx.err_code;
@@ -2177,13 +2274,24 @@ fn handlePaneJoin(alloc: Allocator, server: *Server, req: *const protocol.Reques
     };
     ctx.* = .{
         .window = window,
-        .pane_id = @intCast(pane_id_raw),
-        .workspace_id = @intCast(ws_id_raw),
+        .pane_id = toU64(pane_id_raw) orelse {
+            std.heap.c_allocator.destroy(ctx);
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "pane_id must be non-negative");
+        },
+        .workspace_id = toU64(ws_id_raw) orelse {
+            std.heap.c_allocator.destroy(ctx);
+            return protocol.errorResponse(alloc, req.id, "invalid_param", "workspace_id must be non-negative");
+        },
     };
     _ = c.g_idle_add(&doPaneJoin, @ptrCast(ctx));
 
     // Block until the main thread callback completes
-    ctx.done.wait();
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
+        // since the GTK idle callback may still fire later.
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
 
     const success = ctx.success;
     const err_code = ctx.err_code;
@@ -2259,7 +2367,9 @@ fn handlePaneList(alloc: Allocator, server: *Server, req: *const protocol.Reques
 
     for (tm.workspaces.items) |ws| {
         if (filter_ws_id) |fid| {
-            if (ws.id != @as(u64, @intCast(fid))) continue;
+            if (toU64(fid)) |filter_id| {
+                if (ws.id != filter_id) continue;
+            } else continue;
         }
 
         var pane_ids = try ws.pane_tree.orderedPaneIds(alloc);
@@ -2389,7 +2499,9 @@ fn handleNotificationList(alloc: Allocator, server: *Server, req: *const protoco
 fn handleNotificationClear(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const id = req.getIntParam(alloc, "id");
     if (id) |notif_id| {
-        server.notification_store.clear(@intCast(notif_id));
+        if (toU64(notif_id)) |nid| {
+            server.notification_store.clear(nid);
+        }
     } else {
         server.notification_store.clear(null);
     }
@@ -2493,14 +2605,14 @@ fn resolveClaudeWorkspace(server: *Server, alloc: Allocator, req: *const protoco
 
     // 1. Explicit workspace_id param
     if (req.getIntParam(alloc, "workspace_id")) |id| {
-        return window.tab_manager.findById(@intCast(id));
+        return window.tab_manager.findById(toU64(id) orelse return null);
     }
 
     // 2. Look up via session store
     if (req.getStringParam(alloc, "session_id")) |sid| {
         defer alloc.free(sid);
         if (server.claude_session_store.lookup(sid)) |rec| {
-            return window.tab_manager.findById(@intCast(rec.workspace_id));
+            return window.tab_manager.findById(rec.workspace_id);
         }
     }
 
@@ -2518,7 +2630,7 @@ fn handleClaudeSessionStart(alloc: Allocator, server: *Server, req: *const proto
     defer if (session_id) |s| alloc.free(s);
     const cwd = req.getStringParam(alloc, "cwd");
     defer if (cwd) |c_val| alloc.free(c_val);
-    const surface_id: u64 = if (req.getIntParam(alloc, "surface_id")) |s| @intCast(s) else 0;
+    const surface_id: u64 = if (req.getIntParam(alloc, "surface_id")) |s| (toU64(s) orelse 0) else 0;
 
     if (session_id) |sid| {
         server.claude_session_store.upsert(sid, ws.id, surface_id, cwd);
@@ -2539,7 +2651,7 @@ fn handleClaudeStop(alloc: Allocator, server: *Server, req: *const protocol.Requ
     // Consume session mapping
     const session_id = req.getStringParam(alloc, "session_id");
     defer if (session_id) |s| alloc.free(s);
-    const surface_id: u64 = if (req.getIntParam(alloc, "surface_id")) |s| @intCast(s) else 0;
+    const surface_id: u64 = if (req.getIntParam(alloc, "surface_id")) |s| (toU64(s) orelse 0) else 0;
 
     const record = server.claude_session_store.consume(session_id, ws.id, if (surface_id > 0) surface_id else null);
 
@@ -2664,7 +2776,7 @@ fn handleHistoryList(alloc: Allocator, req: *const protocol.Request) ![]const u8
     try arr.startArray();
 
     var count: usize = 0;
-    const max_count: usize = if (limit_param) |l| @intCast(l) else index.entries.items.len;
+    const max_count: usize = if (limit_param) |l| (toUsize(l) orelse index.entries.items.len) else index.entries.items.len;
 
     // Iterate in reverse (newest first)
     var i: usize = index.entries.items.len;
@@ -2674,7 +2786,9 @@ fn handleHistoryList(alloc: Allocator, req: *const protocol.Request) ![]const u8
 
         // Apply workspace filter if provided
         if (ws_filter) |ws_id| {
-            if (entry.workspace_id != @as(u64, @intCast(ws_id))) continue;
+            if (toU64(ws_id)) |filter_id| {
+                if (entry.workspace_id != filter_id) continue;
+            } else continue;
         }
 
         const entry_json = try serializeHistoryEntry(alloc, &entry);

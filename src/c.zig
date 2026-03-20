@@ -276,6 +276,7 @@ pub const ghostty_action_s = raw.ghostty_action_s;
 pub const ghostty_init = raw.ghostty_init;
 pub const ghostty_config_new = raw.ghostty_config_new;
 pub const ghostty_config_free = raw.ghostty_config_free;
+pub const ghostty_config_load_file = raw.ghostty_config_load_file;
 pub const ghostty_config_load_default_files = raw.ghostty_config_load_default_files;
 pub const ghostty_config_load_recursive_files = raw.ghostty_config_load_recursive_files;
 pub const ghostty_config_finalize = raw.ghostty_config_finalize;

@@ -87,11 +87,16 @@ fn onClipboardReadFinish(
         return;
     }
 
+    // gdk_clipboard_read_text_finish can return null with no error when the
+    // clipboard is empty — handle that explicitly.
+    if (text == null) {
+        c.ghostty_surface_complete_clipboard_request(ctx.surface, null, ctx.request, false);
+        return;
+    }
+
     // Complete the Ghostty clipboard request with the text
     c.ghostty_surface_complete_clipboard_request(ctx.surface, text, ctx.request, false);
-
-    // Free the text returned by GDK
-    if (text != null) c.g_free(@ptrCast(@constCast(text)));
+    c.g_free(@ptrCast(@constCast(text)));
 }
 
 /// Confirm clipboard read (security check).

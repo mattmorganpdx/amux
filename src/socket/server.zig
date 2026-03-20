@@ -138,8 +138,15 @@ fn handleClient(self: *Server, client_fd: posix.socket_t) void {
     const stream = std.net.Stream{ .handle = client_fd };
     var buf: [8192]u8 = undefined;
     var leftover: usize = 0;
+    var overflow = false; // true when a line exceeds the buffer
 
     while (self.running.load(.acquire)) {
+        // If the buffer is full without a newline, the line is too large.
+        if (leftover >= buf.len) {
+            overflow = true;
+            leftover = 0;
+        }
+
         // Read data
         const n = stream.read(buf[leftover..]) catch break;
         if (n == 0) break; // Client disconnected
@@ -150,9 +157,26 @@ fn handleClient(self: *Server, client_fd: posix.socket_t) void {
         var line_start: usize = 0;
         for (0..total) |i| {
             if (buf[i] == '\n') {
-                const line = buf[line_start..i];
-                if (line.len > 0) {
-                    self.processRequest(stream, line);
+                if (overflow) {
+                    // Discard the oversized line and send an error
+                    overflow = false;
+                    const err_resp = protocol.errorResponse(
+                        self.alloc,
+                        0,
+                        "request_too_large",
+                        "Request exceeds maximum size of 8192 bytes",
+                    ) catch {
+                        line_start = i + 1;
+                        continue;
+                    };
+                    defer self.alloc.free(err_resp);
+                    stream.writeAll(err_resp) catch {};
+                    stream.writeAll("\n") catch {};
+                } else {
+                    const line = buf[line_start..i];
+                    if (line.len > 0) {
+                        self.processRequest(stream, line);
+                    }
                 }
                 line_start = i + 1;
             }

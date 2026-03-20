@@ -71,7 +71,7 @@ pub fn create(gtk_app: *c.GtkApplication, app: *App) !*Window {
             return error.WindowCreateFailed,
     );
 
-    c.gtk_window_set_title(@ptrCast(gtk_window), "cmux");
+    c.gtk_window_set_title(@ptrCast(gtk_window), "amux");
     c.gtk_window_set_default_size(@ptrCast(gtk_window), 1100, 700);
 
     // Create the main layout: horizontal paned with sidebar on left + content on right
@@ -165,7 +165,7 @@ pub fn createFromSession(gtk_app: *c.GtkApplication, app: *App, snap: *const ses
             return error.WindowCreateFailed,
     );
 
-    c.gtk_window_set_title(@ptrCast(gtk_window), "cmux");
+    c.gtk_window_set_title(@ptrCast(gtk_window), "amux");
     c.gtk_window_set_default_size(@ptrCast(gtk_window), 1100, 700);
 
     const main_paned: *c.GtkPaned = @ptrCast(c.gtk_paned_new(c.GTK_ORIENTATION_HORIZONTAL));

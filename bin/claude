@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# cmux claude wrapper - injects hooks and session tracking
+# amux claude wrapper - injects hooks and session tracking
 #
-# When running inside a cmux terminal (CMUX_SURFACE_ID is set), this wrapper
+# When running inside an amux terminal (AMUX_SURFACE_ID is set), this wrapper
 # intercepts `claude` invocations to inject --session-id and --settings flags
-# so that Claude Code hooks fire back into cmux for notifications/status.
-# Outside cmux, it passes through to the real claude binary unchanged.
+# so that Claude Code hooks fire back into amux for notifications/status.
+# Outside amux, it passes through to the real claude binary unchanged.
 
 # Find the real claude binary, skipping our own directory.
 find_real_claude() {
@@ -20,39 +20,39 @@ find_real_claude() {
 
 # Detect platform-specific CLI binary name.
 if [[ "$(uname -s)" == "Linux" ]]; then
-    CMUX_CLI_NAME="cmux-cli"
+    AMUX_CLI_NAME="amux-cli"
 else
-    CMUX_CLI_NAME="cmux"
+    AMUX_CLI_NAME="amux"
 fi
 
-# Return 0 only when CMUX_SOCKET_PATH points to a live cmux socket.
-cmux_socket_available() {
-    local socket="${CMUX_SOCKET_PATH:-}"
+# Return 0 only when AMUX_SOCKET_PATH points to a live amux socket.
+amux_socket_available() {
+    local socket="${AMUX_SOCKET_PATH:-}"
     [[ -n "$socket" && -S "$socket" ]] || return 1
 
-    local self_dir cmux_bin
+    local self_dir amux_bin
     self_dir="$(cd "$(dirname "$0")" && pwd)"
-    cmux_bin="$self_dir/$CMUX_CLI_NAME"
-    [[ -x "$cmux_bin" ]] || cmux_bin="$(command -v "$CMUX_CLI_NAME" || true)"
-    [[ -n "$cmux_bin" ]] || return 1
+    amux_bin="$self_dir/$AMUX_CLI_NAME"
+    [[ -x "$amux_bin" ]] || amux_bin="$(command -v "$AMUX_CLI_NAME" || true)"
+    [[ -n "$amux_bin" ]] || return 1
 
     # Keep stale/hung socket checks bounded so claude startup does not block
     # behind the CLI default timeout (15s).
-    CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC=0.75 \
-        "$cmux_bin" --socket "$socket" ping >/dev/null 2>&1
+    AMUX_CLI_RESPONSE_TIMEOUT_SEC=0.75 \
+        "$amux_bin" --socket "$socket" ping >/dev/null 2>&1
 }
 
-# Pass through if not in a cmux terminal, hooks are disabled, or the cmux
+# Pass through if not in an amux terminal, hooks are disabled, or the amux
 # socket is unavailable (stale env / app not running).
-IN_CMUX=0
-if [[ -n "$CMUX_SURFACE_ID" ]]; then
-    IN_CMUX=1
+IN_AMUX=0
+if [[ -n "${AMUX_SURFACE_ID:-}" ]]; then
+    IN_AMUX=1
 fi
 
-if [[ "$IN_CMUX" == "0" || "$CMUX_CLAUDE_HOOKS_DISABLED" == "1" ]] || ! cmux_socket_available; then
-    # In cmux-launched shells, preserve old behavior and always clear nested
+if [[ "$IN_AMUX" == "0" || "${AMUX_CLAUDE_HOOKS_DISABLED:-}" == "1" ]] || ! amux_socket_available; then
+    # In amux-launched shells, preserve old behavior and always clear nested
     # Claude session markers, even when we must pass through due to stale socket.
-    if [[ "$IN_CMUX" == "1" ]]; then
+    if [[ "$IN_AMUX" == "1" ]]; then
         unset CLAUDECODE
     fi
     REAL_CLAUDE="$(find_real_claude)" || { echo "Error: claude not found in PATH" >&2; exit 127; }
@@ -67,7 +67,7 @@ case "${1:-}" in
     mcp|config|api-key) exec "$REAL_CLAUDE" "$@" ;;
 esac
 
-# Unset CLAUDECODE to avoid "nested session" detection — cmux terminals are
+# Unset CLAUDECODE to avoid "nested session" detection — amux terminals are
 # independent sessions even when the parent shell was launched from Claude Code.
 unset CLAUDECODE
 
@@ -85,7 +85,7 @@ done
 
 # Build hooks settings JSON.
 # Claude Code merges --settings additively with the user's own settings.json.
-HOOKS_JSON="{\"hooks\":{\"SessionStart\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"$CMUX_CLI_NAME claude-hook session-start\",\"timeout\":10}]}],\"Stop\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"$CMUX_CLI_NAME claude-hook stop\",\"timeout\":10}]}],\"Notification\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"$CMUX_CLI_NAME claude-hook notification\",\"timeout\":10}]}]}}"
+HOOKS_JSON="{\"hooks\":{\"SessionStart\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"$AMUX_CLI_NAME claude-hook session-start\",\"timeout\":10}]}],\"Stop\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"$AMUX_CLI_NAME claude-hook stop\",\"timeout\":10}]}],\"Notification\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"$AMUX_CLI_NAME claude-hook notification\",\"timeout\":10}]}]}}"
 
 if [[ "$SKIP_SESSION_ID" == true ]]; then
     exec "$REAL_CLAUDE" --settings "$HOOKS_JSON" "$@"

@@ -141,12 +141,12 @@ The sidebar already shows metadata, but the agent can't easily see its own state
 One of the key values of watching an agent work in amux is seeing what it does. These features make that observable history persistent and browsable — so you can review any session after the fact, not just while it's live.
 
 **Scrollback persistence**
-- [x] **Save full scrollback on exit** — when a terminal pane closes (or amux exits), persist the complete scrollback buffer to disk (`~/.config/cmux/history/`)
+- [x] **Save full scrollback on exit** — when a terminal pane closes (or amux exits), persist the complete scrollback buffer to disk (`~/.config/amux/history/`)
 - [x] **Load scrollback on restore** — when session restore reopens a pane, replay its scrollback via `command` field so you can scroll up and see everything from the previous run
-- [x] **Configurable retention** — max entries (`CMUX_HISTORY_MAX_ENTRIES`, default 100), max bytes per entry (`CMUX_HISTORY_MAX_BYTES`, default 10MB), disable with `CMUX_HISTORY_DISABLED=1`
+- [x] **Configurable retention** — max entries (`AMUX_HISTORY_MAX_ENTRIES`, default 100), max bytes per entry (`AMUX_HISTORY_MAX_BYTES`, default 10MB), disable with `AMUX_HISTORY_DISABLED=1`
 
 **Session history browser**
-- [x] **Terminal session log** — index at `~/.config/cmux/history/index.json` tracks every terminal session: pane ID, workspace name/ID, close time, line/byte counts, working directory, close reason
+- [x] **Terminal session log** — index at `~/.config/amux/history/index.json` tracks every terminal session: pane ID, workspace name/ID, close time, line/byte counts, working directory, close reason
 - [x] **`amux-cli history list`** — CLI command to list past sessions with timestamps and metadata (supports `--workspace` and `--limit` filters)
 - [x] **`amux-cli history show <id>`** — retrieve the full saved scrollback for a past session
 - [x] **`amux-cli history search <query>`** — search across all saved session scrollbacks and metadata
@@ -160,6 +160,35 @@ One of the key values of watching an agent work in amux is seeing what it does. 
 - [ ] **Connection health monitoring** — detect when SSH sessions die, notify the agent
 - [ ] **Process status per pane** — track whether the shell is at a prompt or running a command
 - [ ] **Crash recovery** — if amux crashes, restore sessions from the last auto-save on relaunch
+
+### Hardening
+
+Identified via full code review (2026-03-19). These are correctness and safety issues in the existing codebase, not new features.
+
+**Safety & thread correctness**
+- [ ] **`surface_registry` mutex** — global HashMap written from GTK callbacks (`onRealize`, `onUnrealize`) and read from Ghostty renderer threads via `actionCallback` with no synchronization (`src/terminal_widget.zig`)
+- [ ] **`ResetEvent.wait()` timeouts** — socket handler threads wait indefinitely for GTK idle callbacks; a GTK thread hang deadlocks the handler forever (`src/socket/handlers.zig`)
+- [ ] **Surface lifetime in handler closures** — surface pointers captured in `g_idle_add` closures can dangle if the widget is destroyed before the idle callback fires; `handleSurfaceRun` polls `readSurfaceText()` from a handler thread where the surface could be destroyed mid-poll
+- [ ] **`@intCast` bounds checks** — 25+ unchecked casts from `i64` → `u64`/`usize` throughout `handlers.zig`; negative JSON values cause undefined behavior
+- [ ] **`claude_session_store` iterator invalidation** — `consume()` modifies HashMap during iteration; build a removal list first, then remove after iteration (`src/claude_session_store.zig`)
+- [ ] **History truncation UTF-8 safety** — `saveScrollback` truncates to `max_bytes` without checking for partial UTF-8 sequences at the boundary (`src/history.zig`)
+
+**Protocol hardening**
+- [ ] **Parse JSON once in `protocol.zig`** — every call to `getStringParam()`, `getIntParam()`, etc. re-parses the entire raw JSON line; parse once and cache the params object in `Request`
+- [ ] **Socket request size bounds** — fixed 8192-byte read buffer in `server.zig` silently truncates large requests with no feedback to the client
+- [ ] **Clipboard null dereference** — `gdk_clipboard_read_text_finish` result not checked for null before use (`src/clipboard.zig`)
+
+**CLI robustness**
+- [ ] **Validate numeric IDs** — command-line arguments used as JSON number fields are never validated as integers; `amux workspace select "abc"` sends malformed JSON (`cli/main.zig`)
+- [ ] **Buffer overflow on long inputs** — user input injected into fixed-size buffers (256–8192 bytes) via `bufPrint` with JSON escaping that can expand input size (`cli/main.zig`)
+- [ ] **Silent JSON parse failures** — `parseFromSlice` failure on stdin input caught as `null` with no error message (`cli/main.zig`)
+- [x] **Fix `CMUX_*` → `AMUX_*` env vars** — renamed all env vars, config paths, UI strings, and resource files from `cmux` to `amux`; moved `~/.config/cmux` to `~/.config/amux`
+
+**Code quality**
+- [ ] **Split `handlers.zig` by domain** — 2,772-line file handles all 42+ RPC methods; split into workspace, surface, notification, pane handler modules
+- [ ] **Extract CLI helper for JSON formatting** — the same `bufPrint` + error-print + return pattern appears 30+ times in `cli/main.zig`
+- [ ] **Named constants for buffer sizes** — bare literals (256, 512, 4096, 8192, 65536) throughout; define named constants
+- [ ] **Cap workspace history** — history buffer in `tab_manager.zig` grows without limit; use a ring buffer or cap
 
 ### Developer experience
 
@@ -189,4 +218,4 @@ One of the key values of watching an agent work in amux is seeing what it does. 
 
 ## Current state
 
-As of 2026-03-19: amux is a fully functional agent-first terminal multiplexer with 47 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit, and restored on session reload. The `amux-cli run` command enables agents to send a command and get output back in a single call with prompt detection. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by an AI agent using amux as its own development environment.
+As of 2026-03-19: amux is a fully functional agent-first terminal multiplexer with 47 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit, and restored on session reload. The `amux-cli run` command enables agents to send a command and get output back in a single call with prompt detection. A full code review identified thread safety, input validation, and protocol hardening issues now tracked in the Hardening section. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by an AI agent using amux as its own development environment.

@@ -17,7 +17,7 @@ pub const HistoryEntry = struct {
     reason: []const u8, // "pane_close", "workspace_close", "app_exit"
 };
 
-/// The index file stored at ~/.config/cmux/history/index.json
+/// The index file stored at ~/.config/amux/history/index.json
 pub const HistoryIndex = struct {
     version: u32 = 1,
     entries: std.ArrayListUnmanaged(HistoryEntry) = .{},
@@ -28,27 +28,27 @@ const default_max_entries: usize = 100;
 const default_max_bytes: usize = 10 * 1024 * 1024; // 10MB
 
 fn isDisabled() bool {
-    const val = std.posix.getenv("CMUX_HISTORY_DISABLED") orelse return false;
+    const val = std.posix.getenv("AMUX_HISTORY_DISABLED") orelse return false;
     return std.mem.eql(u8, val, "1");
 }
 
 fn getMaxEntries() usize {
-    const val = std.posix.getenv("CMUX_HISTORY_MAX_ENTRIES") orelse return default_max_entries;
+    const val = std.posix.getenv("AMUX_HISTORY_MAX_ENTRIES") orelse return default_max_entries;
     return std.fmt.parseInt(usize, val, 10) catch default_max_entries;
 }
 
 fn getMaxBytes() usize {
-    const val = std.posix.getenv("CMUX_HISTORY_MAX_BYTES") orelse return default_max_bytes;
+    const val = std.posix.getenv("AMUX_HISTORY_MAX_BYTES") orelse return default_max_bytes;
     return std.fmt.parseInt(usize, val, 10) catch default_max_bytes;
 }
 
-/// Get the history directory: $XDG_CONFIG_HOME/cmux/history or ~/.config/cmux/history
+/// Get the history directory: $XDG_CONFIG_HOME/amux/history or ~/.config/amux/history
 fn historyDir(buf: *[4096]u8) ?[]const u8 {
     if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
-        return std.fmt.bufPrint(buf, "{s}/cmux/history", .{xdg}) catch null;
+        return std.fmt.bufPrint(buf, "{s}/amux/history", .{xdg}) catch null;
     }
     if (std.posix.getenv("HOME")) |home| {
-        return std.fmt.bufPrint(buf, "{s}/.config/cmux/history", .{home}) catch null;
+        return std.fmt.bufPrint(buf, "{s}/.config/amux/history", .{home}) catch null;
     }
     return null;
 }

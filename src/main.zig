@@ -120,8 +120,8 @@ fn installDesktopFiles() void {
 
     if (c.g_file_test(icon_dest.ptr, c.G_FILE_TEST_EXISTS) == 0) {
         // Find icon relative to executable
-        const icon_src = findResourceFile("resources/cmux-icon.png") orelse {
-            log.warn("Could not find cmux-icon.png resource", .{});
+        const icon_src = findResourceFile("resources/amux-icon.png") orelse {
+            log.warn("Could not find amux-icon.png resource", .{});
             return;
         };
         copyFile(icon_src, icon_dest) catch |err| {

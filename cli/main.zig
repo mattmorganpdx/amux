@@ -76,7 +76,7 @@ pub fn main() !void {
         if (std.mem.eql(u8, sub, "list")) {
             try sendAndPrint(socket_path, "workspace.list", "{}", stdout, stderr);
         } else if (std.mem.eql(u8, sub, "create")) {
-            // Optional: cmux workspace create "My Title"
+            // Optional: amux-cli workspace create "My Title"
             const title = args.next();
             if (title) |t| {
                 var params_buf: [4096]u8 = undefined;
@@ -113,7 +113,7 @@ pub fn main() !void {
             };
             try sendAndPrint(socket_path, "workspace.close", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "rename")) {
-            // cmux workspace rename [<id>] <title>
+            // amux-cliworkspace rename [<id>] <title>
             const rename_arg1 = args.next() orelse {
                 try stderr.writeAll("Usage: amux workspace rename [<id>] <title>\n");
                 return;
@@ -134,7 +134,7 @@ pub fn main() !void {
                 try sendAndPrint(socket_path, "workspace.rename", params, stdout, stderr);
             }
         } else if (std.mem.eql(u8, sub, "report-git")) {
-            // cmux workspace report-git <id> <branch> [--dirty]
+            // amux-cliworkspace report-git <id> <branch> [--dirty]
             const id_str = args.next() orelse {
                 try stderr.writeAll("Usage: amux workspace report-git <id> <branch> [--dirty]\n");
                 return;
@@ -158,7 +158,7 @@ pub fn main() !void {
             };
             try sendAndPrint(socket_path, "workspace.report_git", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "set-status")) {
-            // cmux workspace set-status <id> <key> <value>
+            // amux-cliworkspace set-status <id> <key> <value>
             const id_str = args.next() orelse {
                 try stderr.writeAll("Usage: amux workspace set-status <id> <key> <value>\n");
                 return;
@@ -178,7 +178,7 @@ pub fn main() !void {
             };
             try sendAndPrint(socket_path, "workspace.set_status", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "clear-status")) {
-            // cmux workspace clear-status <id> [key]
+            // amux-cliworkspace clear-status <id> [key]
             const id_str = args.next() orelse {
                 try stderr.writeAll("Usage: amux workspace clear-status <id> [key]\n");
                 return;
@@ -199,7 +199,7 @@ pub fn main() !void {
                 try sendAndPrint(socket_path, "workspace.clear_status", params, stdout, stderr);
             }
         } else if (std.mem.eql(u8, sub, "add-log")) {
-            // cmux workspace add-log <id> <text>
+            // amux-cliworkspace add-log <id> <text>
             const id_str = args.next() orelse {
                 try stderr.writeAll("Usage: amux workspace add-log <id> <text>\n");
                 return;
@@ -215,7 +215,7 @@ pub fn main() !void {
             };
             try sendAndPrint(socket_path, "workspace.add_log", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "clear-log")) {
-            // cmux workspace clear-log <id>
+            // amux-cliworkspace clear-log <id>
             const id_str = args.next() orelse {
                 try stderr.writeAll("Usage: amux workspace clear-log <id>\n");
                 return;
@@ -227,7 +227,7 @@ pub fn main() !void {
             };
             try sendAndPrint(socket_path, "workspace.clear_log", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "set-progress")) {
-            // cmux workspace set-progress <id> <fraction> [label]
+            // amux-cliworkspace set-progress <id> <fraction> [label]
             const id_str = args.next() orelse {
                 try stderr.writeAll("Usage: amux workspace set-progress <id> <fraction> [label]\n");
                 return;
@@ -252,7 +252,7 @@ pub fn main() !void {
                 try sendAndPrint(socket_path, "workspace.set_progress", params, stdout, stderr);
             }
         } else if (std.mem.eql(u8, sub, "set-pinned")) {
-            // cmux workspace set-pinned <id> <true|false>
+            // amux-cliworkspace set-pinned <id> <true|false>
             const id_str = args.next() orelse {
                 try stderr.writeAll("Usage: amux workspace set-pinned <id> <true|false>\n");
                 return;
@@ -268,7 +268,7 @@ pub fn main() !void {
             };
             try sendAndPrint(socket_path, "workspace.set_pinned", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "set-color")) {
-            // cmux workspace set-color <id> <color|clear>
+            // amux-cliworkspace set-color <id> <color|clear>
             const id_str = args.next() orelse {
                 try stderr.writeAll("Usage: amux workspace set-color <id> <red|blue|green|yellow|purple|orange|pink|cyan|clear>\n");
                 return;
@@ -316,7 +316,7 @@ pub fn main() !void {
             };
             try sendAndPrint(socket_path, "surface.search", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "read-text") or std.mem.eql(u8, sub, "read")) {
-            // cmux surface read-text [surface_id] [--scrollback]
+            // amux-clisurface read-text [surface_id] [--scrollback]
             var surface_id: ?[]const u8 = null;
             var scrollback = false;
             while (args.next()) |arg| {
@@ -344,7 +344,7 @@ pub fn main() !void {
                 "{}";
             try sendAndPrint(socket_path, "surface.read_text", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "send-key")) {
-            // cmux surface send-key [--surface <id>] <key>
+            // amux-clisurface send-key [--surface <id>] <key>
             var surface_id: ?[]const u8 = null;
             var key: ?[]const u8 = null;
             while (args.next()) |arg| {
@@ -379,7 +379,7 @@ pub fn main() !void {
                 };
             try sendAndPrint(socket_path, "surface.send_key", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "split")) {
-            // cmux surface split <direction>
+            // amux-clisurface split <direction>
             const direction = args.next() orelse {
                 try stderr.writeAll("Usage: amux surface split <left|right|up|down>\n");
                 return;
@@ -391,7 +391,7 @@ pub fn main() !void {
             };
             try sendAndPrint(socket_path, "surface.split", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "close")) {
-            // cmux surface close
+            // amux-clisurface close
             try sendAndPrint(socket_path, "surface.close", "{}", stdout, stderr);
         } else {
             try stderr.writeAll("Unknown surface subcommand. Use: list, current, search, read-text, send-key, split, close\n");
@@ -427,7 +427,7 @@ pub fn main() !void {
             };
             try sendAndPrint(socket_path, "pane.join", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "resize")) {
-            // cmux pane resize <pane_id> <direction> [amount]
+            // amux-clipane resize <pane_id> <direction> [amount]
             const pane_id = args.next() orelse {
                 try stderr.writeAll("Usage: amux pane resize <pane_id> <left|right|up|down> [amount]\n");
                 return;
@@ -452,7 +452,7 @@ pub fn main() !void {
                 try sendAndPrint(socket_path, "pane.resize", params, stdout, stderr);
             }
         } else if (std.mem.eql(u8, sub, "swap")) {
-            // cmux pane swap <pane_a> <pane_b>
+            // amux-clipane swap <pane_a> <pane_b>
             const pane_a = args.next() orelse {
                 try stderr.writeAll("Usage: amux pane swap <pane_a> <pane_b>\n");
                 return;
@@ -526,7 +526,7 @@ pub fn main() !void {
         const params = fbs.getWritten();
         try sendAndPrint(socket_path, "surface.run", params, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "send")) {
-        // cmux send [--surface <id>] [--enter] <text>
+        // amux-clisend [--surface <id>] [--enter] <text>
         var surface_id: ?[]const u8 = null;
         var append_enter = false;
         var text: ?[]const u8 = null;
@@ -633,7 +633,7 @@ pub fn main() !void {
         }
     } else if (std.mem.eql(u8, subcommand, "claude-hook")) {
         // Claude Code hook integration. Reads JSON payload from stdin.
-        // Usage: cmux-cli claude-hook <session-start|stop|notification|prompt-submit>
+        // Usage: amux-cli claude-hook <session-start|stop|notification|prompt-submit>
         const hook_sub = args.next() orelse {
             try stderr.writeAll("Usage: amux claude-hook <session-start|stop|notification|prompt-submit>\n");
             return;
@@ -718,8 +718,8 @@ pub fn main() !void {
         const cwd_val: ?[]const u8 = if (cwd_len > 0) cwd_buf[0..cwd_len] else null;
 
         // Get workspace_id and surface_id from env vars
-        const ws_id = posix.getenv("CMUX_WORKSPACE_ID");
-        const surface_id = posix.getenv("CMUX_SURFACE_ID");
+        const ws_id = posix.getenv("AMUX_WORKSPACE_ID");
+        const surface_id = posix.getenv("AMUX_SURFACE_ID");
 
         // Build params JSON
         var params_buf: [8192]u8 = undefined;
@@ -834,7 +834,7 @@ pub fn main() !void {
     } else {
         try stderr.writeAll("Unknown command: ");
         try stderr.writeAll(subcommand);
-        try stderr.writeAll("\nRun 'cmux' for usage.\n");
+        try stderr.writeAll("\nRun 'amux-cli' for usage.\n");
     }
 }
 
@@ -884,7 +884,7 @@ fn sendAndPrint(socket_path: []const u8, method: []const u8, params: []const u8,
     defer posix.close(fd);
 
     posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
-        try stderr.writeAll("Failed to connect to cmux (is it running?)\n");
+        try stderr.writeAll("Failed to connect to amux (is it running?)\n");
         try stderr.writeAll("Socket path: ");
         try stderr.writeAll(socket_path);
         try stderr.writeAll("\n");

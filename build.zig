@@ -51,6 +51,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run cmux");
+    const run_step = b.step("run", "Run amux");
     run_step.dependOn(&run_cmd.step);
 }

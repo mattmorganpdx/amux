@@ -395,11 +395,11 @@ fn getJsonBool(val: std.json.Value, key: []const u8) ?bool {
 /// Get the session file path: $XDG_CONFIG_HOME/amux/session.json or ~/.config/amux/session.json
 fn sessionDir(buf: *[4096]u8) ?[]const u8 {
     if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
-        const len = std.fmt.bufPrint(buf, "{s}/cmux", .{xdg}) catch return null;
+        const len = std.fmt.bufPrint(buf, "{s}/amux", .{xdg}) catch return null;
         return len;
     }
     if (std.posix.getenv("HOME")) |home| {
-        const len = std.fmt.bufPrint(buf, "{s}/.config/cmux", .{home}) catch return null;
+        const len = std.fmt.bufPrint(buf, "{s}/.config/amux", .{home}) catch return null;
         return len;
     }
     return null;
@@ -567,6 +567,6 @@ fn restoreLayoutNode(tree: *PaneTree, layout: *const LayoutSnapshot, parent: ?Pa
 
 /// Check if session restore is disabled by environment variable.
 pub fn isRestoreDisabled() bool {
-    const val = std.posix.getenv("CMUX_DISABLE_SESSION_RESTORE") orelse return false;
+    const val = std.posix.getenv("AMUX_DISABLE_SESSION_RESTORE") orelse return false;
     return std.mem.eql(u8, val, "1");
 }

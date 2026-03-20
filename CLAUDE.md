@@ -122,7 +122,7 @@ cd linux && zig build
 ```
 
 This produces two binaries in `zig-out/bin/`:
-- `cmux` — the GUI terminal (requires GTK4, libghostty, libnotify)
+- `amux` — the GUI terminal (requires GTK4, libghostty, libnotify)
 - `amux-cli` — standalone socket client (libc only)
 
 ### Rebuilding libghostty

@@ -30,6 +30,211 @@ fn toUsize(val: i64) ?usize {
 /// GTK callbacks should complete near-instantly; this guards against hangs.
 const gtk_dispatch_timeout_ns: u64 = 10_000_000_000;
 
+// ------------------------------------------------------------------
+// Main-thread dispatch
+//
+// All window state -- `pane_widgets`, `tab_manager`, and the lifetime of
+// TerminalWidgets and their Ghostty surfaces -- is owned by the GTK main
+// thread. Socket handlers run on their own thread-per-client, so they must
+// never resolve a pane to a surface themselves: the pane can be closed (and
+// the widget freed) between the lookup and the call into libghostty, and
+// `pane_widgets` is an unsynchronized HashMap that the main thread may be
+// rehashing concurrently.
+//
+// Handlers therefore pass a *pane id* to the main thread and do the lookup
+// inside the callback, where the widget cannot be destroyed underneath them.
+// ------------------------------------------------------------------
+
+/// Dispatch `ctx` to the GTK main thread and block until its `run()` completes.
+///
+/// `Ctx` must expose `done: std.Thread.ResetEvent` and `fn run(*Ctx) void`.
+///
+/// On timeout the caller must leak `ctx` (and anything it borrows): the idle
+/// callback may still fire later and write through the pointer.
+fn runOnMainThread(comptime Ctx: type, ctx: *Ctx) error{Timeout}!void {
+    const Trampoline = struct {
+        fn cb(userdata: c.gpointer) callconv(.c) c.gboolean {
+            const inner: *Ctx = @ptrCast(@alignCast(userdata));
+            defer inner.done.set();
+            inner.run();
+            return c.G_SOURCE_REMOVE;
+        }
+    };
+    _ = c.g_idle_add(&Trampoline.cb, @ptrCast(ctx));
+    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
+        log.warn("GTK dispatch timed out for socket request", .{});
+        return error.Timeout;
+    };
+}
+
+/// Builds a JSON response body on the GTK main thread.
+///
+/// `tab_manager.workspaces` is a `std.ArrayListUnmanaged(*Workspace)` that the
+/// main thread reallocs on create (window.zig createWorkspace) and whose
+/// elements it frees on close (TabManager.closeWorkspace does `ws.deinit()`
+/// then `destroy(ws)`). Walking that list from a socket handler thread races
+/// both: an append can move the buffer out from under an in-flight iteration,
+/// and a close can leave the handler holding a dangling `*Workspace`. So the
+/// whole traversal-and-format runs on the main thread and only the finished
+/// string is handed back.
+///
+/// The body is allocated with c_allocator, not the request allocator, so it
+/// stays valid even when the context has to be leaked after a timeout.
+fn JsonOnMain(comptime Arg: type, comptime build: fn (*Window, Allocator, Arg) anyerror![]const u8) type {
+    return struct {
+        const Self = @This();
+
+        window: *Window,
+        arg: Arg,
+        result: ?[]const u8 = null,
+        done: std.Thread.ResetEvent = .{},
+
+        fn run(self: *Self) void {
+            self.result = build(self.window, std.heap.c_allocator, self.arg) catch |err| blk: {
+                log.warn("main-thread JSON build failed: {}", .{err});
+                break :blk null;
+            };
+        }
+    };
+}
+
+/// Run `build` on the GTK main thread and wrap its output in a success response.
+fn respondFromMainThreadWith(
+    alloc: Allocator,
+    req: *const protocol.Request,
+    window: *Window,
+    comptime Arg: type,
+    comptime build: fn (*Window, Allocator, Arg) anyerror![]const u8,
+    arg: Arg,
+) ![]const u8 {
+    const Ctx = JsonOnMain(Arg, build);
+    const ctx = std.heap.c_allocator.create(Ctx) catch {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    };
+    ctx.* = .{ .window = window, .arg = arg };
+
+    runOnMainThread(Ctx, ctx) catch {
+        // Deliberately leak ctx: the idle callback may still fire later.
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
+    defer std.heap.c_allocator.destroy(ctx);
+
+    const body = ctx.result orelse {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to build response");
+    };
+    defer std.heap.c_allocator.free(body);
+    return protocol.successResponse(alloc, req.id, body);
+}
+
+/// `respondFromMainThreadWith` for builders that need no extra argument.
+fn respondFromMainThread(
+    alloc: Allocator,
+    req: *const protocol.Request,
+    window: *Window,
+    comptime build: fn (*Window, Allocator, void) anyerror![]const u8,
+) ![]const u8 {
+    return respondFromMainThreadWith(alloc, req, window, void, build, {});
+}
+
+/// Why a pane could not be resolved to a live surface.
+const ResolveError = enum { none, no_surface, dead_surface, dead_realized };
+
+/// A pane resolved to a live Ghostty surface.
+const ResolvedSurface = struct {
+    surface: c.ghostty_surface_t,
+    pane_id: PaneTree.NodeId,
+};
+
+/// Whether an operation needs the widget to be GTK-realized.
+///
+/// Writing to a surface does; reading from it does not. `onUnrealize` clears
+/// `realized` but deliberately leaves `surface` non-null, so a widget that GTK
+/// has transiently unrealized (e.g. during the reparenting done by pane
+/// break/join/swap) can still be read from.
+const RealizedRequirement = enum { require_realized, allow_unrealized };
+
+/// Resolve `explicit` (or the focused pane when null) to a live surface.
+///
+/// MUST be called on the GTK main thread. The returned surface is only valid
+/// for the duration of that callback -- never store it across a dispatch.
+fn resolveSurfaceOnMain(
+    window: *Window,
+    explicit: ?PaneTree.NodeId,
+    requirement: RealizedRequirement,
+    err: *ResolveError,
+) ?ResolvedSurface {
+    const pane_id = explicit orelse blk: {
+        const ws = window.tab_manager.selectedWorkspace() orelse {
+            err.* = .no_surface;
+            return null;
+        };
+        break :blk ws.pane_tree.focused_pane orelse {
+            err.* = .no_surface;
+            return null;
+        };
+    };
+    const tw = window.pane_widgets.get(pane_id) orelse {
+        err.* = .no_surface;
+        return null;
+    };
+    if (tw.surface == null) {
+        err.* = .dead_surface;
+        return null;
+    }
+    if (requirement == .require_realized and !tw.realized) {
+        err.* = .dead_realized;
+        return null;
+    }
+    err.* = .none;
+    return .{ .surface = tw.surface, .pane_id = pane_id };
+}
+
+/// Map a resolve failure onto the wire error response.
+fn resolveErrorResponse(alloc: Allocator, req_id: i64, err: ResolveError) ![]const u8 {
+    return switch (err) {
+        .dead_surface, .dead_realized => protocol.errorResponse(alloc, req_id, "dead_surface", "Surface is not active (unrealized or uninitialized)"),
+        else => protocol.errorResponse(alloc, req_id, "no_surface", "No target surface found"),
+    };
+}
+
+/// Outcome of reading a surface's text.
+const ReadResult = struct {
+    ok: bool = false,
+    /// Heap-allocated with c_allocator; null when the surface had no text.
+    text: ?[]u8 = null,
+};
+
+/// Read a surface's text. MUST be called on the GTK main thread.
+fn readSurfaceTextOnMain(surface: c.ghostty_surface_t, include_scrollback: bool) ReadResult {
+    if (surface == null) return .{};
+
+    const point_tag: c.ghostty_point_tag_e = if (include_scrollback)
+        c.GHOSTTY_POINT_SCREEN
+    else
+        c.GHOSTTY_POINT_VIEWPORT;
+
+    var selection: c.ghostty_selection_s = std.mem.zeroes(c.ghostty_selection_s);
+    selection.top_left.tag = point_tag;
+    selection.top_left.coord = c.GHOSTTY_POINT_COORD_TOP_LEFT;
+    selection.top_left.x = 0;
+    selection.top_left.y = 0;
+    selection.bottom_right.tag = point_tag;
+    selection.bottom_right.coord = c.GHOSTTY_POINT_COORD_BOTTOM_RIGHT;
+    selection.bottom_right.x = 0;
+    selection.bottom_right.y = 0;
+    selection.rectangle = true;
+
+    var text: c.ghostty_text_s = std.mem.zeroes(c.ghostty_text_s);
+    if (!c.ghostty_surface_read_text(surface, selection, &text)) return .{};
+    defer c.ghostty_surface_free_text(surface, &text);
+
+    if (text.text == null or text.text_len == 0) return .{ .ok = true };
+
+    const copy = std.heap.c_allocator.alloc(u8, text.text_len) catch return .{};
+    @memcpy(copy, text.text[0..text.text_len]);
+    return .{ .ok = true, .text = copy };
+}
+
 /// Dispatch a request to the appropriate handler.
 pub fn dispatch(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     // System methods
@@ -263,29 +468,40 @@ fn handleSystemPing(alloc: Allocator, req: *const protocol.Request) ![]const u8 
     return protocol.successResponse(alloc, req.id, "{\"pong\":true}");
 }
 
-fn handleSystemIdentify(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const window = server.window;
-
-    // Build focused surface info
+/// MUST run on the GTK main thread (see JsonOnMain).
+/// `socket_path` is fixed at Server.init and never mutated, so passing it in is safe.
+fn buildIdentifyJson(window: *Window, alloc: Allocator, socket_path: []const u8) ![]const u8 {
     var focused_json: []const u8 = "null";
     var focused_alloc = false;
-    if (window) |w| {
-        if (w.tab_manager.selectedWorkspace()) |ws| {
-            if (ws.pane_tree.focused_pane) |pane_id| {
-                focused_json = try std.fmt.allocPrint(alloc,
-                    \\{{"workspace_id":{d},"workspace_title":"{s}","pane_id":{d}}}
-                , .{ ws.id, ws.getTitle(), pane_id });
-                focused_alloc = true;
-            }
+    if (window.tab_manager.selectedWorkspace()) |ws| {
+        if (ws.pane_tree.focused_pane) |pane_id| {
+            // The title is user-controlled and may contain quotes, backslashes
+            // or control characters, so it has to be escaped like every other
+            // string on the wire.
+            const escaped_title = try jsonEscapeString(alloc, ws.getTitle());
+            defer alloc.free(escaped_title);
+            focused_json = try std.fmt.allocPrint(alloc,
+                \\{{"workspace_id":{d},"workspace_title":"{s}","pane_id":{d}}}
+            , .{ ws.id, escaped_title, pane_id });
+            focused_alloc = true;
         }
     }
     defer if (focused_alloc) alloc.free(focused_json);
 
-    const result = try std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(alloc,
         \\{{"socket_path":"{s}","focused":{s},"caller":null}}
-    , .{ server.socket_path, focused_json });
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
+    , .{ socket_path, focused_json });
+}
+
+fn handleSystemIdentify(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
+    const window = server.window orelse {
+        const result = try std.fmt.allocPrint(alloc,
+            \\{{"socket_path":"{s}","focused":null,"caller":null}}
+        , .{server.socket_path});
+        defer alloc.free(result);
+        return protocol.successResponse(alloc, req.id, result);
+    };
+    return respondFromMainThreadWith(alloc, req, window, []const u8, buildIdentifyJson, server.socket_path);
 }
 
 fn handleSystemCapabilities(alloc: Allocator, req: *const protocol.Request) ![]const u8 {
@@ -311,7 +527,11 @@ fn handleSystemTree(alloc: Allocator, server: *Server, req: *const protocol.Requ
         ;
         return protocol.successResponse(alloc, req.id, result);
     };
+    return respondFromMainThread(alloc, req, window, buildSystemTreeJson);
+}
 
+/// MUST run on the GTK main thread (see JsonOnMain).
+fn buildSystemTreeJson(window: *Window, alloc: Allocator, _: void) ![]const u8 {
     // Build the tree: one window containing all workspaces
     var ws_array = JsonArrayBuilder.init(alloc);
     defer ws_array.deinit();
@@ -360,11 +580,9 @@ fn handleSystemTree(alloc: Allocator, server: *Server, req: *const protocol.Requ
     const workspaces_json = try ws_array.toOwnedSlice();
     defer alloc.free(workspaces_json);
 
-    const result = try std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(alloc,
         \\{{"focused":null,"caller":null,"windows":[{{"id":1,"workspace_count":{d},"workspaces":{s}}}]}}
     , .{ tm.workspaces.items.len, workspaces_json });
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
 }
 
 // ------------------------------------------------------------------
@@ -494,11 +712,8 @@ fn buildLogJson(alloc: Allocator, ws: *const Workspace) ![]const u8 {
     return buf.toOwnedSlice(alloc);
 }
 
-fn handleWorkspaceList(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const window = server.window orelse {
-        return protocol.successResponse(alloc, req.id, "{\"workspaces\":[]}");
-    };
-
+/// MUST run on the GTK main thread (see JsonOnMain).
+fn buildWorkspaceListJson(window: *Window, alloc: Allocator, _: void) ![]const u8 {
     const tm = &window.tab_manager;
 
     var array = JsonArrayBuilder.init(alloc);
@@ -516,12 +731,70 @@ fn handleWorkspaceList(alloc: Allocator, server: *Server, req: *const protocol.R
     const ws_list = try array.toOwnedSlice();
     defer alloc.free(ws_list);
 
-    const result = try std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(alloc,
         \\{{"workspaces":{s}}}
     , .{ws_list});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
 }
+
+fn handleWorkspaceList(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
+    const window = server.window orelse {
+        return protocol.successResponse(alloc, req.id, "{\"workspaces\":[]}");
+    };
+    return respondFromMainThread(alloc, req, window, buildWorkspaceListJson);
+}
+
+/// Creates a workspace and switches to it, entirely on the GTK main thread.
+///
+/// `TabManager.createWorkspace` appends to `workspaces`, which reallocs the
+/// list. Doing that from a socket handler thread would race every main-thread
+/// reader (and the sidebar), so the whole create-switch-serialize sequence
+/// happens in one main-thread hop.
+const WorkspaceCreateCtx = struct {
+    window: *Window,
+    /// c_allocator-owned copy of the requested title, so it stays valid even
+    /// if this context has to be leaked after a dispatch timeout.
+    title: ?[]u8,
+    body: ?[]const u8 = null,
+    failed: bool = false,
+    done: std.Thread.ResetEvent = .{},
+
+    fn run(self: *WorkspaceCreateCtx) void {
+        const window = self.window;
+        const tm = &window.tab_manager;
+
+        const ws = tm.createWorkspace() catch |err| {
+            log.warn("Failed to create workspace from socket: {}", .{err});
+            self.failed = true;
+            return;
+        };
+        if (self.title) |t| ws.setTitle(t);
+
+        const idx = tm.workspaces.items.len - 1;
+
+        // Build the widgets and switch the UI to the new workspace.
+        window.sidebar.rebuild();
+        window.switchWorkspace(idx) catch |err| {
+            // The data model exists either way; report it rather than failing.
+            log.warn("Failed to switch to new workspace: {}", .{err});
+        };
+
+        // Report the real selection state. HEAD hardcoded `false` because the
+        // switch was dispatched asynchronously and had not happened yet at
+        // serialization time; it now completes above, so `false` would lie.
+        const is_selected = if (tm.selected_index) |sel| sel == idx else false;
+
+        const ca = std.heap.c_allocator;
+        const ws_json = workspaceToJson(ca, ws, is_selected, idx) catch {
+            self.failed = true;
+            return;
+        };
+        defer ca.free(ws_json);
+        self.body = std.fmt.allocPrint(ca, "{{\"workspace\":{s}}}", .{ws_json}) catch {
+            self.failed = true;
+            return;
+        };
+    }
+};
 
 fn handleWorkspaceCreate(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const window = server.window orelse {
@@ -532,55 +805,59 @@ fn handleWorkspaceCreate(alloc: Allocator, server: *Server, req: *const protocol
     const title = req.getStringParam(alloc, "title");
     defer if (title) |t| alloc.free(t);
 
-    // Create the workspace data model
-    const ws = window.tab_manager.createWorkspace() catch |err| {
-        return protocol.errorResponse(alloc, req.id, "create_failed", @errorName(err));
-    };
-
-    if (title) |t| {
-        ws.setTitle(t);
-    }
-
-    const idx = window.tab_manager.workspaces.items.len - 1;
-
-    // Schedule GTK widget building and switch on the main thread.
-    // The workspace data model is already created; we just need to build
-    // the widgets and switch the UI to it.
-    const switch_ctx = std.heap.c_allocator.create(WorkspaceSwitchCtx) catch {
+    const ctx = std.heap.c_allocator.create(WorkspaceCreateCtx) catch {
         return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
     };
-    switch_ctx.* = .{ .window = window, .index = idx };
-    _ = c.g_idle_add(&doWorkspaceSwitch, @ptrCast(switch_ctx));
+    const title_owned: ?[]u8 = if (title) |t|
+        std.heap.c_allocator.dupe(u8, t) catch {
+            std.heap.c_allocator.destroy(ctx);
+            return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+        }
+    else
+        null;
+    ctx.* = .{ .window = window, .title = title_owned };
 
-    const ws_json = try workspaceToJson(alloc, ws, false, idx);
-    defer alloc.free(ws_json);
+    runOnMainThread(WorkspaceCreateCtx, ctx) catch {
+        // Deliberately leak ctx and its title copy: the idle callback may still
+        // fire later and dereference both.
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
+    defer {
+        if (ctx.title) |t| std.heap.c_allocator.free(t);
+        if (ctx.body) |b| std.heap.c_allocator.free(b);
+        std.heap.c_allocator.destroy(ctx);
+    }
 
-    const result = try std.fmt.allocPrint(alloc,
-        \\{{"workspace":{s}}}
-    , .{ws_json});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
+    if (ctx.failed) {
+        return protocol.errorResponse(alloc, req.id, "create_failed", "Failed to create workspace");
+    }
+    const body = ctx.body orelse {
+        return protocol.errorResponse(alloc, req.id, "create_failed", "Failed to create workspace");
+    };
+    return protocol.successResponse(alloc, req.id, body);
 }
 
-fn handleWorkspaceCurrent(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const window = server.window orelse {
-        return protocol.successResponse(alloc, req.id, "{\"workspace\":null}");
-    };
-
+/// MUST run on the GTK main thread (see JsonOnMain).
+fn buildWorkspaceCurrentJson(window: *Window, alloc: Allocator, _: void) ![]const u8 {
     const tm = &window.tab_manager;
     const ws = tm.selectedWorkspace() orelse {
-        return protocol.successResponse(alloc, req.id, "{\"workspace\":null}");
+        return alloc.dupe(u8, "{\"workspace\":null}");
     };
 
     const idx = tm.selected_index orelse 0;
     const ws_json = try workspaceToJson(alloc, ws, true, idx);
     defer alloc.free(ws_json);
 
-    const result = try std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(alloc,
         \\{{"workspace":{s}}}
     , .{ws_json});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
+}
+
+fn handleWorkspaceCurrent(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
+    const window = server.window orelse {
+        return protocol.successResponse(alloc, req.id, "{\"workspace\":null}");
+    };
+    return respondFromMainThread(alloc, req, window, buildWorkspaceCurrentJson);
 }
 
 fn handleWorkspaceSelect(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
@@ -588,97 +865,178 @@ fn handleWorkspaceSelect(alloc: Allocator, server: *Server, req: *const protocol
         return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
     };
 
-    // Resolve target workspace index
-    var target_index: ?usize = null;
-
-    if (req.getIntParam(alloc, "id")) |id| {
-        const ws_id = toU64(id) orelse {
+    // The id/index -> workspace resolution happens on the main thread.
+    const selector: WorkspaceSelector = if (req.getIntParam(alloc, "id")) |id| blk: {
+        break :blk .{ .id = toU64(id) orelse {
             return protocol.errorResponse(alloc, req.id, "invalid_param", "Workspace ID must be non-negative");
-        };
-        for (window.tab_manager.workspaces.items, 0..) |ws, i| {
-            if (ws.id == ws_id) {
-                target_index = i;
-                break;
-            }
-        }
-        if (target_index == null) {
-            return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-        }
-    } else if (req.getIntParam(alloc, "index")) |index| {
-        const idx = toUsize(index) orelse {
+        } };
+    } else if (req.getIntParam(alloc, "index")) |index| blk: {
+        break :blk .{ .index = toUsize(index) orelse {
             return protocol.errorResponse(alloc, req.id, "invalid_param", "Index must be non-negative");
-        };
-        if (idx >= window.tab_manager.workspaces.items.len) {
-            return protocol.errorResponse(alloc, req.id, "not_found", "Invalid workspace index");
-        }
-        target_index = idx;
+        } };
     } else {
         return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'id' or 'index' parameter");
-    }
-
-    const idx = target_index.?;
-
-    // Dispatch workspace switch to GTK main thread and block until complete.
-    // This ensures subsequent socket commands (send, send-key) see the
-    // updated workspace and target the correct surface.
-    const ctx = std.heap.c_allocator.create(WorkspaceSwitchCtx) catch {
-        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
-    };
-    ctx.* = .{
-        .window = window,
-        .index = idx,
-    };
-    _ = c.g_idle_add(&doWorkspaceSwitch, @ptrCast(ctx));
-
-    // Block until the GTK main thread completes the switch
-    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
-        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
-        // since the GTK idle callback may still fire later.
-        log.warn("GTK dispatch timed out for socket request", .{});
-        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
     };
 
-    const success = ctx.success;
-    std.heap.c_allocator.destroy(ctx);
-
-    if (!success) {
-        return protocol.errorResponse(alloc, req.id, "switch_failed", "Failed to switch workspace");
-    }
-
-    // Return the now-selected workspace
-    const ws = window.tab_manager.workspaces.items[idx];
-    const ws_json = try workspaceToJson(alloc, ws, true, idx);
-    defer alloc.free(ws_json);
-
-    const result = try std.fmt.allocPrint(alloc,
-        \\{{"workspace":{s}}}
-    , .{ws_json});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
+    return respondWorkspaceSwitch(alloc, req, window, selector);
 }
+
+/// How to pick the workspace to switch to.
+///
+/// Resolved inside WorkspaceSwitchCtx.run on the GTK main thread. The
+/// workspace list is owned there, so a socket handler must never walk it to
+/// turn an id into an index: an append can realloc the list and a close frees
+/// the `*Workspace` outright.
+const WorkspaceSelector = union(enum) {
+    index: usize,
+    id: u64,
+    /// The most recently appended workspace (used right after create).
+    newest,
+    next,
+    previous,
+    /// The most recent entry in the workspace history stack.
+    last_visited,
+};
+
+/// Why a switch could not happen, mapped to a wire error by the caller.
+const SwitchFailure = enum {
+    none,
+    not_found,
+    no_selection,
+    at_end,
+    at_start,
+    no_history,
+    switch_failed,
+};
 
 const WorkspaceSwitchCtx = struct {
     window: *Window,
-    index: usize,
-    success: bool = false,
+    selector: WorkspaceSelector,
+    /// Response body, c_allocator-owned so it survives a leaked context.
+    body: ?[]const u8 = null,
+    failure: SwitchFailure = .none,
     done: std.Thread.ResetEvent = .{},
+
+    fn run(self: *WorkspaceSwitchCtx) void {
+        const window = self.window;
+        const tm = &window.tab_manager;
+
+        // Rebuild the sidebar in case a workspace was just added.
+        window.sidebar.rebuild();
+
+        const idx: usize = switch (self.selector) {
+            .index => |i| i,
+            .id => |wid| blk: {
+                for (tm.workspaces.items, 0..) |ws, i| {
+                    if (ws.id == wid) break :blk i;
+                }
+                self.failure = .not_found;
+                return;
+            },
+            .newest => blk: {
+                if (tm.workspaces.items.len == 0) {
+                    self.failure = .not_found;
+                    return;
+                }
+                break :blk tm.workspaces.items.len - 1;
+            },
+            .next => blk: {
+                const cur = tm.selected_index orelse {
+                    self.failure = .no_selection;
+                    return;
+                };
+                if (cur + 1 >= tm.workspaces.items.len) {
+                    self.failure = .at_end;
+                    return;
+                }
+                break :blk cur + 1;
+            },
+            .previous => blk: {
+                const cur = tm.selected_index orelse {
+                    self.failure = .no_selection;
+                    return;
+                };
+                if (cur == 0) {
+                    self.failure = .at_start;
+                    return;
+                }
+                break :blk cur - 1;
+            },
+            .last_visited => blk: {
+                if (tm.history.items.len == 0) {
+                    self.failure = .no_history;
+                    return;
+                }
+                const last_id = tm.history.items[tm.history.items.len - 1];
+                for (tm.workspaces.items, 0..) |ws, i| {
+                    if (ws.id == last_id) break :blk i;
+                }
+                self.failure = .not_found;
+                return;
+            },
+        };
+
+        if (idx >= tm.workspaces.items.len) {
+            self.failure = .not_found;
+            return;
+        }
+
+        window.switchWorkspace(idx) catch |err| {
+            log.warn("Failed to switch workspace from socket: {}", .{err});
+            self.failure = .switch_failed;
+            return;
+        };
+
+        // Build the response here too: workspaceToJson reads the workspace and
+        // its pane tree, which are main-thread state.
+        const ca = std.heap.c_allocator;
+        const ws_json = workspaceToJson(ca, tm.workspaces.items[idx], true, idx) catch {
+            self.failure = .switch_failed;
+            return;
+        };
+        defer ca.free(ws_json);
+        self.body = std.fmt.allocPrint(ca, "{{\"workspace\":{s}}}", .{ws_json}) catch {
+            self.failure = .switch_failed;
+            return;
+        };
+    }
 };
 
-fn doWorkspaceSwitch(userdata: c.gpointer) callconv(.c) c.gboolean {
-    const ctx: *WorkspaceSwitchCtx = @ptrCast(@alignCast(userdata));
-    // Do NOT defer destroy — the handler thread still needs ctx
-    defer ctx.done.set();
-
-    // Rebuild sidebar in case a new workspace was added
-    ctx.window.sidebar.rebuild();
-
-    ctx.window.switchWorkspace(ctx.index) catch |err| {
-        log.warn("Failed to switch workspace from socket: {}", .{err});
-        return c.G_SOURCE_REMOVE;
+/// Dispatch a workspace switch to the main thread and build the response.
+fn respondWorkspaceSwitch(
+    alloc: Allocator,
+    req: *const protocol.Request,
+    window: *Window,
+    selector: WorkspaceSelector,
+) ![]const u8 {
+    const ctx = std.heap.c_allocator.create(WorkspaceSwitchCtx) catch {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
     };
-    ctx.success = true;
+    ctx.* = .{ .window = window, .selector = selector };
 
-    return c.G_SOURCE_REMOVE;
+    runOnMainThread(WorkspaceSwitchCtx, ctx) catch {
+        // Deliberately leak ctx: the idle callback may still fire later.
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
+    defer {
+        if (ctx.body) |b| std.heap.c_allocator.free(b);
+        std.heap.c_allocator.destroy(ctx);
+    }
+
+    switch (ctx.failure) {
+        .none => {},
+        .not_found => return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found"),
+        .no_selection => return protocol.errorResponse(alloc, req.id, "no_workspace", "No workspace selected"),
+        .at_end => return protocol.errorResponse(alloc, req.id, "at_end", "Already at last workspace"),
+        .at_start => return protocol.errorResponse(alloc, req.id, "at_start", "Already at first workspace"),
+        .no_history => return protocol.errorResponse(alloc, req.id, "no_history", "No workspace history"),
+        .switch_failed => return protocol.errorResponse(alloc, req.id, "switch_failed", "Failed to switch workspace"),
+    }
+
+    const body = ctx.body orelse {
+        return protocol.errorResponse(alloc, req.id, "switch_failed", "Failed to switch workspace");
+    };
+    return protocol.successResponse(alloc, req.id, body);
 }
 
 fn handleWorkspaceClose(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
@@ -686,170 +1044,302 @@ fn handleWorkspaceClose(alloc: Allocator, server: *Server, req: *const protocol.
         return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
     };
 
-    // Validate the workspace exists before scheduling close
-    var close_id: ?u64 = null;
-    var close_index: ?usize = null;
-
-    if (req.getIntParam(alloc, "id")) |id| {
-        const ws_id = toU64(id) orelse {
+    // Resolution happens on the main thread; validating here would race a
+    // concurrent create/close that reallocs or shrinks the workspace list.
+    const selector: WorkspaceSelector = if (req.getIntParam(alloc, "id")) |id| blk: {
+        break :blk .{ .id = toU64(id) orelse {
             return protocol.errorResponse(alloc, req.id, "invalid_param", "Workspace ID must be non-negative");
-        };
-        for (window.tab_manager.workspaces.items, 0..) |ws, i| {
-            if (ws.id == ws_id) {
-                close_id = ws_id;
-                close_index = i;
-                break;
-            }
-        }
-        if (close_id == null) {
-            return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-        }
-    } else if (req.getIntParam(alloc, "index")) |index| {
-        const idx = toUsize(index) orelse {
+        } };
+    } else if (req.getIntParam(alloc, "index")) |index| blk: {
+        break :blk .{ .index = toUsize(index) orelse {
             return protocol.errorResponse(alloc, req.id, "invalid_param", "Index must be non-negative");
-        };
-        if (idx >= window.tab_manager.workspaces.items.len) {
-            return protocol.errorResponse(alloc, req.id, "not_found", "Invalid workspace index");
-        }
-        close_index = idx;
+        } };
     } else {
         return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'id' or 'index' parameter");
-    }
+    };
 
-    // Schedule close on main thread (tab_manager + sidebar rebuild)
     const ctx = std.heap.c_allocator.create(WorkspaceCloseCtx) catch {
         return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
     };
-    ctx.* = .{
-        .window = window,
-        .index = close_index.?,
-        .id = close_id,
-    };
-    _ = c.g_idle_add(&doWorkspaceClose, @ptrCast(ctx));
+    ctx.* = .{ .window = window, .selector = selector };
 
+    runOnMainThread(WorkspaceCloseCtx, ctx) catch {
+        // Deliberately leak ctx: the idle callback may still fire later.
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
+    defer std.heap.c_allocator.destroy(ctx);
+
+    if (!ctx.closed) {
+        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
+    }
     return protocol.successResponse(alloc, req.id, "{\"closed\":true}");
 }
 
 const WorkspaceCloseCtx = struct {
     window: *Window,
-    index: usize,
-    id: ?u64,
+    selector: WorkspaceSelector,
+    closed: bool = false,
+    done: std.Thread.ResetEvent = .{},
+
+    fn run(self: *WorkspaceCloseCtx) void {
+        const tm = &self.window.tab_manager;
+        switch (self.selector) {
+            .id => |wid| {
+                var exists = false;
+                for (tm.workspaces.items) |ws| {
+                    if (ws.id == wid) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) return;
+                self.closed = self.window.closeWorkspaceById(wid);
+            },
+            .index => |i| {
+                if (i >= tm.workspaces.items.len) return;
+                self.closed = self.window.closeWorkspaceByIndex(i);
+            },
+            else => return,
+        }
+        // Rebuild sidebar to reflect the change
+        self.window.sidebar.rebuild();
+    }
 };
 
-fn doWorkspaceClose(userdata: c.gpointer) callconv(.c) c.gboolean {
-    const ctx: *WorkspaceCloseCtx = @ptrCast(@alignCast(userdata));
-    defer std.heap.c_allocator.destroy(ctx);
-
-    if (ctx.id) |id| {
-        _ = ctx.window.closeWorkspaceById(id);
-    } else {
-        _ = ctx.window.closeWorkspaceByIndex(ctx.index);
-    }
-
-    // Rebuild sidebar to reflect the change
-    ctx.window.sidebar.rebuild();
-
-    return c.G_SOURCE_REMOVE;
-}
 
 fn handleWorkspaceRename(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const window = server.window orelse {
-        return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
-    };
-
     const new_title = req.getStringParam(alloc, "title") orelse {
         return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'title' parameter");
     };
     defer alloc.free(new_title);
 
-    // Find workspace by id or use current
-    var ws: ?*Workspace = null;
-    if (req.getIntParam(alloc, "id")) |id| {
-        const ws_id = toU64(id) orelse {
-            return protocol.errorResponse(alloc, req.id, "invalid_param", "Workspace ID must be non-negative");
-        };
-        ws = window.tab_manager.findById(ws_id);
-    } else {
-        ws = window.tab_manager.selectedWorkspace();
-    }
-
-    if (ws) |w| {
-        w.setTitle(new_title);
-        return protocol.successResponse(alloc, req.id, "{\"renamed\":true}");
-    }
-
-    return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
+    const arg = WsMutArg{ .text_a = ownArg(new_title) orelse {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    } };
+    return respondWorkspaceMutation(alloc, req, server, arg, applyRename, .row, "{\"renamed\":true}");
 }
 
 // ------------------------------------------------------------------
 // Workspace metadata handlers
 // ------------------------------------------------------------------
 
-/// Helper: find a workspace by id param, or fall back to current workspace.
-fn resolveWorkspace(server: *Server, alloc: Allocator, req: *const protocol.Request) ?*Workspace {
-    const window = server.window orelse return null;
-    if (req.getIntParam(alloc, "id")) |id| {
-        return window.tab_manager.findById(toU64(id) orelse return null);
-    }
-    return window.tab_manager.selectedWorkspace();
-}
+/// Payload for a workspace metadata mutation.
+///
+/// Strings are c_allocator-owned by the context, not the request allocator:
+/// the handler's copies are freed as soon as it returns, but a context leaked
+/// after a dispatch timeout may still be read by a late idle callback.
+const WsMutArg = struct {
+    text_a: ?[]u8 = null,
+    text_b: ?[]u8 = null,
+    number: f64 = 0,
+    flag: bool = false,
+    has_flag: bool = false,
 
-/// Helper: find the index of a workspace in the tab manager.
-fn workspaceIndex(server: *Server, ws: *const Workspace) ?usize {
-    const window = server.window orelse return null;
-    for (window.tab_manager.workspaces.items, 0..) |w, i| {
-        if (w.id == ws.id) return i;
+    fn free(self: WsMutArg) void {
+        const ca = std.heap.c_allocator;
+        if (self.text_a) |t| ca.free(t);
+        if (self.text_b) |t| ca.free(t);
     }
-    return null;
-}
-
-/// Context for scheduling a sidebar row update on the GTK main thread.
-const SidebarUpdateCtx = struct {
-    window: *Window,
-    index: usize,
 };
 
-fn doSidebarUpdate(userdata: c.gpointer) callconv(.c) c.gboolean {
-    const ctx: *SidebarUpdateCtx = @ptrCast(@alignCast(userdata));
-    defer std.heap.c_allocator.destroy(ctx);
-    ctx.window.sidebar.updateRow(ctx.index);
-    return c.G_SOURCE_REMOVE;
+/// Copy a request-allocator string into a c_allocator buffer for a WsMutArg.
+fn ownArg(text: []const u8) ?[]u8 {
+    return std.heap.c_allocator.dupe(u8, text) catch null;
 }
 
-/// Schedule a sidebar row update for the given workspace.
-fn scheduleSidebarUpdate(server: *Server, ws: *const Workspace) void {
-    const window = server.window orelse return;
-    const idx = workspaceIndex(server, ws) orelse return;
-    const ctx = std.heap.c_allocator.create(SidebarUpdateCtx) catch return;
-    ctx.* = .{ .window = window, .index = idx };
-    _ = c.g_idle_add(&doSidebarUpdate, @ptrCast(ctx));
-}
+/// How the sidebar should be refreshed after a mutation.
+const SidebarRefresh = enum { row, rebuild };
 
-fn handleWorkspaceReportGit(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveWorkspace(server, alloc, req) orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
+/// Applies a metadata mutation to a workspace on the GTK main thread.
+///
+/// Both halves must happen there. Resolving the target walks
+/// `tab_manager.workspaces`, which the main thread reallocs on create and
+/// frees elements from on close; and the mutated fields (title, status, log,
+/// progress, git info, pin, color) are exactly what the sidebar reads.
+const WorkspaceMutationCtx = struct {
+    window: *Window,
+    /// null selects the currently selected workspace.
+    target_id: ?u64,
+    arg: WsMutArg,
+    apply: *const fn (*Workspace, WsMutArg) void,
+    refresh: SidebarRefresh,
+    found: bool = false,
+    /// Id of the workspace the mutation actually landed on.
+    resolved_id: u64 = 0,
+    done: std.Thread.ResetEvent = .{},
+
+    fn run(self: *WorkspaceMutationCtx) void {
+        const tm = &self.window.tab_manager;
+        var index: usize = 0;
+        const ws: *Workspace = blk: {
+            if (self.target_id) |wid| {
+                for (tm.workspaces.items, 0..) |w, i| {
+                    if (w.id == wid) {
+                        index = i;
+                        break :blk w;
+                    }
+                }
+                return; // leaves found = false
+            }
+            const sel = tm.selected_index orelse return;
+            if (sel >= tm.workspaces.items.len) return;
+            index = sel;
+            break :blk tm.workspaces.items[sel];
+        };
+
+        self.apply(ws, self.arg);
+        self.found = true;
+        self.resolved_id = ws.id;
+
+        switch (self.refresh) {
+            .row => self.window.sidebar.updateRow(index),
+            .rebuild => self.window.sidebar.rebuild(),
+        }
+    }
+};
+
+/// Outcome of a workspace mutation, keeping "no such workspace" distinct from
+/// "the GTK thread never answered" so the two do not report the same error.
+const MutationResult = union(enum) {
+    ok: u64,
+    not_found,
+    unavailable,
+};
+
+/// Run a workspace mutation on the GTK main thread.
+///
+/// Takes ownership of `arg` in all cases.
+fn mutateWorkspaceOnMain(
+    window: *Window,
+    target_id: ?u64,
+    arg: WsMutArg,
+    apply: *const fn (*Workspace, WsMutArg) void,
+    refresh: SidebarRefresh,
+) MutationResult {
+    const ctx = std.heap.c_allocator.create(WorkspaceMutationCtx) catch {
+        arg.free();
+        return .unavailable;
+    };
+    ctx.* = .{
+        .window = window,
+        .target_id = target_id,
+        .arg = arg,
+        .apply = apply,
+        .refresh = refresh,
     };
 
+    runOnMainThread(WorkspaceMutationCtx, ctx) catch {
+        // Deliberately leak ctx and its owned strings: the idle callback may
+        // still fire later and dereference both.
+        return .unavailable;
+    };
+    defer {
+        ctx.arg.free();
+        std.heap.c_allocator.destroy(ctx);
+    }
+
+    if (!ctx.found) return .not_found;
+    return .{ .ok = ctx.resolved_id };
+}
+
+fn respondWorkspaceMutation(
+    alloc: Allocator,
+    req: *const protocol.Request,
+    server: *Server,
+    arg: WsMutArg,
+    apply: *const fn (*Workspace, WsMutArg) void,
+    refresh: SidebarRefresh,
+    success_body: []const u8,
+) ![]const u8 {
+    const window = server.window orelse {
+        arg.free();
+        return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
+    };
+
+    var target_id: ?u64 = null;
+    if (req.getIntParam(alloc, "id")) |id| {
+        target_id = toU64(id) orelse {
+            arg.free();
+            return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
+        };
+    }
+
+    switch (mutateWorkspaceOnMain(window, target_id, arg, apply, refresh)) {
+        .ok => {},
+        .not_found => return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found"),
+        .unavailable => return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out"),
+    }
+    return protocol.successResponse(alloc, req.id, success_body);
+}
+
+// Mutations. Each runs on the GTK main thread via WorkspaceMutationCtx.
+fn applyReportGit(ws: *Workspace, arg: WsMutArg) void {
+    if (arg.text_a) |branch| ws.setGitBranch(branch);
+    if (arg.has_flag) ws.setGitDirty(arg.flag);
+}
+
+fn applySetStatus(ws: *Workspace, arg: WsMutArg) void {
+    ws.setStatusEntry(arg.text_a orelse return, arg.text_b orelse return);
+}
+
+fn applyClearStatus(ws: *Workspace, arg: WsMutArg) void {
+    if (arg.text_a) |key| {
+        ws.removeStatusEntry(key);
+    } else {
+        ws.clearStatus();
+    }
+}
+
+fn applyAddLog(ws: *Workspace, arg: WsMutArg) void {
+    ws.addLogEntry(arg.text_a orelse return);
+}
+
+fn applyClearLog(ws: *Workspace, _: WsMutArg) void {
+    ws.clearLog();
+}
+
+fn applySetProgress(ws: *Workspace, arg: WsMutArg) void {
+    ws.setProgress(@floatCast(arg.number), arg.text_a);
+}
+
+fn applySetPinned(ws: *Workspace, arg: WsMutArg) void {
+    ws.pinned = arg.flag;
+}
+
+fn applySetColor(ws: *Workspace, arg: WsMutArg) void {
+    const name = arg.text_a orelse {
+        ws.clearColor();
+        return;
+    };
+    if (name.len == 0) {
+        ws.clearColor();
+    } else {
+        ws.setColor(name);
+    }
+}
+
+fn applyRename(ws: *Workspace, arg: WsMutArg) void {
+    ws.setTitle(arg.text_a orelse return);
+}
+
+
+fn handleWorkspaceReportGit(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const branch = req.getStringParam(alloc, "branch") orelse {
         return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'branch' parameter");
     };
     defer alloc.free(branch);
 
-    ws.setGitBranch(branch);
-
+    var arg = WsMutArg{ .text_a = ownArg(branch) orelse {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    } };
     if (req.getBoolParam(alloc, "dirty")) |dirty| {
-        ws.setGitDirty(dirty);
+        arg.flag = dirty;
+        arg.has_flag = true;
     }
-
-    scheduleSidebarUpdate(server, ws);
-    return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
+    return respondWorkspaceMutation(alloc, req, server, arg, applyReportGit, .row, "{\"ok\":true}");
 }
 
 fn handleWorkspaceSetStatus(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveWorkspace(server, alloc, req) orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-    };
-
     const key = req.getStringParam(alloc, "key") orelse {
         return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'key' parameter");
     };
@@ -860,164 +1350,161 @@ fn handleWorkspaceSetStatus(alloc: Allocator, server: *Server, req: *const proto
     };
     defer alloc.free(value);
 
-    ws.setStatusEntry(key, value);
-    scheduleSidebarUpdate(server, ws);
-    return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
+    const arg = WsMutArg{ .text_a = ownArg(key), .text_b = ownArg(value) };
+    if (arg.text_a == null or arg.text_b == null) {
+        arg.free();
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    }
+    return respondWorkspaceMutation(alloc, req, server, arg, applySetStatus, .row, "{\"ok\":true}");
 }
 
 fn handleWorkspaceClearStatus(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveWorkspace(server, alloc, req) orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-    };
-
     // Optional key param: clear one entry or all
+    var arg = WsMutArg{};
     if (req.getStringParam(alloc, "key")) |key| {
         defer alloc.free(key);
-        ws.removeStatusEntry(key);
-    } else {
-        ws.clearStatus();
+        arg.text_a = ownArg(key) orelse {
+            return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+        };
     }
-
-    scheduleSidebarUpdate(server, ws);
-    return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
+    return respondWorkspaceMutation(alloc, req, server, arg, applyClearStatus, .row, "{\"ok\":true}");
 }
 
 fn handleWorkspaceAddLog(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveWorkspace(server, alloc, req) orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-    };
-
     const text = req.getStringParam(alloc, "text") orelse {
         return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'text' parameter");
     };
     defer alloc.free(text);
 
-    ws.addLogEntry(text);
-    scheduleSidebarUpdate(server, ws);
-    return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
+    const arg = WsMutArg{ .text_a = ownArg(text) orelse {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    } };
+    return respondWorkspaceMutation(alloc, req, server, arg, applyAddLog, .row, "{\"ok\":true}");
 }
 
 fn handleWorkspaceClearLog(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveWorkspace(server, alloc, req) orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-    };
-
-    ws.clearLog();
-    scheduleSidebarUpdate(server, ws);
-    return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
+    return respondWorkspaceMutation(alloc, req, server, .{}, applyClearLog, .row, "{\"ok\":true}");
 }
 
 fn handleWorkspaceSetProgress(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveWorkspace(server, alloc, req) orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-    };
-
     const fraction = req.getFloatParam(alloc, "fraction") orelse {
         return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'fraction' parameter");
     };
 
-    const label = req.getStringParam(alloc, "label");
-    defer if (label) |l| alloc.free(l);
-
-    ws.setProgress(@floatCast(fraction), label);
-    scheduleSidebarUpdate(server, ws);
-    return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
+    var arg = WsMutArg{ .number = fraction };
+    if (req.getStringParam(alloc, "label")) |label| {
+        defer alloc.free(label);
+        arg.text_a = ownArg(label) orelse {
+            return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+        };
+    }
+    return respondWorkspaceMutation(alloc, req, server, arg, applySetProgress, .row, "{\"ok\":true}");
 }
 
 fn handleWorkspaceSetPinned(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveWorkspace(server, alloc, req) orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-    };
-
     const pinned = req.getBoolParam(alloc, "pinned") orelse {
         return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'pinned' parameter");
     };
-
-    ws.pinned = pinned;
-
-    // Pinning changes sort order, so rebuild entire sidebar (not just update one row)
-    scheduleSidebarRebuild(server);
-    return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
+    // Pinning changes sort order, so rebuild the whole sidebar.
+    return respondWorkspaceMutation(alloc, req, server, .{ .flag = pinned }, applySetPinned, .rebuild, "{\"ok\":true}");
 }
 
 fn handleWorkspaceSetColor(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveWorkspace(server, alloc, req) orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-    };
-
-    const color = req.getStringParam(alloc, "color");
-    if (color) |name| {
-        if (name.len == 0) {
-            // Empty string clears color
-            ws.clearColor();
-        } else if (!Workspace.isValidColor(name)) {
+    // Validation is a pure function, so it can stay off the main thread.
+    var arg = WsMutArg{};
+    if (req.getStringParam(alloc, "color")) |name| {
+        defer alloc.free(name);
+        if (name.len != 0 and !Workspace.isValidColor(name)) {
             return protocol.errorResponse(alloc, req.id, "invalid_color", "Color must be one of: red, blue, green, yellow, purple, orange, pink, cyan");
-        } else {
-            ws.setColor(name);
         }
-    } else {
-        // null or missing clears the color
-        ws.clearColor();
+        arg.text_a = ownArg(name) orelse {
+            return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+        };
     }
-
-    scheduleSidebarUpdate(server, ws);
-    return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
-}
-
-/// Schedule a full sidebar rebuild on the GTK main thread.
-fn scheduleSidebarRebuild(server: *Server) void {
-    const window = server.window orelse return;
-    const ctx = std.heap.c_allocator.create(SidebarRebuildCtx) catch return;
-    ctx.* = .{ .window = window };
-    _ = c.g_idle_add(&doSidebarRebuild, @ptrCast(ctx));
-}
-
-const SidebarRebuildCtx = struct {
-    window: *Window,
-};
-
-fn doSidebarRebuild(userdata: c.gpointer) callconv(.c) c.gboolean {
-    const ctx: *SidebarRebuildCtx = @ptrCast(@alignCast(userdata));
-    defer std.heap.c_allocator.destroy(ctx);
-    ctx.window.sidebar.rebuild();
-    return c.G_SOURCE_REMOVE;
+    // A missing/null color, like an empty one, clears it.
+    return respondWorkspaceMutation(alloc, req, server, arg, applySetColor, .row, "{\"ok\":true}");
 }
 
 // ------------------------------------------------------------------
 // Surface handlers
 // ------------------------------------------------------------------
 
+/// One pane's externally visible state, captured on the main thread.
+const PaneSnapshot = struct {
+    pane_id: PaneTree.NodeId,
+    workspace_id: Workspace.WorkspaceId,
+    focused: bool,
+    alive: bool,
+};
+
+/// Snapshots every pane across every workspace. `pane_widgets` and
+/// `tab_manager` are owned by the main thread, so the walk happens there and
+/// the handler thread only formats the copy.
+const SurfaceListCtx = struct {
+    window: *Window,
+    /// c_allocator so the list survives independently of the request arena if
+    /// this context has to be leaked on timeout.
+    panes: std.ArrayListUnmanaged(PaneSnapshot) = .{},
+    ok: bool = false,
+    done: std.Thread.ResetEvent = .{},
+
+    fn run(self: *SurfaceListCtx) void {
+        const ca = std.heap.c_allocator;
+        const tm = &self.window.tab_manager;
+        for (tm.workspaces.items) |ws| {
+            var pane_ids = ws.pane_tree.orderedPaneIds(ca) catch return;
+            defer pane_ids.deinit(ca);
+            for (pane_ids.items) |pane_id| {
+                self.panes.append(ca, .{
+                    .pane_id = pane_id,
+                    .workspace_id = ws.id,
+                    .focused = if (ws.pane_tree.focused_pane) |fp| fp == pane_id else false,
+                    .alive = self.window.pane_widgets.get(pane_id) != null,
+                }) catch return;
+            }
+        }
+        self.ok = true;
+    }
+};
+
 fn handleSurfaceList(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const window = server.window orelse {
         return protocol.successResponse(alloc, req.id, "{\"surfaces\":[]}");
     };
 
+    const ctx = std.heap.c_allocator.create(SurfaceListCtx) catch {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    };
+    ctx.* = .{ .window = window };
+    runOnMainThread(SurfaceListCtx, ctx) catch {
+        // Deliberately leak ctx: the idle callback may still fire later.
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
+    defer {
+        ctx.panes.deinit(std.heap.c_allocator);
+        std.heap.c_allocator.destroy(ctx);
+    }
+    if (!ctx.ok) {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to enumerate surfaces");
+    }
+
     var array = JsonArrayBuilder.init(alloc);
     defer array.deinit();
     try array.startArray();
 
-    const tm = &window.tab_manager;
-    for (tm.workspaces.items) |ws| {
-        var pane_ids = try ws.pane_tree.orderedPaneIds(alloc);
-        defer pane_ids.deinit(alloc);
-
-        for (pane_ids.items) |pane_id| {
-            const is_focused = if (ws.pane_tree.focused_pane) |fp| fp == pane_id else false;
-            const has_surface = window.pane_widgets.get(pane_id) != null;
-
-            const surface_json = try std.fmt.allocPrint(alloc,
-                \\{{"id":{d},"ref":"surface:{d}","workspace_id":{d},"pane_id":{d},"focused":{s},"alive":{s}}}
-            , .{
-                pane_id,
-                pane_id,
-                ws.id,
-                pane_id,
-                if (is_focused) "true" else "false",
-                if (has_surface) "true" else "false",
-            });
-            defer alloc.free(surface_json);
-            try array.addRaw(surface_json);
-        }
+    for (ctx.panes.items) |pane| {
+        const surface_json = try std.fmt.allocPrint(alloc,
+            \\{{"id":{d},"ref":"surface:{d}","workspace_id":{d},"pane_id":{d},"focused":{s},"alive":{s}}}
+        , .{
+            pane.pane_id,
+            pane.pane_id,
+            pane.workspace_id,
+            pane.pane_id,
+            if (pane.focused) "true" else "false",
+            if (pane.alive) "true" else "false",
+        });
+        defer alloc.free(surface_json);
+        try array.addRaw(surface_json);
     }
 
     try array.endArray();
@@ -1031,32 +1518,106 @@ fn handleSurfaceList(alloc: Allocator, server: *Server, req: *const protocol.Req
     return protocol.successResponse(alloc, req.id, result);
 }
 
+/// Snapshots the focused pane on the main thread.
+const SurfaceCurrentCtx = struct {
+    window: *Window,
+    found: bool = false,
+    pane: PaneSnapshot = .{ .pane_id = 0, .workspace_id = 0, .focused = true, .alive = false },
+    done: std.Thread.ResetEvent = .{},
+
+    fn run(self: *SurfaceCurrentCtx) void {
+        const ws = self.window.tab_manager.selectedWorkspace() orelse return;
+        const pane_id = ws.pane_tree.focused_pane orelse return;
+        self.pane = .{
+            .pane_id = pane_id,
+            .workspace_id = ws.id,
+            .focused = true,
+            .alive = self.window.pane_widgets.get(pane_id) != null,
+        };
+        self.found = true;
+    }
+};
+
 fn handleSurfaceCurrent(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const window = server.window orelse {
         return protocol.successResponse(alloc, req.id, "{\"surface\":null}");
     };
 
-    const ws = window.tab_manager.selectedWorkspace() orelse {
-        return protocol.successResponse(alloc, req.id, "{\"surface\":null}");
+    const ctx = std.heap.c_allocator.create(SurfaceCurrentCtx) catch {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
     };
-
-    const pane_id = ws.pane_tree.focused_pane orelse {
-        return protocol.successResponse(alloc, req.id, "{\"surface\":null}");
+    ctx.* = .{ .window = window };
+    runOnMainThread(SurfaceCurrentCtx, ctx) catch {
+        // Deliberately leak ctx: the idle callback may still fire later.
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
     };
+    defer std.heap.c_allocator.destroy(ctx);
 
-    const has_surface = window.pane_widgets.get(pane_id) != null;
+    if (!ctx.found) {
+        return protocol.successResponse(alloc, req.id, "{\"surface\":null}");
+    }
 
     const surface_json = try std.fmt.allocPrint(alloc,
         \\{{"surface":{{"id":{d},"ref":"surface:{d}","workspace_id":{d},"pane_id":{d},"focused":true,"alive":{s}}}}}
     , .{
-        pane_id,
-        pane_id,
-        ws.id,
-        pane_id,
-        if (has_surface) "true" else "false",
+        ctx.pane.pane_id,
+        ctx.pane.pane_id,
+        ctx.pane.workspace_id,
+        ctx.pane.pane_id,
+        if (ctx.pane.alive) "true" else "false",
     });
     defer alloc.free(surface_json);
     return protocol.successResponse(alloc, req.id, surface_json);
+}
+
+/// Sends a pre-encoded binding action to a pane, resolved on the main thread.
+const BindingActionCtx = struct {
+    window: *Window,
+    explicit_pane: ?PaneTree.NodeId,
+    /// Owned by this context (c_allocator) so it can be leaked on timeout.
+    action: []u8,
+    resolve_err: ResolveError = .none,
+    pane_id: PaneTree.NodeId = 0,
+    sent: bool = false,
+    done: std.Thread.ResetEvent = .{},
+
+    fn run(self: *BindingActionCtx) void {
+        const resolved = resolveSurfaceOnMain(self.window, self.explicit_pane, .require_realized, &self.resolve_err) orelse return;
+        self.pane_id = resolved.pane_id;
+        _ = c.ghostty_surface_binding_action(resolved.surface, self.action.ptr, self.action.len);
+        self.sent = true;
+    }
+};
+
+/// Build a BindingActionCtx owning a copy of `action`.
+fn createBindingActionCtx(
+    window: *Window,
+    explicit_pane: ?PaneTree.NodeId,
+    action: []const u8,
+) ?*BindingActionCtx {
+    const ctx = std.heap.c_allocator.create(BindingActionCtx) catch return null;
+    const owned = std.heap.c_allocator.dupe(u8, action) catch {
+        std.heap.c_allocator.destroy(ctx);
+        return null;
+    };
+    ctx.* = .{ .window = window, .explicit_pane = explicit_pane, .action = owned };
+    return ctx;
+}
+
+fn destroyBindingActionCtx(ctx: *BindingActionCtx) void {
+    std.heap.c_allocator.free(ctx.action);
+    std.heap.c_allocator.destroy(ctx);
+}
+
+/// Read the optional `surface_id` param. Returns false if it was present but
+/// not a usable pane id, matching the previous "no target surface" behaviour.
+fn explicitPaneParam(alloc: Allocator, req: *const protocol.Request, out: *?PaneTree.NodeId) bool {
+    if (req.getIntParam(alloc, "surface_id")) |sid| {
+        out.* = toU64(sid) orelse return false;
+    } else {
+        out.* = null;
+    }
+    return true;
 }
 
 fn handleSurfaceSendText(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
@@ -1069,27 +1630,9 @@ fn handleSurfaceSendText(alloc: Allocator, server: *Server, req: *const protocol
     };
     defer alloc.free(text);
 
-    // Find the target surface: by surface_id param, or use the focused surface
-    var target_pane_id: ?PaneTree.NodeId = null;
-    if (req.getIntParam(alloc, "surface_id")) |sid| {
-        target_pane_id = toU64(sid);
-    } else {
-        // Use focused surface in current workspace
-        if (window.tab_manager.selectedWorkspace()) |ws| {
-            target_pane_id = ws.pane_tree.focused_pane;
-        }
-    }
-
-    const pane_id = target_pane_id orelse {
+    var explicit_pane: ?PaneTree.NodeId = null;
+    if (!explicitPaneParam(alloc, req, &explicit_pane)) {
         return protocol.errorResponse(alloc, req.id, "no_surface", "No target surface found");
-    };
-
-    const tw = window.pane_widgets.get(pane_id) orelse {
-        return protocol.errorResponse(alloc, req.id, "no_surface", "Surface widget not found");
-    };
-
-    if (tw.surface == null or !tw.realized) {
-        return protocol.errorResponse(alloc, req.id, "dead_surface", "Surface is not active (unrealized or uninitialized)");
     }
 
     // Use ghostty_surface_binding_action with "text:" prefix to write directly
@@ -1103,13 +1646,23 @@ fn handleSurfaceSendText(alloc: Allocator, server: *Server, req: *const protocol
     const action_str = try encodeBindingActionText(alloc, text);
     defer alloc.free(action_str);
 
-    _ = c.ghostty_surface_binding_action(tw.surface, action_str.ptr, action_str.len);
+    const ctx = createBindingActionCtx(window, explicit_pane, action_str) orelse {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    };
+    runOnMainThread(BindingActionCtx, ctx) catch {
+        // Deliberately leak ctx and its action buffer: the idle callback may
+        // still fire later and dereference both.
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
+    defer destroyBindingActionCtx(ctx);
 
-    log.info("send_text to pane {d}: {d} bytes", .{ pane_id, text.len });
+    if (!ctx.sent) return resolveErrorResponse(alloc, req.id, ctx.resolve_err);
+
+    log.info("send_text to pane {d}: {d} bytes", .{ ctx.pane_id, text.len });
 
     const result = try std.fmt.allocPrint(alloc,
         \\{{"queued":true,"surface_id":{d}}}
-    , .{pane_id});
+    , .{ctx.pane_id});
     defer alloc.free(result);
     return protocol.successResponse(alloc, req.id, result);
 }
@@ -1160,14 +1713,24 @@ fn hexDigit(nibble: u8) u8 {
 // surface.read_text — read terminal content via Ghostty API
 // ------------------------------------------------------------------
 
+/// Reads a pane's text, resolving the pane on the GTK main thread.
 const ReadTextCtx = struct {
-    surface: c.ghostty_surface_t,
+    window: *Window,
+    explicit_pane: ?PaneTree.NodeId,
     include_scrollback: bool,
     // Output fields — written by main thread, read by handler thread
-    result_text: ?[*]const u8 = null,
-    result_len: usize = 0,
-    success: bool = false,
+    resolve_err: ResolveError = .none,
+    pane_id: PaneTree.NodeId = 0,
+    result: ReadResult = .{},
     done: std.Thread.ResetEvent = .{},
+
+    fn run(self: *ReadTextCtx) void {
+        // Reads tolerate an unrealized widget; surface.read_text did not
+        // require `realized` before the main-thread refactor.
+        const resolved = resolveSurfaceOnMain(self.window, self.explicit_pane, .allow_unrealized, &self.resolve_err) orelse return;
+        self.pane_id = resolved.pane_id;
+        self.result = readSurfaceTextOnMain(resolved.surface, self.include_scrollback);
+    }
 };
 
 fn handleSurfaceReadText(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
@@ -1175,88 +1738,43 @@ fn handleSurfaceReadText(alloc: Allocator, server: *Server, req: *const protocol
         return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
     };
 
-    // Resolve target surface
-    var target_pane_id: ?PaneTree.NodeId = null;
-    if (req.getIntParam(alloc, "surface_id")) |sid| {
-        target_pane_id = toU64(sid);
-    } else {
-        if (window.tab_manager.selectedWorkspace()) |ws| {
-            target_pane_id = ws.pane_tree.focused_pane;
-        }
-    }
-
-    const pane_id = target_pane_id orelse {
+    var explicit_pane: ?PaneTree.NodeId = null;
+    if (!explicitPaneParam(alloc, req, &explicit_pane)) {
         return protocol.errorResponse(alloc, req.id, "no_surface", "No target surface found");
-    };
-
-    const tw = window.pane_widgets.get(pane_id) orelse {
-        return protocol.errorResponse(alloc, req.id, "no_surface", "Surface widget not found");
-    };
-
-    if (tw.surface == null) {
-        return protocol.errorResponse(alloc, req.id, "no_surface", "Surface not initialized");
     }
 
     const include_scrollback = req.getBoolParam(alloc, "scrollback") orelse false;
 
-    // Dispatch to GTK main thread and block until complete
     const ctx = std.heap.c_allocator.create(ReadTextCtx) catch {
         return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
     };
     ctx.* = .{
-        .surface = tw.surface,
+        .window = window,
+        .explicit_pane = explicit_pane,
         .include_scrollback = include_scrollback,
     };
-    _ = c.g_idle_add(&doReadText, @ptrCast(ctx));
 
-    // Block until the main thread callback completes
-    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
-        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
-        // since the GTK idle callback may still fire later.
-        log.warn("GTK dispatch timed out for socket request", .{});
+    runOnMainThread(ReadTextCtx, ctx) catch {
+        // Deliberately leak ctx: the idle callback may still fire later.
         return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
     };
+    defer std.heap.c_allocator.destroy(ctx);
 
-    // Read results (main thread is done writing)
-    const success = ctx.success;
-    const result_text = ctx.result_text;
-    const result_len = ctx.result_len;
-    std.heap.c_allocator.destroy(ctx);
-
-    if (!success) {
+    if (ctx.resolve_err != .none) return resolveErrorResponse(alloc, req.id, ctx.resolve_err);
+    if (!ctx.result.ok) {
         return protocol.errorResponse(alloc, req.id, "read_failed", "Failed to read terminal text");
     }
 
-    // Build JSON response with the text
-    if (result_text) |text_ptr| {
-        const text_slice = text_ptr[0..result_len];
+    const pane_id = ctx.pane_id;
+    if (ctx.result.text) |text_slice| {
         defer std.heap.c_allocator.free(text_slice);
 
-        // JSON-escape the text
-        var escaped: std.ArrayListUnmanaged(u8) = .{};
-        defer escaped.deinit(alloc);
-        for (text_slice) |ch| {
-            switch (ch) {
-                '"' => try escaped.appendSlice(alloc, "\\\""),
-                '\\' => try escaped.appendSlice(alloc, "\\\\"),
-                '\n' => try escaped.appendSlice(alloc, "\\n"),
-                '\r' => try escaped.appendSlice(alloc, "\\r"),
-                '\t' => try escaped.appendSlice(alloc, "\\t"),
-                else => {
-                    if (ch < 0x20) {
-                        var buf: [6]u8 = undefined;
-                        const hex_str = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{ch}) catch continue;
-                        try escaped.appendSlice(alloc, hex_str);
-                    } else {
-                        try escaped.append(alloc, ch);
-                    }
-                },
-            }
-        }
+        const escaped = try jsonEscapeString(alloc, text_slice);
+        defer alloc.free(escaped);
 
         const result = try std.fmt.allocPrint(alloc,
             \\{{"text":"{s}","surface_id":{d}}}
-        , .{ escaped.items, pane_id });
+        , .{ escaped, pane_id });
         defer alloc.free(result);
         return protocol.successResponse(alloc, req.id, result);
     }
@@ -1268,70 +1786,85 @@ fn handleSurfaceReadText(alloc: Allocator, server: *Server, req: *const protocol
     return protocol.successResponse(alloc, req.id, result);
 }
 
-fn doReadText(userdata: c.gpointer) callconv(.c) c.gboolean {
-    const ctx: *ReadTextCtx = @ptrCast(@alignCast(userdata));
-    // Do NOT defer destroy — the handler thread still needs ctx
-    defer ctx.done.set();
+/// Outcome of one polling read during surface.run.
+const PollStatus = enum {
+    /// The read completed (`text` may still be null if the screen was empty).
+    ok,
+    /// This attempt failed but the pane may still be fine -- a saturated GTK
+    /// main thread or a failed allocation. The caller should retry.
+    transient,
+    /// The pane is genuinely gone: it no longer resolves to a surface.
+    gone,
+};
 
-    if (ctx.surface == null) return c.G_SOURCE_REMOVE;
+/// Result of one polling read during surface.run.
+const PollOutcome = struct {
+    status: PollStatus,
+    /// Heap-allocated with c_allocator when present.
+    text: ?[]u8 = null,
+};
 
-    const point_tag: c.ghostty_point_tag_e = if (ctx.include_scrollback)
-        c.GHOSTTY_POINT_SCREEN
-    else
-        c.GHOSTTY_POINT_VIEWPORT;
-
-    var selection: c.ghostty_selection_s = std.mem.zeroes(c.ghostty_selection_s);
-    selection.top_left.tag = point_tag;
-    selection.top_left.coord = c.GHOSTTY_POINT_COORD_TOP_LEFT;
-    selection.top_left.x = 0;
-    selection.top_left.y = 0;
-    selection.bottom_right.tag = point_tag;
-    selection.bottom_right.coord = c.GHOSTTY_POINT_COORD_BOTTOM_RIGHT;
-    selection.bottom_right.x = 0;
-    selection.bottom_right.y = 0;
-    selection.rectangle = true;
-
-    var text: c.ghostty_text_s = std.mem.zeroes(c.ghostty_text_s);
-    if (c.ghostty_surface_read_text(ctx.surface, selection, &text)) {
-        defer c.ghostty_surface_free_text(ctx.surface, &text);
-        if (text.text != null and text.text_len > 0) {
-            // Copy text into heap-allocated buffer for the handler thread
-            const slice = text.text[0..text.text_len];
-            const copy = std.heap.c_allocator.alloc(u8, text.text_len) catch {
-                return c.G_SOURCE_REMOVE;
-            };
-            @memcpy(copy, slice);
-            ctx.result_text = copy.ptr;
-            ctx.result_len = text.text_len;
-        }
-        ctx.success = true;
-    }
-
-    return c.G_SOURCE_REMOVE;
-}
-
-/// Reusable helper: read terminal text via g_idle_add + ResetEvent.
-/// Returns heap-allocated text (caller must free with c_allocator), or null on failure.
-fn readSurfaceText(surface: c.ghostty_surface_t) ?[]u8 {
-    const ctx = std.heap.c_allocator.create(ReadTextCtx) catch return null;
-    ctx.* = .{ .surface = surface, .include_scrollback = true };
-    _ = c.g_idle_add(&doReadText, @ptrCast(ctx));
-    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
-        log.warn("readSurfaceText: GTK dispatch timed out", .{});
-        // Don't destroy ctx — the GTK callback may still fire and access it.
-        return null;
+/// Read a pane's full scrollback for the surface.run poll loop.
+///
+/// The pane is re-resolved on the main thread on every call, so a pane closed
+/// mid-run ends the poll instead of dereferencing a freed widget or surface.
+///
+/// A dispatch timeout is reported as `.transient`, not `.gone`: before the
+/// main-thread refactor a timed-out read simply skipped that poll iteration,
+/// and treating a momentarily busy UI as a closed pane would abort the run and
+/// discard output the command had already produced.
+fn pollPaneText(window: *Window, pane_id: PaneTree.NodeId) PollOutcome {
+    const ctx = std.heap.c_allocator.create(ReadTextCtx) catch return .{ .status = .transient };
+    ctx.* = .{
+        .window = window,
+        .explicit_pane = pane_id,
+        .include_scrollback = true,
     };
-    const text_ptr = ctx.result_text;
-    const text_len = ctx.result_len;
-    const success = ctx.success;
-    std.heap.c_allocator.destroy(ctx);
-    if (!success or text_ptr == null) return null;
-    return @constCast(text_ptr.?[0..text_len]);
+    runOnMainThread(ReadTextCtx, ctx) catch {
+        // Deliberately leak ctx: the idle callback may still fire later.
+        return .{ .status = .transient };
+    };
+    defer std.heap.c_allocator.destroy(ctx);
+
+    if (ctx.resolve_err != .none) return .{ .status = .gone };
+    return .{ .status = .ok, .text = ctx.result.text };
 }
 
 // ------------------------------------------------------------------
 // surface.run — send command, wait for prompt, return output
 // ------------------------------------------------------------------
+
+/// Default timeout for surface.run when the caller does not specify one.
+const default_run_timeout_secs: u64 = 30;
+
+/// Upper bound on surface.run polling. A caller-supplied timeout is clamped to
+/// this so one request cannot pin a handler thread (and its socket connection)
+/// for an unbounded stretch.
+const max_run_timeout_secs: u64 = 600;
+
+/// Resolves the pane, snapshots the screen, and sends the command in a single
+/// main-thread hop, so the surface cannot be destroyed between those steps.
+const RunStartCtx = struct {
+    window: *Window,
+    explicit_pane: ?PaneTree.NodeId,
+    /// Owned by this context (c_allocator) so it can be leaked on timeout.
+    action: []u8,
+    resolve_err: ResolveError = .none,
+    pane_id: PaneTree.NodeId = 0,
+    before: ReadResult = .{},
+    started: bool = false,
+    done: std.Thread.ResetEvent = .{},
+
+    fn run(self: *RunStartCtx) void {
+        // Sending the command is a write, so the widget must be realized.
+        const resolved = resolveSurfaceOnMain(self.window, self.explicit_pane, .require_realized, &self.resolve_err) orelse return;
+        self.pane_id = resolved.pane_id;
+        self.before = readSurfaceTextOnMain(resolved.surface, true);
+        if (!self.before.ok) return;
+        _ = c.ghostty_surface_binding_action(resolved.surface, self.action.ptr, self.action.len);
+        self.started = true;
+    }
+};
 
 fn handleSurfaceRun(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const window = server.window orelse {
@@ -1345,85 +1878,126 @@ fn handleSurfaceRun(alloc: Allocator, server: *Server, req: *const protocol.Requ
     defer alloc.free(command);
 
     const timeout_secs: u64 = if (req.getIntParam(alloc, "timeout")) |t|
-        toU64(@max(t, 1)) orelse 30
+        @min(toU64(@max(t, 1)) orelse default_run_timeout_secs, max_run_timeout_secs)
     else
-        30;
-    const timeout_ns: u64 = timeout_secs * 1_000_000_000;
+        default_run_timeout_secs;
+    const timeout_ns: u64 = timeout_secs * std.time.ns_per_s;
 
     const prompt_suffix = req.getStringParam(alloc, "prompt_pattern");
-    defer if (prompt_suffix) |p| alloc.free(p);
+    defer if (prompt_suffix) |ps| alloc.free(ps);
 
-    // 2. Resolve target surface
-    var target_pane_id: ?PaneTree.NodeId = null;
-    if (req.getIntParam(alloc, "surface_id")) |sid| {
-        target_pane_id = toU64(sid);
-    } else {
-        if (window.tab_manager.selectedWorkspace()) |ws| {
-            target_pane_id = ws.pane_tree.focused_pane;
-        }
-    }
-    const pane_id = target_pane_id orelse {
+    var explicit_pane: ?PaneTree.NodeId = null;
+    if (!explicitPaneParam(alloc, req, &explicit_pane)) {
         return protocol.errorResponse(alloc, req.id, "no_surface", "No target surface found");
-    };
-    const tw = window.pane_widgets.get(pane_id) orelse {
-        return protocol.errorResponse(alloc, req.id, "no_surface", "Surface widget not found");
-    };
-    if (tw.surface == null or !tw.realized) {
-        return protocol.errorResponse(alloc, req.id, "dead_surface", "Surface is not active");
     }
 
-    // 3. Read "before" snapshot
-    const before_text = readSurfaceText(tw.surface) orelse {
-        return protocol.errorResponse(alloc, req.id, "read_failed", "Failed to read initial terminal text");
+    var timer = std.time.Timer.start() catch {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "No monotonic clock available");
     };
-    defer std.heap.c_allocator.free(before_text);
 
-    // 4. Send command + Enter
+    // 2. Encode the command as a binding action ("text:" + escapes).
     const cmd_with_newline = try std.fmt.allocPrint(alloc, "{s}\n", .{command});
     defer alloc.free(cmd_with_newline);
     const action_str = try encodeBindingActionText(alloc, cmd_with_newline);
     defer alloc.free(action_str);
-    _ = c.ghostty_surface_binding_action(tw.surface, action_str.ptr, action_str.len);
 
-    // 5. Poll loop — wait for prompt to reappear
+    // 3. Resolve + snapshot + send, atomically on the main thread.
+    const start_ctx = std.heap.c_allocator.create(RunStartCtx) catch {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    };
+    const action_owned = std.heap.c_allocator.dupe(u8, action_str) catch {
+        std.heap.c_allocator.destroy(start_ctx);
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    };
+    start_ctx.* = .{ .window = window, .explicit_pane = explicit_pane, .action = action_owned };
+
+    runOnMainThread(RunStartCtx, start_ctx) catch {
+        // Deliberately leak ctx and its action buffer: the idle callback may
+        // still fire later and dereference both.
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
+
+    const pane_id = start_ctx.pane_id;
+    const resolve_err = start_ctx.resolve_err;
+    const started = start_ctx.started;
+    const before_result = start_ctx.before;
+    std.heap.c_allocator.free(start_ctx.action);
+    std.heap.c_allocator.destroy(start_ctx);
+
+    if (resolve_err != .none) return resolveErrorResponse(alloc, req.id, resolve_err);
+    if (!started) {
+        if (before_result.text) |bt| std.heap.c_allocator.free(bt);
+        return protocol.errorResponse(alloc, req.id, "read_failed", "Failed to read initial terminal text");
+    }
+    defer if (before_result.text) |bt| std.heap.c_allocator.free(bt);
+    const before_text: []const u8 = before_result.text orelse &[_]u8{};
+
+    // 4. Poll for the prompt to reappear. Every read re-resolves the pane on
+    //    the main thread, so a pane closed mid-run ends the loop cleanly
+    //    instead of reading through a freed widget.
     const poll_interval_ns: u64 = 150_000_000; // 150ms
-    const start_ns: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    // Each timed-out dispatch leaks its context, so give up rather than
+    // retrying forever against a wedged UI.
+    const max_consecutive_transient: u8 = 3;
     var timed_out = true;
     var final_text: ?[]u8 = null;
+    var pane_gone = false;
+    var stalled = false;
+    var transient_count: u8 = 0;
 
-    while (true) {
-        const now_ns: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-        const elapsed: u64 = now_ns -| start_ns; // saturating subtract handles clock weirdness
-        if (elapsed >= timeout_ns) break;
-
+    while (timer.read() < timeout_ns) {
         std.Thread.sleep(poll_interval_ns);
 
-        const current = readSurfaceText(tw.surface) orelse continue;
+        const outcome = pollPaneText(window, pane_id);
+        switch (outcome.status) {
+            .gone => {
+                pane_gone = true;
+                break;
+            },
+            .transient => {
+                transient_count += 1;
+                if (transient_count >= max_consecutive_transient) {
+                    stalled = true;
+                    break;
+                }
+                continue;
+            },
+            .ok => transient_count = 0,
+        }
+
+        const current = outcome.text orelse continue;
 
         // Text must have grown beyond the before snapshot + command echo
-        if (current.len > before_text.len) {
-            if (endsWithPrompt(current, prompt_suffix)) {
-                final_text = current;
-                timed_out = false;
-                break;
-            }
+        if (current.len > before_text.len and endsWithPrompt(current, prompt_suffix)) {
+            final_text = current;
+            timed_out = false;
+            break;
         }
         std.heap.c_allocator.free(current);
     }
 
-    // On timeout, do one final read
-    if (timed_out and final_text == null) {
-        final_text = readSurfaceText(tw.surface);
+    if (pane_gone) {
+        if (final_text) |ft| std.heap.c_allocator.free(ft);
+        return protocol.errorResponse(alloc, req.id, "dead_surface", "Surface was closed while the command was running");
+    }
+    if (stalled) {
+        if (final_text) |ft| std.heap.c_allocator.free(ft);
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out while polling the terminal");
     }
 
-    // 6. Extract output between command echo and final prompt
+    // On timeout, do one final read
+    if (timed_out and final_text == null) {
+        final_text = pollPaneText(window, pane_id).text;
+    }
+
+    // 5. Extract output between command echo and final prompt
     const output = if (final_text) |ft| blk: {
         defer std.heap.c_allocator.free(ft);
         break :blk extractCommandOutput(alloc, before_text, ft, command) catch "";
     } else "";
     defer if (output.len > 0) alloc.free(@constCast(output));
 
-    // 7. Build JSON response
+    // 6. Build JSON response
     const escaped_output = try jsonEscapeString(alloc, output);
     defer alloc.free(escaped_output);
 
@@ -1528,26 +2102,9 @@ fn handleSurfaceSendKey(alloc: Allocator, server: *Server, req: *const protocol.
     };
     defer alloc.free(key);
 
-    // Resolve target surface
-    var target_pane_id: ?PaneTree.NodeId = null;
-    if (req.getIntParam(alloc, "surface_id")) |sid| {
-        target_pane_id = toU64(sid);
-    } else {
-        if (window.tab_manager.selectedWorkspace()) |ws| {
-            target_pane_id = ws.pane_tree.focused_pane;
-        }
-    }
-
-    const pane_id = target_pane_id orelse {
+    var explicit_pane: ?PaneTree.NodeId = null;
+    if (!explicitPaneParam(alloc, req, &explicit_pane)) {
         return protocol.errorResponse(alloc, req.id, "no_surface", "No target surface found");
-    };
-
-    const tw = window.pane_widgets.get(pane_id) orelse {
-        return protocol.errorResponse(alloc, req.id, "no_surface", "Surface widget not found");
-    };
-
-    if (tw.surface == null or !tw.realized) {
-        return protocol.errorResponse(alloc, req.id, "dead_surface", "Surface is not active (unrealized or uninitialized)");
     }
 
     const action_bytes = resolveKeyAction(alloc, key) orelse {
@@ -1555,11 +2112,20 @@ fn handleSurfaceSendKey(alloc: Allocator, server: *Server, req: *const protocol.
     };
     defer alloc.free(action_bytes);
 
-    _ = c.ghostty_surface_binding_action(tw.surface, action_bytes.ptr, action_bytes.len);
+    const ctx = createBindingActionCtx(window, explicit_pane, action_bytes) orelse {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    };
+    runOnMainThread(BindingActionCtx, ctx) catch {
+        // Deliberately leaked; see handleSurfaceSendText.
+        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
+    };
+    defer destroyBindingActionCtx(ctx);
+
+    if (!ctx.sent) return resolveErrorResponse(alloc, req.id, ctx.resolve_err);
 
     const result = try std.fmt.allocPrint(alloc,
         \\{{"sent":true,"key":"{s}","surface_id":{d}}}
-    , .{ key, pane_id });
+    , .{ key, ctx.pane_id });
     defer alloc.free(result);
     return protocol.successResponse(alloc, req.id, result);
 }
@@ -1728,21 +2294,29 @@ const SurfaceCloseCtx = struct {
     err_code: []const u8 = "internal_error",
     err_msg: []const u8 = "Unknown error",
     done: std.Thread.ResetEvent = .{},
+
+    /// Checks the workspace and last-pane guard on the main thread before
+    /// closing. Reading `selectedWorkspace()`/`paneCount()` from a handler
+    /// thread would race workspace create/close and pane split/close.
+    fn checkGuards(self: *SurfaceCloseCtx) bool {
+        const ws = self.window.tab_manager.selectedWorkspace() orelse {
+            self.err_code = "no_workspace";
+            self.err_msg = "No workspace selected";
+            return false;
+        };
+        if (ws.pane_tree.paneCount() <= 1) {
+            self.err_code = "last_pane";
+            self.err_msg = "Cannot close the last pane";
+            return false;
+        }
+        return true;
+    }
 };
 
 fn handleSurfaceClose(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const window = server.window orelse {
         return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
     };
-
-    const ws = window.tab_manager.selectedWorkspace() orelse {
-        return protocol.errorResponse(alloc, req.id, "no_workspace", "No workspace selected");
-    };
-
-    // Guard: can't close the last pane
-    if (ws.pane_tree.paneCount() <= 1) {
-        return protocol.errorResponse(alloc, req.id, "last_pane", "Cannot close the last pane");
-    }
 
     const ctx = std.heap.c_allocator.create(SurfaceCloseCtx) catch {
         return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
@@ -1772,6 +2346,7 @@ fn handleSurfaceClose(alloc: Allocator, server: *Server, req: *const protocol.Re
 fn doCloseSurface(userdata: c.gpointer) callconv(.c) c.gboolean {
     const ctx: *SurfaceCloseCtx = @ptrCast(@alignCast(userdata));
     defer ctx.done.set();
+    if (!ctx.checkGuards()) return c.G_SOURCE_REMOVE;
     ctx.window.closeFocused() catch |err| {
         log.warn("Failed to close surface from socket: {}", .{err});
         ctx.err_code = "close_failed";
@@ -1847,142 +2422,21 @@ fn handleWorkspaceNext(alloc: Allocator, server: *Server, req: *const protocol.R
     const window = server.window orelse {
         return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
     };
-
-    const tm = &window.tab_manager;
-    const idx = tm.selected_index orelse {
-        return protocol.errorResponse(alloc, req.id, "no_workspace", "No workspace selected");
-    };
-
-    if (idx + 1 >= tm.workspaces.items.len) {
-        return protocol.errorResponse(alloc, req.id, "at_end", "Already at last workspace");
-    }
-
-    const next_idx = idx + 1;
-    const ctx = std.heap.c_allocator.create(WorkspaceSwitchCtx) catch {
-        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
-    };
-    ctx.* = .{ .window = window, .index = next_idx };
-    _ = c.g_idle_add(&doWorkspaceSwitch, @ptrCast(ctx));
-    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
-        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
-        // since the GTK idle callback may still fire later.
-        log.warn("GTK dispatch timed out for socket request", .{});
-        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
-    };
-
-    const success = ctx.success;
-    std.heap.c_allocator.destroy(ctx);
-
-    if (!success) {
-        return protocol.errorResponse(alloc, req.id, "switch_failed", "Failed to switch workspace");
-    }
-
-    const ws = tm.workspaces.items[next_idx];
-    const ws_json = try workspaceToJson(alloc, ws, true, next_idx);
-    defer alloc.free(ws_json);
-    const result = try std.fmt.allocPrint(alloc,
-        \\{{"workspace":{s}}}
-    , .{ws_json});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
+    return respondWorkspaceSwitch(alloc, req, window, .next);
 }
 
 fn handleWorkspacePrevious(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const window = server.window orelse {
         return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
     };
-
-    const tm = &window.tab_manager;
-    const idx = tm.selected_index orelse {
-        return protocol.errorResponse(alloc, req.id, "no_workspace", "No workspace selected");
-    };
-
-    if (idx == 0) {
-        return protocol.errorResponse(alloc, req.id, "at_start", "Already at first workspace");
-    }
-
-    const prev_idx = idx - 1;
-    const ctx = std.heap.c_allocator.create(WorkspaceSwitchCtx) catch {
-        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
-    };
-    ctx.* = .{ .window = window, .index = prev_idx };
-    _ = c.g_idle_add(&doWorkspaceSwitch, @ptrCast(ctx));
-    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
-        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
-        // since the GTK idle callback may still fire later.
-        log.warn("GTK dispatch timed out for socket request", .{});
-        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
-    };
-
-    const success = ctx.success;
-    std.heap.c_allocator.destroy(ctx);
-
-    if (!success) {
-        return protocol.errorResponse(alloc, req.id, "switch_failed", "Failed to switch workspace");
-    }
-
-    const ws = tm.workspaces.items[prev_idx];
-    const ws_json = try workspaceToJson(alloc, ws, true, prev_idx);
-    defer alloc.free(ws_json);
-    const result = try std.fmt.allocPrint(alloc,
-        \\{{"workspace":{s}}}
-    , .{ws_json});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
+    return respondWorkspaceSwitch(alloc, req, window, .previous);
 }
 
 fn handleWorkspaceLast(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const window = server.window orelse {
         return protocol.errorResponse(alloc, req.id, "no_window", "No window available");
     };
-
-    const tm = &window.tab_manager;
-    if (tm.history.items.len == 0) {
-        return protocol.errorResponse(alloc, req.id, "no_history", "No workspace history");
-    }
-
-    const last_id = tm.history.items[tm.history.items.len - 1];
-
-    // Find index for this workspace ID
-    var target_index: ?usize = null;
-    for (tm.workspaces.items, 0..) |ws, i| {
-        if (ws.id == last_id) {
-            target_index = i;
-            break;
-        }
-    }
-
-    const idx = target_index orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Last workspace no longer exists");
-    };
-
-    const ctx = std.heap.c_allocator.create(WorkspaceSwitchCtx) catch {
-        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
-    };
-    ctx.* = .{ .window = window, .index = idx };
-    _ = c.g_idle_add(&doWorkspaceSwitch, @ptrCast(ctx));
-    ctx.done.timedWait(gtk_dispatch_timeout_ns) catch {
-        // Timeout: GTK main thread is unresponsive. Leak ctx to avoid use-after-free
-        // since the GTK idle callback may still fire later.
-        log.warn("GTK dispatch timed out for socket request", .{});
-        return protocol.errorResponse(alloc, req.id, "timeout", "GTK dispatch timed out");
-    };
-
-    const success = ctx.success;
-    std.heap.c_allocator.destroy(ctx);
-
-    if (!success) {
-        return protocol.errorResponse(alloc, req.id, "switch_failed", "Failed to switch workspace");
-    }
-
-    const ws = tm.workspaces.items[idx];
-    const ws_json = try workspaceToJson(alloc, ws, true, idx);
-    defer alloc.free(ws_json);
-    const result = try std.fmt.allocPrint(alloc,
-        \\{{"workspace":{s}}}
-    , .{ws_json});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
+    return respondWorkspaceSwitch(alloc, req, window, .last_visited);
 }
 
 // ------------------------------------------------------------------
@@ -2355,15 +2809,18 @@ fn handlePaneList(alloc: Allocator, server: *Server, req: *const protocol.Reques
     const window = server.window orelse {
         return protocol.successResponse(alloc, req.id, "{\"panes\":[]}");
     };
+    // Optionally filter by workspace_id
+    const filter_ws_id = req.getIntParam(alloc, "workspace_id");
+    return respondFromMainThreadWith(alloc, req, window, ?i64, buildPaneListJson, filter_ws_id);
+}
 
+/// MUST run on the GTK main thread (see JsonOnMain).
+fn buildPaneListJson(window: *Window, alloc: Allocator, filter_ws_id: ?i64) ![]const u8 {
     var array = JsonArrayBuilder.init(alloc);
     defer array.deinit();
     try array.startArray();
 
     const tm = &window.tab_manager;
-
-    // Optionally filter by workspace_id
-    const filter_ws_id = req.getIntParam(alloc, "workspace_id");
 
     for (tm.workspaces.items) |ws| {
         if (filter_ws_id) |fid| {
@@ -2395,41 +2852,41 @@ fn handlePaneList(alloc: Allocator, server: *Server, req: *const protocol.Reques
     const panes_json = try array.toOwnedSlice();
     defer alloc.free(panes_json);
 
-    const result = try std.fmt.allocPrint(alloc,
+    return std.fmt.allocPrint(alloc,
         \\{{"panes":{s}}}
     , .{panes_json});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
 }
 
 // ------------------------------------------------------------------
 // Window handlers
 // ------------------------------------------------------------------
 
+/// MUST run on the GTK main thread (see JsonOnMain).
+fn buildWindowListJson(window: *Window, alloc: Allocator, _: void) ![]const u8 {
+    return std.fmt.allocPrint(alloc,
+        \\{{"windows":[{{"id":1,"ref":"window:1","focused":true,"workspace_count":{d}}}]}}
+    , .{window.tab_manager.workspaces.items.len});
+}
+
 fn handleWindowList(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const window = server.window orelse {
         return protocol.successResponse(alloc, req.id, "{\"windows\":[]}");
     };
+    return respondFromMainThread(alloc, req, window, buildWindowListJson);
+}
 
-    const ws_count = window.tab_manager.workspaces.items.len;
-    const result = try std.fmt.allocPrint(alloc,
-        \\{{"windows":[{{"id":1,"ref":"window:1","focused":true,"workspace_count":{d}}}]}}
-    , .{ws_count});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
+/// MUST run on the GTK main thread (see JsonOnMain).
+fn buildWindowCurrentJson(window: *Window, alloc: Allocator, _: void) ![]const u8 {
+    return std.fmt.allocPrint(alloc,
+        \\{{"window":{{"id":1,"ref":"window:1","focused":true,"workspace_count":{d}}}}}
+    , .{window.tab_manager.workspaces.items.len});
 }
 
 fn handleWindowCurrent(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
     const window = server.window orelse {
         return protocol.successResponse(alloc, req.id, "{\"window\":null}");
     };
-
-    const ws_count = window.tab_manager.workspaces.items.len;
-    const result = try std.fmt.allocPrint(alloc,
-        \\{{"window":{{"id":1,"ref":"window:1","focused":true,"workspace_count":{d}}}}}
-    , .{ws_count});
-    defer alloc.free(result);
-    return protocol.successResponse(alloc, req.id, result);
+    return respondFromMainThread(alloc, req, window, buildWindowCurrentJson);
 }
 
 // ------------------------------------------------------------------
@@ -2600,28 +3057,80 @@ fn handleClaudeHook(alloc: Allocator, server: *Server, req: *const protocol.Requ
 }
 
 /// Resolve a workspace by explicit workspace_id param, session store lookup, or current.
-fn resolveClaudeWorkspace(server: *Server, alloc: Allocator, req: *const protocol.Request) ?*Workspace {
-    const window = server.window orelse return null;
+/// Which workspace a Claude hook targets.
+const ClaudeTarget = union(enum) {
+    id: u64,
+    /// No explicit target: use whichever workspace is selected.
+    current,
+    /// A target was given but is not a usable workspace id.
+    invalid,
+};
 
+/// Resolve the target workspace *id* for a Claude hook.
+///
+/// Only touches the session store (which has its own mutex) and request
+/// params, never `tab_manager` -- the id is turned into a `*Workspace` on the
+/// main thread by WorkspaceMutationCtx.
+fn resolveClaudeTarget(server: *Server, alloc: Allocator, req: *const protocol.Request) ClaudeTarget {
     // 1. Explicit workspace_id param
     if (req.getIntParam(alloc, "workspace_id")) |id| {
-        return window.tab_manager.findById(toU64(id) orelse return null);
+        return .{ .id = toU64(id) orelse return .invalid };
     }
 
     // 2. Look up via session store
     if (req.getStringParam(alloc, "session_id")) |sid| {
         defer alloc.free(sid);
         if (server.claude_session_store.lookup(sid)) |rec| {
-            return window.tab_manager.findById(rec.workspace_id);
+            return .{ .id = rec.workspace_id };
         }
     }
 
     // 3. Fall back to current workspace
-    return window.tab_manager.selectedWorkspace();
+    return .current;
+}
+
+/// Apply a Claude status change and return the workspace it landed on.
+fn claudeStatusUpdate(
+    server: *Server,
+    target: ClaudeTarget,
+    arg: WsMutArg,
+    apply: *const fn (*Workspace, WsMutArg) void,
+) ?u64 {
+    const window = server.window orelse {
+        arg.free();
+        return null;
+    };
+    const target_id: ?u64 = switch (target) {
+        .id => |wid| wid,
+        .current => null,
+        .invalid => {
+            arg.free();
+            return null;
+        },
+    };
+    return switch (mutateWorkspaceOnMain(window, target_id, arg, apply, .row)) {
+        .ok => |wid| wid,
+        .not_found, .unavailable => null,
+    };
+}
+
+/// Sets the "claude" status entry to WsMutArg.text_a.
+fn applyClaudeStatus(ws: *Workspace, arg: WsMutArg) void {
+    ws.setStatusEntry("claude", arg.text_a orelse return);
+}
+
+/// Removes the "claude" status entry.
+fn applyClaudeStatusClear(ws: *Workspace, _: WsMutArg) void {
+    ws.removeStatusEntry("claude");
 }
 
 fn handleClaudeSessionStart(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveClaudeWorkspace(server, alloc, req) orelse {
+    const target = resolveClaudeTarget(server, alloc, req);
+
+    const arg = WsMutArg{ .text_a = ownArg("Running") orelse {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    } };
+    const ws_id = claudeStatusUpdate(server, target, arg, applyClaudeStatus) orelse {
         return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
     };
 
@@ -2633,18 +3142,17 @@ fn handleClaudeSessionStart(alloc: Allocator, server: *Server, req: *const proto
     const surface_id: u64 = if (req.getIntParam(alloc, "surface_id")) |s| (toU64(s) orelse 0) else 0;
 
     if (session_id) |sid| {
-        server.claude_session_store.upsert(sid, ws.id, surface_id, cwd);
+        server.claude_session_store.upsert(sid, ws_id, surface_id, cwd);
     }
 
-    ws.setStatusEntry("claude", "Running");
-    scheduleSidebarUpdate(server, ws);
-
-    log.info("Claude session started for workspace {d}", .{ws.id});
+    log.info("Claude session started for workspace {d}", .{ws_id});
     return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
 }
 
 fn handleClaudeStop(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveClaudeWorkspace(server, alloc, req) orelse {
+    const target = resolveClaudeTarget(server, alloc, req);
+
+    const ws_id = claudeStatusUpdate(server, target, .{}, applyClaudeStatusClear) orelse {
         return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
     };
 
@@ -2653,7 +3161,7 @@ fn handleClaudeStop(alloc: Allocator, server: *Server, req: *const protocol.Requ
     defer if (session_id) |s| alloc.free(s);
     const surface_id: u64 = if (req.getIntParam(alloc, "surface_id")) |s| (toU64(s) orelse 0) else 0;
 
-    const record = server.claude_session_store.consume(session_id, ws.id, if (surface_id > 0) surface_id else null);
+    const record = server.claude_session_store.consume(session_id, ws_id, if (surface_id > 0) surface_id else null);
 
     // Build notification body from stored record if available
     const notif_body: []const u8 = if (record) |rec|
@@ -2661,19 +3169,14 @@ fn handleClaudeStop(alloc: Allocator, server: *Server, req: *const protocol.Requ
     else
         "Session complete";
 
-    ws.removeStatusEntry("claude");
-    scheduleSidebarUpdate(server, ws);
-
     _ = server.notification_store.add("Claude Code", notif_body);
 
-    log.info("Claude session stopped for workspace {d}", .{ws.id});
+    log.info("Claude session stopped for workspace {d}", .{ws_id});
     return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
 }
 
 fn handleClaudeNotification(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveClaudeWorkspace(server, alloc, req) orelse {
-        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
-    };
+    const target = resolveClaudeTarget(server, alloc, req);
 
     const message = req.getStringParam(alloc, "message");
     defer if (message) |m| alloc.free(m);
@@ -2683,9 +3186,12 @@ fn handleClaudeNotification(alloc: Allocator, server: *Server, req: *const proto
     // Classify notification
     const classified = classifyClaudeNotification(event, message);
 
-    // Update sidebar status
-    ws.setStatusEntry("claude", classified.label);
-    scheduleSidebarUpdate(server, ws);
+    const arg = WsMutArg{ .text_a = ownArg(classified.label) orelse {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    } };
+    const ws_id = claudeStatusUpdate(server, target, arg, applyClaudeStatus) orelse {
+        return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
+    };
 
     // Fire desktop notification
     _ = server.notification_store.add("Claude Code", classified.body);
@@ -2693,19 +3199,21 @@ fn handleClaudeNotification(alloc: Allocator, server: *Server, req: *const proto
     // Update session record with last message info
     const session_id = req.getStringParam(alloc, "session_id");
     defer if (session_id) |s| alloc.free(s);
-    server.claude_session_store.updateMessage(session_id, ws.id, classified.label, classified.body);
+    server.claude_session_store.updateMessage(session_id, ws_id, classified.label, classified.body);
 
-    log.info("Claude notification ({s}) for workspace {d}", .{ classified.label, ws.id });
+    log.info("Claude notification ({s}) for workspace {d}", .{ classified.label, ws_id });
     return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
 }
 
 fn handleClaudePromptSubmit(alloc: Allocator, server: *Server, req: *const protocol.Request) ![]const u8 {
-    const ws = resolveClaudeWorkspace(server, alloc, req) orelse {
+    const target = resolveClaudeTarget(server, alloc, req);
+
+    const arg = WsMutArg{ .text_a = ownArg("Running") orelse {
+        return protocol.errorResponse(alloc, req.id, "internal_error", "Failed to allocate context");
+    } };
+    _ = claudeStatusUpdate(server, target, arg, applyClaudeStatus) orelse {
         return protocol.errorResponse(alloc, req.id, "not_found", "Workspace not found");
     };
-
-    ws.setStatusEntry("claude", "Running");
-    scheduleSidebarUpdate(server, ws);
 
     return protocol.successResponse(alloc, req.id, "{\"ok\":true}");
 }
@@ -2809,8 +3317,9 @@ fn handleHistoryShow(alloc: Allocator, req: *const protocol.Request) ![]const u8
     };
     defer alloc.free(id);
 
-    const text = history.loadEntryText(alloc, id) catch {
-        return protocol.errorResponse(alloc, req.id, "not_found", "History entry not found");
+    const text = history.loadEntryText(alloc, id) catch |err| switch (err) {
+        error.InvalidEntryId => return protocol.errorResponse(alloc, req.id, "invalid_id", "History id contains unsupported characters"),
+        else => return protocol.errorResponse(alloc, req.id, "not_found", "History entry not found"),
     };
     defer alloc.free(text);
 
@@ -2857,7 +3366,11 @@ fn handleHistoryDelete(alloc: Allocator, req: *const protocol.Request) ![]const 
     };
     defer alloc.free(id);
 
-    history.deleteEntry(alloc, id) catch {};
+    history.deleteEntry(alloc, id) catch |err| switch (err) {
+        error.InvalidEntryId => return protocol.errorResponse(alloc, req.id, "invalid_id", "History id contains unsupported characters"),
+        error.NotFound => return protocol.errorResponse(alloc, req.id, "not_found", "History entry not found"),
+        error.IndexUnavailable => return protocol.errorResponse(alloc, req.id, "index_unavailable", "History index could not be read"),
+    };
 
     return protocol.successResponse(alloc, req.id, "{\"deleted\":true}");
 }

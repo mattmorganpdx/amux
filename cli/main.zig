@@ -80,7 +80,9 @@ pub fn main() !void {
             const title = args.next();
             if (title) |t| {
                 var params_buf: [4096]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"title\":\"{s}\"}}", .{t}) catch {
+                var p = Params.init(&params_buf);
+                p.str("title", t);
+                const params = p.finish() orelse {
                     try stderr.writeAll("Title too long\n");
                     return;
                 };
@@ -95,9 +97,15 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux workspace select <id>\n");
                 return;
             };
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
             var params_buf: [256]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s}}}", .{id_str}) catch {
-                try stderr.writeAll("Invalid id\n");
+            var p = Params.init(&params_buf);
+            p.int("id", id);
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
                 return;
             };
             try sendAndPrint(socket_path, "workspace.select", params, stdout, stderr);
@@ -106,9 +114,15 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux workspace close <id>\n");
                 return;
             };
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
             var params_buf: [256]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s}}}", .{id_str}) catch {
-                try stderr.writeAll("Invalid id\n");
+            var p = Params.init(&params_buf);
+            p.int("id", id);
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
                 return;
             };
             try sendAndPrint(socket_path, "workspace.close", params, stdout, stderr);
@@ -121,13 +135,22 @@ pub fn main() !void {
             // If there's a second arg, rename_arg1 is the ID and second is the title
             var params_buf: [4096]u8 = undefined;
             if (args.next()) |rename_title| {
-                const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"title\":\"{s}\"}}", .{ rename_arg1, rename_title }) catch {
+                const id = argInt(rename_arg1) orelse {
+                    try stderr.writeAll("Invalid id: must be an integer\n");
+                    return;
+                };
+                var p = Params.init(&params_buf);
+                p.int("id", id);
+                p.str("title", rename_title);
+                const params = p.finish() orelse {
                     try stderr.writeAll("Title too long\n");
                     return;
                 };
                 try sendAndPrint(socket_path, "workspace.rename", params, stdout, stderr);
             } else {
-                const params = std.fmt.bufPrint(&params_buf, "{{\"title\":\"{s}\"}}", .{rename_arg1}) catch {
+                var p = Params.init(&params_buf);
+                p.str("title", rename_arg1);
+                const params = p.finish() orelse {
                     try stderr.writeAll("Title too long\n");
                     return;
                 };
@@ -147,12 +170,16 @@ pub fn main() !void {
             if (args.next()) |flag| {
                 if (std.mem.eql(u8, flag, "--dirty")) dirty = true;
             }
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
             var params_buf: [4096]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"branch\":\"{s}\",\"dirty\":{s}}}", .{
-                id_str,
-                branch,
-                if (dirty) "true" else "false",
-            }) catch {
+            var p = Params.init(&params_buf);
+            p.int("id", id);
+            p.str("branch", branch);
+            p.boolean("dirty", dirty);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Params too long\n");
                 return;
             };
@@ -171,8 +198,16 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux workspace set-status <id> <key> <value>\n");
                 return;
             };
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
             var params_buf: [4096]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ id_str, key, value }) catch {
+            var p = Params.init(&params_buf);
+            p.int("id", id);
+            p.str("key", key);
+            p.str("value", value);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Params too long\n");
                 return;
             };
@@ -183,16 +218,25 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux workspace clear-status <id> [key]\n");
                 return;
             };
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
             if (args.next()) |key| {
                 var params_buf: [4096]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"key\":\"{s}\"}}", .{ id_str, key }) catch {
+                var p = Params.init(&params_buf);
+                p.int("id", id);
+                p.str("key", key);
+                const params = p.finish() orelse {
                     try stderr.writeAll("Params too long\n");
                     return;
                 };
                 try sendAndPrint(socket_path, "workspace.clear_status", params, stdout, stderr);
             } else {
                 var params_buf: [256]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s}}}", .{id_str}) catch {
+                var p = Params.init(&params_buf);
+                p.int("id", id);
+                const params = p.finish() orelse {
                     try stderr.writeAll("Params too long\n");
                     return;
                 };
@@ -208,8 +252,15 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux workspace add-log <id> <text>\n");
                 return;
             };
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
             var params_buf: [4096]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"text\":\"{s}\"}}", .{ id_str, text }) catch {
+            var p = Params.init(&params_buf);
+            p.int("id", id);
+            p.str("text", text);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Params too long\n");
                 return;
             };
@@ -220,8 +271,14 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux workspace clear-log <id>\n");
                 return;
             };
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
             var params_buf: [256]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s}}}", .{id_str}) catch {
+            var p = Params.init(&params_buf);
+            p.int("id", id);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Params too long\n");
                 return;
             };
@@ -236,16 +293,31 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux workspace set-progress <id> <fraction> [label]\n");
                 return;
             };
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
+            const fraction_val = argFloat(fraction) orelse {
+                try stderr.writeAll("Invalid fraction: must be a number\n");
+                return;
+            };
             if (args.next()) |label| {
                 var params_buf: [4096]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"fraction\":{s},\"label\":\"{s}\"}}", .{ id_str, fraction, label }) catch {
+                var p = Params.init(&params_buf);
+                p.int("id", id);
+                p.float("fraction", fraction_val);
+                p.str("label", label);
+                const params = p.finish() orelse {
                     try stderr.writeAll("Params too long\n");
                     return;
                 };
                 try sendAndPrint(socket_path, "workspace.set_progress", params, stdout, stderr);
             } else {
                 var params_buf: [256]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"fraction\":{s}}}", .{ id_str, fraction }) catch {
+                var p = Params.init(&params_buf);
+                p.int("id", id);
+                p.float("fraction", fraction_val);
+                const params = p.finish() orelse {
                     try stderr.writeAll("Params too long\n");
                     return;
                 };
@@ -261,8 +333,19 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux workspace set-pinned <id> <true|false>\n");
                 return;
             };
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
+            const pinned = argBool(val) orelse {
+                try stderr.writeAll("Invalid value: must be true or false\n");
+                return;
+            };
             var params_buf: [256]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"pinned\":{s}}}", .{ id_str, val }) catch {
+            var p = Params.init(&params_buf);
+            p.int("id", id);
+            p.boolean("pinned", pinned);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Params too long\n");
                 return;
             };
@@ -277,17 +360,18 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux workspace set-color <id> <red|blue|green|yellow|purple|orange|pink|cyan|clear>\n");
                 return;
             };
+            const id = argInt(id_str) orelse {
+                try stderr.writeAll("Invalid id: must be an integer\n");
+                return;
+            };
             var params_buf: [256]u8 = undefined;
-            const params = if (std.mem.eql(u8, color_val, "clear"))
-                std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"color\":\"\"}}", .{id_str}) catch {
-                    try stderr.writeAll("Params too long\n");
-                    return;
-                }
-            else
-                std.fmt.bufPrint(&params_buf, "{{\"id\":{s},\"color\":\"{s}\"}}", .{ id_str, color_val }) catch {
-                    try stderr.writeAll("Params too long\n");
-                    return;
-                };
+            var p = Params.init(&params_buf);
+            p.int("id", id);
+            p.str("color", if (std.mem.eql(u8, color_val, "clear")) "" else color_val);
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
+                return;
+            };
             try sendAndPrint(socket_path, "workspace.set_color", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "next")) {
             try sendAndPrint(socket_path, "workspace.next", "{}", stdout, stderr);
@@ -310,7 +394,9 @@ pub fn main() !void {
                 return;
             };
             var params_buf: [4096]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"text\":\"{s}\"}}", .{search_text}) catch {
+            var p = Params.init(&params_buf);
+            p.str("text", search_text);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Text too long\n");
                 return;
             };
@@ -327,21 +413,19 @@ pub fn main() !void {
                 }
             }
             var params_buf: [256]u8 = undefined;
-            const params = if (surface_id) |sid|
-                if (scrollback)
-                    std.fmt.bufPrint(&params_buf, "{{\"surface_id\":{s},\"scrollback\":true}}", .{sid}) catch {
-                        try stderr.writeAll("Params too long\n");
-                        return;
-                    }
-                else
-                    std.fmt.bufPrint(&params_buf, "{{\"surface_id\":{s}}}", .{sid}) catch {
-                        try stderr.writeAll("Params too long\n");
-                        return;
-                    }
-            else if (scrollback)
-                "{\"scrollback\":true}"
-            else
-                "{}";
+            var p = Params.init(&params_buf);
+            if (surface_id) |sid| {
+                const sid_val = argInt(sid) orelse {
+                    try stderr.writeAll("Invalid surface id: must be an integer\n");
+                    return;
+                };
+                p.int("surface_id", sid_val);
+            }
+            if (scrollback) p.boolean("scrollback", true);
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
+                return;
+            };
             try sendAndPrint(socket_path, "surface.read_text", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "send-key")) {
             // amux-clisurface send-key [--surface <id>] <key>
@@ -367,16 +451,19 @@ pub fn main() !void {
                 return;
             };
             var params_buf: [256]u8 = undefined;
-            const params = if (surface_id) |sid|
-                std.fmt.bufPrint(&params_buf, "{{\"key\":\"{s}\",\"surface_id\":{s}}}", .{ key_name, sid }) catch {
-                    try stderr.writeAll("Params too long\n");
-                    return;
-                }
-            else
-                std.fmt.bufPrint(&params_buf, "{{\"key\":\"{s}\"}}", .{key_name}) catch {
-                    try stderr.writeAll("Params too long\n");
+            var p = Params.init(&params_buf);
+            p.str("key", key_name);
+            if (surface_id) |sid| {
+                const sid_val = argInt(sid) orelse {
+                    try stderr.writeAll("Invalid surface id: must be an integer\n");
                     return;
                 };
+                p.int("surface_id", sid_val);
+            }
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
+                return;
+            };
             try sendAndPrint(socket_path, "surface.send_key", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "split")) {
             // amux-clisurface split <direction>
@@ -385,7 +472,9 @@ pub fn main() !void {
                 return;
             };
             var params_buf: [256]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"direction\":\"{s}\"}}", .{direction}) catch {
+            var p = Params.init(&params_buf);
+            p.str("direction", direction);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Params too long\n");
                 return;
             };
@@ -405,9 +494,15 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux pane break <pane_id>\n");
                 return;
             };
+            const pane_id_val = argInt(pane_id) orelse {
+                try stderr.writeAll("Invalid pane_id: must be an integer\n");
+                return;
+            };
             var params_buf: [256]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"pane_id\":{s}}}", .{pane_id}) catch {
-                try stderr.writeAll("Invalid pane_id\n");
+            var p = Params.init(&params_buf);
+            p.int("pane_id", pane_id_val);
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
                 return;
             };
             try sendAndPrint(socket_path, "pane.break", params, stdout, stderr);
@@ -420,8 +515,19 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux pane join <pane_id> <workspace_id>\n");
                 return;
             };
+            const pane_id_val = argInt(pane_id) orelse {
+                try stderr.writeAll("Invalid pane_id: must be an integer\n");
+                return;
+            };
+            const ws_id_val = argInt(workspace_id) orelse {
+                try stderr.writeAll("Invalid workspace_id: must be an integer\n");
+                return;
+            };
             var params_buf: [256]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"pane_id\":{s},\"workspace_id\":{s}}}", .{ pane_id, workspace_id }) catch {
+            var p = Params.init(&params_buf);
+            p.int("pane_id", pane_id_val);
+            p.int("workspace_id", ws_id_val);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Params too long\n");
                 return;
             };
@@ -436,21 +542,26 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux pane resize <pane_id> <left|right|up|down> [amount]\n");
                 return;
             };
+            const pane_id_val = argInt(pane_id) orelse {
+                try stderr.writeAll("Invalid pane_id: must be an integer\n");
+                return;
+            };
+            var params_buf: [256]u8 = undefined;
+            var p = Params.init(&params_buf);
+            p.int("pane_id", pane_id_val);
+            p.str("direction", direction);
             if (args.next()) |amount| {
-                var params_buf: [256]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"pane_id\":{s},\"direction\":\"{s}\",\"amount\":{s}}}", .{ pane_id, direction, amount }) catch {
-                    try stderr.writeAll("Params too long\n");
+                const amount_val = argFloat(amount) orelse {
+                    try stderr.writeAll("Invalid amount: must be a number\n");
                     return;
                 };
-                try sendAndPrint(socket_path, "pane.resize", params, stdout, stderr);
-            } else {
-                var params_buf: [256]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"pane_id\":{s},\"direction\":\"{s}\"}}", .{ pane_id, direction }) catch {
-                    try stderr.writeAll("Params too long\n");
-                    return;
-                };
-                try sendAndPrint(socket_path, "pane.resize", params, stdout, stderr);
+                p.float("amount", amount_val);
             }
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
+                return;
+            };
+            try sendAndPrint(socket_path, "pane.resize", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "swap")) {
             // amux-clipane swap <pane_a> <pane_b>
             const pane_a = args.next() orelse {
@@ -461,8 +572,19 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux pane swap <pane_a> <pane_b>\n");
                 return;
             };
+            const pane_a_val = argInt(pane_a) orelse {
+                try stderr.writeAll("Invalid pane_a: must be an integer\n");
+                return;
+            };
+            const pane_b_val = argInt(pane_b) orelse {
+                try stderr.writeAll("Invalid pane_b: must be an integer\n");
+                return;
+            };
             var params_buf: [256]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"pane_a\":{s},\"pane_b\":{s}}}", .{ pane_a, pane_b }) catch {
+            var p = Params.init(&params_buf);
+            p.int("pane_a", pane_a_val);
+            p.int("pane_b", pane_b_val);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Params too long\n");
                 return;
             };
@@ -505,25 +627,27 @@ pub fn main() !void {
 
         // Build JSON params
         var params_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&params_buf);
-        const writer = fbs.writer();
-        try writer.writeAll("{\"command\":\"");
-        try writeJsonEscaped(writer, cmd);
-        try writer.writeByte('"');
+        var p = Params.init(&params_buf);
+        p.str("command", cmd);
         if (surface_id) |sid| {
-            try writer.print(",\"surface_id\":{s}", .{sid});
+            const sid_val = argInt(sid) orelse {
+                try stderr.writeAll("Invalid surface id: must be an integer\n");
+                return;
+            };
+            p.int("surface_id", sid_val);
         }
         if (timeout_str) |t| {
-            try writer.print(",\"timeout\":{s}", .{t});
+            const timeout_val = argInt(t) orelse {
+                try stderr.writeAll("Invalid timeout: must be an integer\n");
+                return;
+            };
+            p.int("timeout", timeout_val);
         }
-        if (prompt_pat) |pat| {
-            try writer.writeAll(",\"prompt_pattern\":\"");
-            try writeJsonEscaped(writer, pat);
-            try writer.writeByte('"');
-        }
-        try writer.writeByte('}');
-
-        const params = fbs.getWritten();
+        if (prompt_pat) |pat| p.str("prompt_pattern", pat);
+        const params = p.finish() orelse {
+            try stderr.writeAll("Command too long\n");
+            return;
+        };
         try sendAndPrint(socket_path, "surface.run", params, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "send")) {
         // amux-clisend [--surface <id>] [--enter] <text>
@@ -553,18 +677,19 @@ pub fn main() !void {
         };
         // Build params JSON with properly escaped text
         var params_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&params_buf);
-        const writer = fbs.writer();
-        try writer.writeAll("{\"text\":\"");
-        try writeJsonEscaped(writer, send_text);
-        if (append_enter) try writer.writeAll("\\n");
-        try writer.writeByte('"');
+        var p = Params.init(&params_buf);
+        p.strCat("text", send_text, if (append_enter) "\n" else "");
         if (surface_id) |sid| {
-            try writer.writeAll(",\"surface_id\":");
-            try writer.writeAll(sid);
+            const sid_val = argInt(sid) orelse {
+                try stderr.writeAll("Invalid surface id: must be an integer\n");
+                return;
+            };
+            p.int("surface_id", sid_val);
         }
-        try writer.writeByte('}');
-        const params = fbs.getWritten();
+        const params = p.finish() orelse {
+            try stderr.writeAll("Text too long\n");
+            return;
+        };
         try sendAndPrint(socket_path, "surface.send_text", params, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "window")) {
         const sub = args.next() orelse "list";
@@ -584,26 +709,26 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux notification create <title> [body]\n");
                 return;
             };
-            if (args.next()) |body| {
-                var params_buf: [4096]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"title\":\"{s}\",\"body\":\"{s}\"}}", .{ title, body }) catch {
-                    try stderr.writeAll("Params too long\n");
-                    return;
-                };
-                try sendAndPrint(socket_path, "notification.create", params, stdout, stderr);
-            } else {
-                var params_buf: [4096]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"title\":\"{s}\"}}", .{title}) catch {
-                    try stderr.writeAll("Params too long\n");
-                    return;
-                };
-                try sendAndPrint(socket_path, "notification.create", params, stdout, stderr);
-            }
+            var params_buf: [4096]u8 = undefined;
+            var p = Params.init(&params_buf);
+            p.str("title", title);
+            if (args.next()) |body| p.str("body", body);
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
+                return;
+            };
+            try sendAndPrint(socket_path, "notification.create", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "clear")) {
             if (args.next()) |id_str| {
+                const id = argInt(id_str) orelse {
+                    try stderr.writeAll("Invalid id: must be an integer\n");
+                    return;
+                };
                 var params_buf: [256]u8 = undefined;
-                const params = std.fmt.bufPrint(&params_buf, "{{\"id\":{s}}}", .{id_str}) catch {
-                    try stderr.writeAll("Invalid id\n");
+                var p = Params.init(&params_buf);
+                p.int("id", id);
+                const params = p.finish() orelse {
+                    try stderr.writeAll("Params too long\n");
                     return;
                 };
                 try sendAndPrint(socket_path, "notification.clear", params, stdout, stderr);
@@ -623,7 +748,9 @@ pub fn main() !void {
                 return;
             };
             var params_buf: [512]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"action\":\"{s}\"}}", .{action_name}) catch {
+            var p = Params.init(&params_buf);
+            p.str("action", action_name);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Action name too long\n");
                 return;
             };
@@ -721,44 +848,26 @@ pub fn main() !void {
         const ws_id = posix.getenv("AMUX_WORKSPACE_ID");
         const surface_id = posix.getenv("AMUX_SURFACE_ID");
 
-        // Build params JSON
+        // Build params JSON. The workspace/surface ids come from the environment
+        // amux injects into each pane; if they are missing or malformed, omit them
+        // rather than emitting an invalid JSON number.
         var params_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&params_buf);
-        const writer = fbs.writer();
-        try writer.writeAll("{\"subcommand\":\"");
-        try writer.writeAll(hook_sub);
-        try writer.writeByte('"');
-        if (session_id) |sid| {
-            try writer.writeAll(",\"session_id\":\"");
-            try writeJsonEscaped(writer, sid);
-            try writer.writeByte('"');
-        }
+        var p = Params.init(&params_buf);
+        p.str("subcommand", hook_sub);
+        if (session_id) |sid| p.str("session_id", sid);
         if (ws_id) |w| {
-            try writer.writeAll(",\"workspace_id\":");
-            try writer.writeAll(w);
+            if (argInt(w)) |v| p.int("workspace_id", v);
         }
-        if (surface_id) |s| {
-            try writer.writeAll(",\"surface_id\":");
-            try writer.writeAll(s);
+        if (surface_id) |sf| {
+            if (argInt(sf)) |v| p.int("surface_id", v);
         }
-        if (message) |m| {
-            try writer.writeAll(",\"message\":\"");
-            try writeJsonEscaped(writer, m);
-            try writer.writeByte('"');
-        }
-        if (event) |e| {
-            try writer.writeAll(",\"event\":\"");
-            try writeJsonEscaped(writer, e);
-            try writer.writeByte('"');
-        }
-        if (cwd_val) |c| {
-            try writer.writeAll(",\"cwd\":\"");
-            try writeJsonEscaped(writer, c);
-            try writer.writeByte('"');
-        }
-        try writer.writeByte('}');
-
-        const params = fbs.getWritten();
+        if (message) |m| p.str("message", m);
+        if (event) |e| p.str("event", e);
+        if (cwd_val) |cv| p.str("cwd", cv);
+        const params = p.finish() orelse {
+            try stderr.writeAll("Hook payload too long\n");
+            return;
+        };
         try sendAndPrint(socket_path, "claude.hook", params, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "history")) {
         const sub = args.next() orelse "list";
@@ -777,20 +886,25 @@ pub fn main() !void {
                 }
             }
             if (ws_id_str != null or limit_str != null) {
-                var fbs = std.io.fixedBufferStream(&params_buf);
-                const writer = fbs.writer();
-                try writer.writeByte('{');
-                var first = true;
+                var p = Params.init(&params_buf);
                 if (ws_id_str) |ws_id| {
-                    try writer.print("\"workspace_id\":{s}", .{ws_id});
-                    first = false;
+                    const ws_val = argInt(ws_id) orelse {
+                        try stderr.writeAll("Invalid --workspace: must be an integer\n");
+                        return;
+                    };
+                    p.int("workspace_id", ws_val);
                 }
                 if (limit_str) |limit| {
-                    if (!first) try writer.writeByte(',');
-                    try writer.print("\"limit\":{s}", .{limit});
+                    const limit_val = argInt(limit) orelse {
+                        try stderr.writeAll("Invalid --limit: must be an integer\n");
+                        return;
+                    };
+                    p.int("limit", limit_val);
                 }
-                try writer.writeByte('}');
-                params = fbs.getWritten();
+                params = p.finish() orelse {
+                    try stderr.writeAll("Params too long\n");
+                    return;
+                };
             }
             try sendAndPrint(socket_path, "history.list", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "show")) {
@@ -799,7 +913,9 @@ pub fn main() !void {
                 return;
             };
             var params_buf: [4096]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":\"{s}\"}}", .{id_str}) catch {
+            var p = Params.init(&params_buf);
+            p.str("id", id_str);
+            const params = p.finish() orelse {
                 try stderr.writeAll("ID too long\n");
                 return;
             };
@@ -810,7 +926,9 @@ pub fn main() !void {
                 return;
             };
             var params_buf: [4096]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"query\":\"{s}\"}}", .{query}) catch {
+            var p = Params.init(&params_buf);
+            p.str("query", query);
+            const params = p.finish() orelse {
                 try stderr.writeAll("Query too long\n");
                 return;
             };
@@ -821,7 +939,9 @@ pub fn main() !void {
                 return;
             };
             var params_buf: [4096]u8 = undefined;
-            const params = std.fmt.bufPrint(&params_buf, "{{\"id\":\"{s}\"}}", .{id_str}) catch {
+            var p = Params.init(&params_buf);
+            p.str("id", id_str);
+            const params = p.finish() orelse {
                 try stderr.writeAll("ID too long\n");
                 return;
             };
@@ -849,24 +969,146 @@ fn extractJsonString(obj: std.json.Value, keys: []const []const u8) ?[]const u8 
     return null;
 }
 
-/// Write a JSON-escaped string (handles quotes, backslash, control chars).
-fn writeJsonEscaped(writer: anytype, s: []const u8) !void {
-    for (s) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (ch < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{ch});
-                } else {
-                    try writer.writeByte(ch);
-                }
-            },
+/// Builds a JSON params object safely.
+///
+/// Every string value is JSON-escaped and every numeric/boolean value is
+/// validated before it reaches the wire, so user input containing quotes,
+/// backslashes, newlines or non-numeric text can no longer produce malformed
+/// JSON (or inject extra keys into the request).
+///
+/// Overflow is tracked rather than thrown: `finish()` returns null if the
+/// object did not fit, so callers report one consistent error.
+const Params = struct {
+    buf: []u8,
+    len: usize = 0,
+    overflow: bool = false,
+    first: bool = true,
+
+    fn init(buf: []u8) Params {
+        return .{ .buf = buf };
+    }
+
+    fn putByte(self: *Params, ch: u8) void {
+        if (self.len >= self.buf.len) {
+            self.overflow = true;
+            return;
+        }
+        self.buf[self.len] = ch;
+        self.len += 1;
+    }
+
+    fn putAll(self: *Params, text: []const u8) void {
+        for (text) |ch| self.putByte(ch);
+    }
+
+    fn putKey(self: *Params, key: []const u8) void {
+        self.putByte(if (self.first) '{' else ',');
+        self.first = false;
+        self.putByte('"');
+        self.putAll(key);
+        self.putAll("\":");
+    }
+
+    /// Add a JSON-escaped string value.
+    fn str(self: *Params, key: []const u8, value: []const u8) void {
+        self.putKey(key);
+        self.putByte('"');
+        self.escapeInto(value);
+        self.putByte('"');
+    }
+
+    /// Add a JSON-escaped string value assembled from two parts.
+    fn strCat(self: *Params, key: []const u8, head: []const u8, tail: []const u8) void {
+        self.putKey(key);
+        self.putByte('"');
+        self.escapeInto(head);
+        self.escapeInto(tail);
+        self.putByte('"');
+    }
+
+    fn escapeInto(self: *Params, value: []const u8) void {
+        for (value) |ch| {
+            switch (ch) {
+                '"' => self.putAll("\\\""),
+                '\\' => self.putAll("\\\\"),
+                '\n' => self.putAll("\\n"),
+                '\r' => self.putAll("\\r"),
+                '\t' => self.putAll("\\t"),
+                else => {
+                    if (ch < 0x20) {
+                        var hex: [6]u8 = undefined;
+                        const written = std.fmt.bufPrint(&hex, "\\u{x:0>4}", .{ch}) catch {
+                            self.overflow = true;
+                            return;
+                        };
+                        self.putAll(written);
+                    } else {
+                        self.putByte(ch);
+                    }
+                },
+            }
         }
     }
+
+    fn int(self: *Params, key: []const u8, value: i64) void {
+        self.putKey(key);
+        var num: [24]u8 = undefined;
+        const written = std.fmt.bufPrint(&num, "{d}", .{value}) catch {
+            self.overflow = true;
+            return;
+        };
+        self.putAll(written);
+    }
+
+    fn float(self: *Params, key: []const u8, value: f64) void {
+        self.putKey(key);
+        // `{d}` prints floats without an exponent, so f64's full range needs
+        // room for ~310 integer digits plus a fractional tail.
+        var num: [512]u8 = undefined;
+        const written = std.fmt.bufPrint(&num, "{d}", .{value}) catch {
+            self.overflow = true;
+            return;
+        };
+        self.putAll(written);
+    }
+
+    fn boolean(self: *Params, key: []const u8, value: bool) void {
+        self.putKey(key);
+        self.putAll(if (value) "true" else "false");
+    }
+
+    /// Finish the object. Returns null if it did not fit in the buffer.
+    fn finish(self: *Params) ?[]const u8 {
+        if (self.first) self.putByte('{');
+        self.putByte('}');
+        if (self.overflow) return null;
+        return self.buf[0..self.len];
+    }
+};
+
+/// Parse a CLI argument that must reach the server as a JSON number.
+fn argInt(text: []const u8) ?i64 {
+    return std.fmt.parseInt(i64, text, 10) catch null;
+}
+
+/// Parse a CLI argument that must reach the server as a JSON float.
+///
+/// `parseFloat` accepts "nan", "inf" and "infinity", but JSON has no literal
+/// for either -- they would be emitted as bare tokens and make the whole
+/// request unparseable. Reject them here so the user gets a clear message.
+fn argFloat(text: []const u8) ?f64 {
+    const value = std.fmt.parseFloat(f64, text) catch return null;
+    if (!std.math.isFinite(value)) return null;
+    return value;
+}
+
+/// Parse a CLI argument that must reach the server as a JSON boolean.
+fn argBool(text: []const u8) ?bool {
+    if (std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "1") or
+        std.mem.eql(u8, text, "yes")) return true;
+    if (std.mem.eql(u8, text, "false") or std.mem.eql(u8, text, "0") or
+        std.mem.eql(u8, text, "no")) return false;
+    return null;
 }
 
 var next_req_id: i64 = 1;
@@ -911,20 +1153,34 @@ fn sendAndPrint(socket_path: []const u8, method: []const u8, params: []const u8,
     };
     stream.writeAll("\n") catch {};
 
-    // Read response
-    var resp_buf: [65536]u8 = undefined;
-    const n = stream.read(&resp_buf) catch {
-        try stderr.writeAll("Failed to read response\n");
-        return;
-    };
+    // Read the response. Responses are newline-delimited and can be far larger
+    // than any single read() returns (scrollback reads, `history show`), so keep
+    // reading until the delimiter arrives instead of printing a truncated chunk.
+    const alloc = std.heap.page_allocator;
+    var response_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer response_buf.deinit(alloc);
 
-    if (n == 0) {
+    var chunk: [65536]u8 = undefined;
+    while (true) {
+        const n = stream.read(&chunk) catch {
+            try stderr.writeAll("Failed to read response\n");
+            return;
+        };
+        if (n == 0) break; // server closed
+        response_buf.appendSlice(alloc, chunk[0..n]) catch {
+            try stderr.writeAll("Response too large\n");
+            return;
+        };
+        if (std.mem.indexOfScalar(u8, chunk[0..n], '\n') != null) break;
+    }
+
+    if (response_buf.items.len == 0) {
         try stderr.writeAll("Empty response from server\n");
         return;
     }
 
     // Trim trailing newline
-    var response = resp_buf[0..n];
+    var response: []const u8 = response_buf.items;
     while (response.len > 0 and (response[response.len - 1] == '\n' or response[response.len - 1] == '\r')) {
         response = response[0 .. response.len - 1];
     }

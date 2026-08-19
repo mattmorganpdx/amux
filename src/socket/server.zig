@@ -124,11 +124,18 @@ fn acceptLoop(self: *Server) void {
             continue;
         };
 
-        // Spawn a thread to handle this client
-        _ = std.Thread.spawn(.{}, handleClient, .{ self, client }) catch |err| {
+        // Spawn a thread to handle this client.
+        //
+        // The handle must be detached: a Thread that is neither joined nor
+        // detached never releases its stack and bookkeeping. amux-cli opens a
+        // fresh connection per command, so leaving these attached leaked memory
+        // on every single CLI invocation.
+        const thread = std.Thread.spawn(.{}, handleClient, .{ self, client }) catch |err| {
             log.warn("Failed to spawn client thread: {}", .{err});
             posix.close(client);
+            continue;
         };
+        thread.detach();
     }
 }
 

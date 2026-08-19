@@ -59,11 +59,29 @@ fn indexFilePath(buf: *[4096]u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/index.json", .{dir}) catch null;
 }
 
+/// History entry IDs double as filenames, and socket clients can pass an
+/// arbitrary `id` to history.show / history.delete. Restrict them to the
+/// character set the generator actually produces (`{timestamp}_ws{n}_p{n}`)
+/// so an id can never contain `/` or `..` and escape the history directory.
+pub fn isValidEntryId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 128) return false;
+    for (id) |ch| {
+        switch (ch) {
+            'A'...'Z', 'a'...'z', '0'...'9', '_', '-' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 pub fn entryFilePathPub(buf: *[4096]u8, id: []const u8) ?[]const u8 {
     return entryFilePath(buf, id);
 }
 
+/// Returns null for an invalid id or a missing config dir. Validation lives
+/// here because every filesystem path in this module is built through it.
 fn entryFilePath(buf: *[4096]u8, id: []const u8) ?[]const u8 {
+    if (!isValidEntryId(id)) return null;
     var dir_buf: [4096]u8 = undefined;
     const dir = historyDir(&dir_buf) orelse return null;
     return std.fmt.bufPrint(buf, "{s}/{s}.txt", .{ dir, id }) catch null;
@@ -227,6 +245,7 @@ pub fn loadIndex(alloc: Allocator) !HistoryIndex {
 
 /// Load the text content of a specific history entry.
 pub fn loadEntryText(alloc: Allocator, id: []const u8) ![]const u8 {
+    if (!isValidEntryId(id)) return error.InvalidEntryId;
     var path_buf: [4096]u8 = undefined;
     const path = entryFilePath(&path_buf, id) orelse return error.NoConfigDir;
 
@@ -243,11 +262,20 @@ pub fn loadEntryText(alloc: Allocator, id: []const u8) ![]const u8 {
 
 /// Delete a history entry (both text file and index entry).
 pub fn deleteEntry(alloc: Allocator, id: []const u8) !void {
-    deleteEntryFile(id);
+    if (!isValidEntryId(id)) return error.InvalidEntryId;
 
-    var index = loadIndex(alloc) catch return;
+    // Distinguish "the index says no such entry" from "the index could not be
+    // read at all" (missing config dir, truncated/corrupt JSON, permissions).
+    // Collapsing the latter into NotFound would tell the caller an entry is
+    // gone while its file is still on disk.
+    var index = loadIndex(alloc) catch |err| switch (err) {
+        error.FileNotFound => return error.NotFound,
+        else => return error.IndexUnavailable,
+    };
     defer freeIndex(alloc, &index);
 
+    // Only unlink files this index actually owns, so a caller-supplied id can
+    // never delete an unrelated file even if validation were bypassed.
     var found: ?usize = null;
     for (index.entries.items, 0..) |e, i| {
         if (std.mem.eql(u8, e.id, id)) {
@@ -255,11 +283,12 @@ pub fn deleteEntry(alloc: Allocator, id: []const u8) !void {
             break;
         }
     }
-    if (found) |idx| {
-        const old = index.entries.orderedRemove(idx);
-        freeEntry(alloc, &old);
-        writeIndex(alloc, &index) catch {};
-    }
+    const idx = found orelse return error.NotFound;
+
+    deleteEntryFile(id);
+    const old = index.entries.orderedRemove(idx);
+    freeEntry(alloc, &old);
+    writeIndex(alloc, &index) catch {};
 }
 
 /// Search across all history entries for a query string.

@@ -209,7 +209,7 @@ Identified via full code review (2026-03-19). These are correctness and safety i
 
 ## Architecture
 
-- **Language:** Zig 0.14, `@cImport` for GTK4 and Ghostty C headers
+- **Language:** Zig 0.15.2 (pinned in `build.zig`), `@cImport` for GTK4 and Ghostty C headers
 - **UI toolkit:** GTK4 (GtkApplication, GtkGLArea, GtkPaned, GtkListBox, etc.)
 - **Terminal backend:** Ghostty embedded apprt via `libghostty.so`
 - **Ghostty fork:** `mattmorganpdx/ghostty` branch `matt/linux-embedded-apprt` — adds Linux platform to embedded apprt

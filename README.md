@@ -47,7 +47,7 @@ amux speaks the [cmux](https://cmux.dev) V2 socket protocol (newline-delimited J
 ### Prerequisites
 
 - Linux (X11 or Wayland)
-- Zig 0.14+
+- Zig 0.15.2 (exactly the 0.15.x series — `build.zig` rejects 0.16, which cannot compile the GTK4 `@cImport`)
 - GTK4 development files (`sudo apt install libgtk-4-dev`)
 - libnotify development files (`sudo apt install libnotify-dev`)
 
@@ -123,7 +123,7 @@ Socket path resolution: `AMUX_SOCKET` > `AMUX_SOCKET_PATH` > `/tmp/amux.sock`
 
 ## Architecture
 
-- **Language:** Zig 0.14, `@cImport` for GTK4 and Ghostty C headers
+- **Language:** Zig 0.15.2 (pinned in `build.zig`), `@cImport` for GTK4 and Ghostty C headers
 - **UI:** GTK4 (GtkApplication, GtkGLArea, GtkPaned, GtkListBox, GtkStack)
 - **Terminal:** Ghostty embedded apprt via `libghostty.so`
 - **Ghostty fork:** [`mattmorganpdx/ghostty`](https://github.com/mattmorganpdx/ghostty) branch `matt/linux-embedded-apprt`

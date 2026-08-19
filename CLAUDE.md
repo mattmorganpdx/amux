@@ -117,8 +117,12 @@ Socket path resolution: `AMUX_SOCKET` → `AMUX_SOCKET_PATH` → `/tmp/amux.sock
 
 ## Building
 
+amux pins **Zig 0.15.2**. Zig 0.16 will not build it — `build.zig` checks the
+compiler version and fails with instructions. See `build.zig` for why (0.16's
+translate-c cannot process the GTK4 headers).
+
 ```bash
-cd linux && zig build
+zig build
 ```
 
 This produces two binaries in `zig-out/bin/`:
@@ -130,12 +134,12 @@ This produces two binaries in `zig-out/bin/`:
 If the Ghostty submodule changes, rebuild via the setup script:
 
 ```bash
-cd linux && ./setup.sh
+./setup.sh
 ```
 
 ## Architecture
 
-- **Language:** Zig 0.14, `@cImport` for GTK4 and Ghostty C headers
+- **Language:** Zig 0.15.2 (pinned in `build.zig`), `@cImport` for GTK4 and Ghostty C headers
 - **UI:** GTK4 (GtkApplication, GtkGLArea, GtkPaned, GtkListBox)
 - **Terminal:** Ghostty embedded apprt via `libghostty.so`
 - **Socket:** Unix domain socket, newline-delimited JSON-RPC, thread-per-client

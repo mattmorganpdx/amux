@@ -76,29 +76,62 @@ pub fn add(self: *NotificationStore, title: []const u8, body: ?[]const u8) u64 {
     return id;
 }
 
-/// Show a desktop notification via libnotify.
-fn showDesktopNotification(_: *NotificationStore, title: []const u8, body: ?[]const u8) void {
-    // Null-terminate title
-    var title_z: [257]u8 = undefined;
-    const t_len = @min(title.len, 256);
-    @memcpy(title_z[0..t_len], title[0..t_len]);
-    title_z[t_len] = 0;
+/// One queued desktop notification, owned by the GTK main thread.
+///
+/// The strings are copied in rather than borrowed: the requesting handler
+/// thread returns (and frees its request arena) long before the idle callback
+/// runs. Both buffers carry room for a NUL beyond the libnotify field sizes.
+const DesktopRequest = struct {
+    title: [257]u8,
+    body: [513]u8,
+    has_body: bool,
+};
 
-    // Null-terminate body (or null)
-    var body_ptr: ?[*:0]const u8 = null;
-    var body_z: [513]u8 = undefined;
+/// Show a desktop notification via libnotify.
+///
+/// libnotify and the GLib main context behind it are not safe to drive from
+/// arbitrary threads, and every entry point in this store runs on a socket
+/// handler thread. The show is therefore queued onto the GTK main thread, the
+/// same place every other UI touchpoint in amux is driven from -- and where
+/// `notify_init` itself runs, so this can no longer race initialisation.
+///
+/// Deliberately fire-and-forget: the caller does not wait, so a slow DBus
+/// round-trip cannot stall a socket handler (or, before the store grew a
+/// mutex, every other handler behind it). The only cost is that a request
+/// queued while the main loop is shutting down never fires and its payload is
+/// leaked -- bounded, and the process is exiting anyway.
+fn showDesktopNotification(_: *NotificationStore, title: []const u8, body: ?[]const u8) void {
+    const req = std.heap.c_allocator.create(DesktopRequest) catch |err| {
+        log.warn("Dropping desktop notification: {}", .{err});
+        return;
+    };
+    // Zeroed so both buffers are NUL-terminated whatever the copy length is.
+    req.* = std.mem.zeroes(DesktopRequest);
+    req.has_body = body != null;
+
+    const t_len = @min(title.len, req.title.len - 1);
+    @memcpy(req.title[0..t_len], title[0..t_len]);
+
     if (body) |b| {
-        const b_len = @min(b.len, 512);
-        @memcpy(body_z[0..b_len], b[0..b_len]);
-        body_z[b_len] = 0;
-        body_ptr = @ptrCast(&body_z);
+        const b_len = @min(b.len, req.body.len - 1);
+        @memcpy(req.body[0..b_len], b[0..b_len]);
     }
 
-    const notif = c.notify_notification_new(&title_z, body_ptr, null);
+    _ = c.g_idle_add(&showQueuedNotification, @ptrCast(req));
+}
+
+/// Runs on the GTK main thread; consumes and frees one DesktopRequest.
+fn showQueuedNotification(userdata: c.gpointer) callconv(.c) c.gboolean {
+    const req: *DesktopRequest = @ptrCast(@alignCast(userdata));
+    defer std.heap.c_allocator.destroy(req);
+
+    const body_ptr: ?[*:0]const u8 = if (req.has_body) @ptrCast(&req.body) else null;
+    const notif = c.notify_notification_new(@ptrCast(&req.title), body_ptr, null);
     if (notif) |n| {
         _ = c.notify_notification_show(n, null);
         c.g_object_unref(n);
     }
+    return c.G_SOURCE_REMOVE;
 }
 
 /// Get all stored notifications (most recent first).

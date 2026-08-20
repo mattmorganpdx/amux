@@ -143,4 +143,4 @@ If the Ghostty submodule changes, rebuild via the setup script:
 - **UI:** GTK4 (GtkApplication, GtkGLArea, GtkPaned, GtkListBox)
 - **Terminal:** Ghostty embedded apprt via `libghostty.so`
 - **Socket:** Unix domain socket, newline-delimited JSON-RPC, thread-per-client
-- **Source layout:** `src/` (GUI app), `cli/` (CLI tool), `src/socket/` (server + handlers)
+- **Source layout:** `src/` (GUI app), `cli/` (CLI tool), `src/socket/` (server + request router), `src/socket/handlers/` (per-domain handlers: system, workspace, surface, pane, window_api, notification, palette, claude, history, plus `common` for shared main-thread dispatch)

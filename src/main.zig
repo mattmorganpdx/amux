@@ -62,10 +62,16 @@ pub fn main() !void {
         global_window = null;
     }
 
-    if (global_app) |app| {
-        app.deinit();
-        global_app = null;
-    }
+    // The Ghostty app is deliberately NOT freed here.
+    //
+    // ghostty_surface_free does not join a surface's renderer/io threads --
+    // measured directly: closing panes never lowers the process thread count --
+    // so those threads outlive every surface amux has ever created and keep
+    // referencing app-level state. ghostty_app_free tears that state down
+    // underneath them, segfaulting inside libghostty; reproducible after any
+    // workspace or pane churn. There is no point at which the free is safe, and
+    // the process is exiting, so let the OS reclaim it.
+    global_app = null;
 
     c.notify_uninit();
 
@@ -204,6 +210,12 @@ fn copyFile(src: [*:0]const u8, dest: [*:0]const u8) !void {
 /// Returning 0 (FALSE) lets GTK proceed with window destruction; when the last
 /// window is destroyed GtkApplication automatically quits the main loop.
 fn onCloseRequest(_: *c.GtkWindow, _: c.gpointer) callconv(.c) c.gboolean {
+    // Returning 0 below hands the window to GTK for destruction, so stop any
+    // further idle callbacks from touching it.
+    if (global_window) |window| {
+        window.closing = true;
+    }
+
     // Save terminal history before the window is destroyed
     if (global_window) |window| {
         window.saveAllHistory("app_exit");

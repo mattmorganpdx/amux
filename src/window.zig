@@ -21,6 +21,12 @@ const Allocator = std.mem.Allocator;
 /// The GTK application window.
 gtk_window: *c.GtkApplicationWindow,
 
+/// Set once the window is on its way out, so queued idle callbacks stop
+/// touching GTK. Ghostty can emit a title change at any time; when one landed
+/// after the window was destroyed it produced
+/// `Gtk-CRITICAL: gtk_window_set_title: assertion 'GTK_IS_WINDOW (window)' failed`.
+closing: bool = false,
+
 /// The Ghostty app reference.
 app: *App,
 
@@ -1056,6 +1062,55 @@ pub fn previousWorkspace(self: *Window) void {
     }
 }
 
+/// Append every node id (panes and splits) reachable from `node_id`.
+fn collectSubtreeNodes(
+    self: *Window,
+    tree: *const PaneTree,
+    node_id: ?PaneTree.NodeId,
+    out: *std.ArrayListUnmanaged(PaneTree.NodeId),
+) !void {
+    const id = node_id orelse return;
+    try out.append(self.alloc, id);
+    switch (tree.getNode(id) orelse return) {
+        .pane => {},
+        .split => |sp| {
+            try self.collectSubtreeNodes(tree, sp.first, out);
+            try self.collectSubtreeNodes(tree, sp.second, out);
+        },
+    }
+}
+
+/// Destroy the terminal widgets backing every pane still attached to `ws`.
+///
+/// Closing a workspace used to drop the Workspace and its pane tree without
+/// touching the TerminalWidgets, so each closed workspace leaked its Ghostty
+/// surface -- and that surface's renderer/io/io-reader thread trio -- for the
+/// rest of the process lifetime. Every orphan was then freed at once in
+/// `deinit`, racing threads that were still live, which segfaulted inside
+/// libghostty.
+///
+/// Traversal deliberately starts at the tree root: a pane moved out by
+/// `joinPaneToWorkspace` is unreachable from it (the last-pane case clears
+/// `root` and leaves the node in place), so a moved pane is never destroyed
+/// here. Must run after `saveWorkspaceHistory`, which still needs live
+/// surfaces to read.
+fn destroyWorkspaceWidgets(self: *Window, ws: *Workspace) void {
+    var node_ids: std.ArrayListUnmanaged(PaneTree.NodeId) = .{};
+    defer node_ids.deinit(self.alloc);
+
+    self.collectSubtreeNodes(&ws.pane_tree, ws.pane_tree.root, &node_ids) catch {
+        log.warn("Workspace {d}: could not enumerate nodes; widgets leaked", .{ws.id});
+        return;
+    };
+
+    for (node_ids.items) |node_id| {
+        _ = self.node_widgets.remove(node_id);
+        if (self.pane_widgets.fetchRemove(node_id)) |entry| {
+            entry.value.deinit();
+        }
+    }
+}
+
 /// Remove a workspace's widget tree from the content stack entirely.
 /// Only used when a workspace is being closed/deleted.
 fn removeWorkspaceFromStack(self: *Window, ws_id: Workspace.WorkspaceId) void {
@@ -1088,15 +1143,23 @@ pub fn lastWorkspace(self: *Window) void {
 
 /// Close a workspace by ID, cleaning up its widget tree from the stack.
 pub fn closeWorkspaceById(self: *Window, ws_id: Workspace.WorkspaceId) bool {
-    // Save scrollback history for all panes in this workspace before closing
+    var target: ?*Workspace = null;
     for (self.tab_manager.workspaces.items) |ws| {
         if (ws.id == ws_id) {
-            self.saveWorkspaceHistory(ws, "workspace_close");
+            target = ws;
             break;
         }
     }
 
+    // Order matches closePane: read scrollback while the surfaces are live, let
+    // GTK tear the widget hierarchy down (which unrealizes each surface and
+    // unregisters it, so Ghostty stops calling back into it), and only then
+    // free the surfaces. Freeing them while still realized and parented
+    // crashed on a glib worker thread.
+    if (target) |ws| self.saveWorkspaceHistory(ws, "workspace_close");
     self.removeWorkspaceFromStack(ws_id);
+    if (target) |ws| self.destroyWorkspaceWidgets(ws);
+
     const closed = self.tab_manager.closeWorkspaceById(ws_id);
     if (closed) {
         // If the selected workspace was closed, show the new selection
@@ -1114,8 +1177,9 @@ pub fn closeWorkspaceById(self: *Window, ws_id: Workspace.WorkspaceId) bool {
 pub fn closeWorkspaceByIndex(self: *Window, index: usize) bool {
     // Get the workspace ID before closing so we can clean up the stack
     if (index < self.tab_manager.workspaces.items.len) {
-        const ws_id = self.tab_manager.workspaces.items[index].id;
-        self.removeWorkspaceFromStack(ws_id);
+        const ws = self.tab_manager.workspaces.items[index];
+        self.removeWorkspaceFromStack(ws.id);
+        self.destroyWorkspaceWidgets(ws);
     }
     const closed = self.tab_manager.closeWorkspace(index);
     if (closed) {

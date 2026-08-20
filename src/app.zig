@@ -83,6 +83,12 @@ pub fn init() !*App {
     return app;
 }
 
+/// Frees the Ghostty app and config.
+///
+/// NOT safe to call once any surface has been created: libghostty does not join
+/// a surface's renderer/io threads on `ghostty_surface_free`, so they are still
+/// running and still referencing the state this tears down. The shutdown path
+/// in main.zig deliberately skips it for that reason.
 pub fn deinit(self: *App) void {
     if (self.ghostty_app != null) {
         c.ghostty_app_free(self.ghostty_app);
@@ -250,6 +256,10 @@ fn doSetTitle(userdata: c.gpointer) callconv(.c) c.gboolean {
 
     const main_mod = @import("main.zig");
     const window = main_mod.global_window orelse return c.G_SOURCE_REMOVE;
+
+    // The window may already have been destroyed: `global_window` stays set
+    // until main() finishes its exit path, well after GTK tears the window down.
+    if (window.closing) return c.G_SOURCE_REMOVE;
 
     // Set the GTK window title
     c.gtk_window_set_title(@ptrCast(window.gtk_window), ctx.title.ptr);

@@ -30,6 +30,31 @@ notification_store: NotificationStore = .{},
 /// In-memory Claude Code session store.
 claude_session_store: ClaudeSessionStore,
 
+// --- In-flight client tracking ---
+//
+// Client handlers run on detached threads and dereference this Server (and,
+// through it, the Window) for the whole request. `deinit` runs from main()
+// after g_application_run() returns, so without a drain it can free both out
+// from under a handler that is still mid-request.
+
+/// Guards `clients` and `active_clients`.
+client_mutex: std.Thread.Mutex = .{},
+/// Signalled when `active_clients` reaches zero.
+client_drained: std.Thread.Condition = .{},
+/// Sockets whose handler thread has not returned yet. Kept so shutdown can
+/// wake threads parked in a blocking read().
+clients: std.AutoHashMapUnmanaged(posix.socket_t, void) = .{},
+/// Number of registered handlers still running.
+active_clients: usize = 0,
+
+/// How long shutdown waits for handlers to finish.
+///
+/// Sized just above the 10s GTK dispatch timeout in handlers.zig: once the
+/// GTK loop is gone, a handler blocked in `runOnMainThread` cannot complete
+/// until that timeout expires, and cutting the drain shorter would leave it
+/// running against freed memory.
+const drain_timeout_ns: u64 = 11 * std.time.ns_per_s;
+
 pub fn init(alloc: Allocator) !*Server {
     const self = try alloc.create(Server);
 
@@ -73,11 +98,59 @@ pub fn getSocketPathZ(self: *Server) [*:0]const u8 {
 }
 
 pub fn deinit(self: *Server) void {
-    self.stop();
+    if (!self.stop()) {
+        // Handlers are still running and still dereferencing `self`. The
+        // process is on its way out, so leaking is strictly safer than freeing
+        // memory another thread is about to touch. The OS reclaims it.
+        log.warn("Skipping server teardown: client handlers still active", .{});
+        return;
+    }
+    self.clients.deinit(self.alloc);
     self.claude_session_store.deinit();
     self.registry.deinit();
     self.alloc.free(self.socket_path);
     self.alloc.destroy(self);
+}
+
+/// Register an accepted socket *before* its handler thread starts, so a
+/// concurrent stop() cannot miss a client that is still being spawned.
+fn registerClient(self: *Server, fd: posix.socket_t) bool {
+    self.client_mutex.lock();
+    defer self.client_mutex.unlock();
+    self.clients.put(self.alloc, fd, {}) catch return false;
+    self.active_clients += 1;
+    return true;
+}
+
+fn unregisterClient(self: *Server, fd: posix.socket_t) void {
+    self.client_mutex.lock();
+    defer self.client_mutex.unlock();
+    _ = self.clients.remove(fd);
+    self.active_clients -= 1;
+    if (self.active_clients == 0) self.client_drained.broadcast();
+}
+
+/// Wake every in-flight handler and wait for it to return.
+/// Returns false if the drain timed out.
+fn drainClients(self: *Server) bool {
+    self.client_mutex.lock();
+    defer self.client_mutex.unlock();
+
+    // Unblock handlers parked in read(). Closing is not enough on its own;
+    // shutdown() makes the pending read return immediately.
+    var it = self.clients.keyIterator();
+    while (it.next()) |fd| posix.shutdown(fd.*, .both) catch {};
+
+    var timer = std.time.Timer.start() catch return self.active_clients == 0;
+    while (self.active_clients > 0) {
+        const elapsed = timer.read();
+        if (elapsed >= drain_timeout_ns) {
+            log.warn("Drain timed out with {d} client handler(s) still running", .{self.active_clients});
+            return false;
+        }
+        self.client_drained.timedWait(&self.client_mutex, drain_timeout_ns - elapsed) catch {};
+    }
+    return true;
 }
 
 /// Start the socket server in a background thread.
@@ -102,9 +175,15 @@ pub fn start(self: *Server) !void {
     self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
 }
 
-pub fn stop(self: *Server) void {
+/// Stop accepting connections and wait for in-flight handlers to finish.
+/// Returns false if handlers were still running when the drain timed out.
+pub fn stop(self: *Server) bool {
     self.running.store(false, .release);
+
     if (self.listen_fd) |fd| {
+        // close() alone does not reliably return a blocked accept(); shutdown()
+        // does, so the accept thread can actually be joined.
+        posix.shutdown(fd, .both) catch {};
         posix.close(fd);
         self.listen_fd = null;
     }
@@ -112,17 +191,35 @@ pub fn stop(self: *Server) void {
         thread.join();
         self.accept_thread = null;
     }
+
+    // The accept thread has exited, so no further clients can be registered
+    // and the set can only shrink from here.
+    const drained = self.drainClients();
+
     // Clean up socket file
     std.fs.deleteFileAbsolute(self.socket_path) catch {};
+    return drained;
 }
 
 fn acceptLoop(self: *Server) void {
+    // Read the descriptor once: stop() clears the field, and re-reading it
+    // every iteration races that write.
+    const listen_fd = self.listen_fd orelse return;
+
     while (self.running.load(.acquire)) {
-        const client = posix.accept(self.listen_fd orelse break, null, null, 0) catch |err| {
+        const client = posix.accept(listen_fd, null, null, 0) catch |err| {
             if (!self.running.load(.acquire)) break;
             log.warn("Accept error: {}", .{err});
             continue;
         };
+
+        // Register before spawning. If stop() ran between accept() and the
+        // thread starting, an unregistered client would not be waited for.
+        if (!self.registerClient(client)) {
+            log.warn("Failed to register client socket", .{});
+            posix.close(client);
+            continue;
+        }
 
         // Spawn a thread to handle this client.
         //
@@ -132,6 +229,7 @@ fn acceptLoop(self: *Server) void {
         // on every single CLI invocation.
         const thread = std.Thread.spawn(.{}, handleClient, .{ self, client }) catch |err| {
             log.warn("Failed to spawn client thread: {}", .{err});
+            self.unregisterClient(client);
             posix.close(client);
             continue;
         };
@@ -140,7 +238,13 @@ fn acceptLoop(self: *Server) void {
 }
 
 fn handleClient(self: *Server, client_fd: posix.socket_t) void {
-    defer posix.close(client_fd);
+    defer {
+        // Unregister before closing so the drain never shutdown()s a
+        // descriptor number that has already been recycled. Nothing after this
+        // touches `self` -- once the count hits zero, deinit may free it.
+        self.unregisterClient(client_fd);
+        posix.close(client_fd);
+    }
 
     const stream = std.net.Stream{ .handle = client_fd };
     var buf: [8192]u8 = undefined;

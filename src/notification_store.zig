@@ -16,39 +16,61 @@ pub const Notification = struct {
 
 const MAX_NOTIFICATIONS = 64;
 
+/// Guards every field below.
+///
+/// All six call sites live in socket handlers, which run on a thread per
+/// client, so `add`/`list`/`clear` genuinely run concurrently -- two Claude
+/// Code hook events firing at once is enough. Without this, `list` could size
+/// its result from one read of `count` and then bound its loop on a later,
+/// larger one, writing past the allocation.
+mutex: std.Thread.Mutex = .{},
+
 /// Ring buffer of notifications.
-notifications: [MAX_NOTIFICATIONS]Notification = undefined,
+///
+/// Zero-initialised rather than `undefined`: `clear` compares `id` against
+/// slots that may never have been written, and reading undefined memory is
+/// undefined behaviour. A zeroed slot has `id == 0`, which is never a real id.
+notifications: [MAX_NOTIFICATIONS]Notification = std.mem.zeroes([MAX_NOTIFICATIONS]Notification),
+/// Number of slots in the live ring window. Includes cleared (tombstoned)
+/// entries -- see `clear`.
 count: usize = 0,
 write_pos: usize = 0,
 next_id: u64 = 1,
 
 /// Add a notification and show it via libnotify. Returns the notification ID.
 pub fn add(self: *NotificationStore, title: []const u8, body: ?[]const u8) u64 {
-    const id = self.next_id;
-    self.next_id += 1;
+    // Scoped so the lock is released by `defer` on every path, and so the
+    // libnotify call below happens outside it: that goes over DBus and can
+    // block, and needs no store state.
+    const id = blk: {
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
-    var notif: Notification = undefined;
-    notif.id = id;
-    notif.timestamp = std.time.timestamp();
+        const id = self.next_id;
+        self.next_id += 1;
 
-    const t_len = @min(title.len, notif.title.len);
-    @memcpy(notif.title[0..t_len], title[0..t_len]);
-    notif.title_len = t_len;
+        var notif: Notification = std.mem.zeroes(Notification);
+        notif.id = id;
+        notif.timestamp = std.time.timestamp();
 
-    if (body) |b| {
-        const b_len = @min(b.len, notif.body.len);
-        @memcpy(notif.body[0..b_len], b[0..b_len]);
-        notif.body_len = b_len;
-    } else {
-        notif.body_len = 0;
-    }
+        const t_len = @min(title.len, notif.title.len);
+        @memcpy(notif.title[0..t_len], title[0..t_len]);
+        notif.title_len = t_len;
 
-    // Store in ring buffer
-    self.notifications[self.write_pos] = notif;
-    self.write_pos = (self.write_pos + 1) % MAX_NOTIFICATIONS;
-    if (self.count < MAX_NOTIFICATIONS) self.count += 1;
+        if (body) |b| {
+            const b_len = @min(b.len, notif.body.len);
+            @memcpy(notif.body[0..b_len], b[0..b_len]);
+            notif.body_len = b_len;
+        }
 
-    // Show desktop notification via libnotify
+        // Store in ring buffer
+        self.notifications[self.write_pos] = notif;
+        self.write_pos = (self.write_pos + 1) % MAX_NOTIFICATIONS;
+        if (self.count < MAX_NOTIFICATIONS) self.count += 1;
+
+        break :blk id;
+    };
+
     self.showDesktopNotification(title, body);
 
     return id;
@@ -80,14 +102,25 @@ fn showDesktopNotification(_: *NotificationStore, title: []const u8, body: ?[]co
 }
 
 /// Get all stored notifications (most recent first).
-pub fn list(self: *const NotificationStore, alloc: std.mem.Allocator) ![]const Notification {
-    if (self.count == 0) return &[_]Notification{};
+///
+/// Cleared entries are returned as tombstones with `id == 0`; callers skip
+/// them. Takes `*NotificationStore` rather than a const pointer because the
+/// read has to be serialised against concurrent `add`/`clear`.
+pub fn list(self: *NotificationStore, alloc: std.mem.Allocator) ![]const Notification {
+    self.mutex.lock();
+    defer self.mutex.unlock();
 
-    var result = try alloc.alloc(Notification, self.count);
+    // Read `count` exactly once. Sizing the allocation from one read and
+    // bounding the loop on another is what let a concurrent `add` push
+    // `out_idx` one past the end of `result`.
+    const window = self.count;
+    if (window == 0) return &[_]Notification{};
+
+    const result = try alloc.alloc(Notification, window);
     // Read in reverse order (most recent first)
     var out_idx: usize = 0;
     var ring_idx: usize = if (self.write_pos == 0) MAX_NOTIFICATIONS - 1 else self.write_pos - 1;
-    while (out_idx < self.count) : (out_idx += 1) {
+    while (out_idx < window) : (out_idx += 1) {
         result[out_idx] = self.notifications[ring_idx];
         ring_idx = if (ring_idx == 0) MAX_NOTIFICATIONS - 1 else ring_idx - 1;
     }
@@ -96,21 +129,33 @@ pub fn list(self: *const NotificationStore, alloc: std.mem.Allocator) ![]const N
 
 /// Clear a specific notification by ID, or all if id is null.
 pub fn clear(self: *NotificationStore, id: ?u64) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
     if (id == null) {
         self.count = 0;
         self.write_pos = 0;
         return;
     }
 
-    // For simplicity with a ring buffer, clearing a single entry
-    // just marks it as id=0 (tombstone). List skips tombstones.
+    // Clearing a single entry tombstones it in place; `handleNotificationList`
+    // skips `id == 0`.
+    //
+    // `count` is deliberately left alone. It is the width of the ring window,
+    // not a tally of live entries, so decrementing it here shrank the window
+    // and silently dropped the *oldest* notification as well as the target.
+    //
+    // Only the live window is scanned: slots outside it hold stale entries
+    // whose ids could still match and tombstone the wrong thing.
     const target_id = id.?;
-    for (&self.notifications, 0..) |*n, i| {
-        _ = i;
+    var scanned: usize = 0;
+    var ring_idx: usize = if (self.write_pos == 0) MAX_NOTIFICATIONS - 1 else self.write_pos - 1;
+    while (scanned < self.count) : (scanned += 1) {
+        const n = &self.notifications[ring_idx];
         if (n.id == target_id) {
             n.id = 0;
-            if (self.count > 0) self.count -= 1;
             return;
         }
+        ring_idx = if (ring_idx == 0) MAX_NOTIFICATIONS - 1 else ring_idx - 1;
     }
 }

@@ -4,6 +4,11 @@ const PaneTree = @import("pane_tree.zig");
 
 const log = std.log.scoped(.tab_manager);
 
+/// Cap on the workspace-visit history. Deep enough that "last workspace" keeps
+/// working across normal use, bounded so a long-lived session cannot grow it
+/// without limit.
+const max_history: usize = 64;
+
 /// Manages the ordered list of workspaces, selection, and history.
 pub const TabManager = @This();
 
@@ -18,9 +23,10 @@ workspaces: std.ArrayListUnmanaged(*Workspace) = .{},
 /// Currently selected workspace index.
 selected_index: ?usize = null,
 
-/// History stack for back/forward navigation.
+/// Most-recently-visited workspace ids, oldest first. Only the tail is ever
+/// read (`selectLast`), so it is capped rather than allowed to grow for the
+/// lifetime of the process -- one entry was appended on every workspace switch.
 history: std.ArrayListUnmanaged(WorkspaceId) = .{},
-history_pos: usize = 0,
 
 /// Next workspace id.
 next_id: WorkspaceId = 1,
@@ -86,8 +92,10 @@ pub fn selectIndex(self: *TabManager, index: usize) void {
     if (self.selected_index) |current| {
         if (current != index) {
             const ws = self.workspaces.items[current];
+            if (self.history.items.len >= max_history) {
+                _ = self.history.orderedRemove(0);
+            }
             self.history.append(self.alloc, ws.id) catch {};
-            self.history_pos = self.history.items.len;
         }
     }
 

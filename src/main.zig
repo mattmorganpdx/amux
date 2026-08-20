@@ -8,6 +8,9 @@ const session = @import("session.zig");
 
 const log = std.log.scoped(.main);
 
+/// Chunk size used when copying the bundled icon/.desktop files into place.
+const file_copy_chunk_bytes: usize = 4096;
+
 /// Global application state, initialized in activate callback.
 pub var global_app: ?*App = null;
 pub var global_window: ?*Window = null;
@@ -51,7 +54,11 @@ pub fn main() !void {
         }
     }
 
-    // Cleanup — order matters: free surfaces before the ghostty app
+    // Cleanup — order matters: drain socket handlers, then free every surface,
+    // then the ghostty app. Freeing the app while any surface is still alive
+    // tears down state that surface's renderer/io threads are using, which
+    // segfaults inside libghostty; TerminalWidget.onRealize is what guarantees
+    // no surface outlives its widget.
     if (global_server) |server| {
         server.deinit();
         global_server = null;
@@ -62,16 +69,10 @@ pub fn main() !void {
         global_window = null;
     }
 
-    // The Ghostty app is deliberately NOT freed here.
-    //
-    // ghostty_surface_free does not join a surface's renderer/io threads --
-    // measured directly: closing panes never lowers the process thread count --
-    // so those threads outlive every surface amux has ever created and keep
-    // referencing app-level state. ghostty_app_free tears that state down
-    // underneath them, segfaulting inside libghostty; reproducible after any
-    // workspace or pane churn. There is no point at which the free is safe, and
-    // the process is exiting, so let the OS reclaim it.
-    global_app = null;
+    if (global_app) |app| {
+        app.deinit();
+        global_app = null;
+    }
 
     c.notify_uninit();
 
@@ -198,7 +199,7 @@ fn copyFile(src: [*:0]const u8, dest: [*:0]const u8) !void {
     const dest_file = try std.fs.createFileAbsoluteZ(dest, .{});
     defer dest_file.close();
 
-    var buf: [4096]u8 = undefined;
+    var buf: [file_copy_chunk_bytes]u8 = undefined;
     while (true) {
         const n = try src_file.read(&buf);
         if (n == 0) break;

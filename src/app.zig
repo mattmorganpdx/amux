@@ -85,10 +85,10 @@ pub fn init() !*App {
 
 /// Frees the Ghostty app and config.
 ///
-/// NOT safe to call once any surface has been created: libghostty does not join
-/// a surface's renderer/io threads on `ghostty_surface_free`, so they are still
-/// running and still referencing the state this tears down. The shutdown path
-/// in main.zig deliberately skips it for that reason.
+/// Every surface must already be freed. `ghostty_surface_free` joins that
+/// surface's renderer and io threads, but a surface that was never freed keeps
+/// them running and referencing app state, so tearing the app down underneath
+/// them segfaults inside libghostty.
 pub fn deinit(self: *App) void {
     if (self.ghostty_app != null) {
         c.ghostty_app_free(self.ghostty_app);

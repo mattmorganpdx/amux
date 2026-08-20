@@ -309,6 +309,26 @@ fn onRealize(gl_area: *c.GtkGLArea, userdata: c.gpointer) callconv(.c) void {
         surface_config.env_var_count = env_count;
     }
 
+    // Release any surface left over from a previous realize.
+    //
+    // `onUnrealize` deliberately keeps `surface` non-null so a transiently
+    // unrealized pane stays readable, and GTK unrealizes then re-realizes a
+    // GtkGLArea whenever the widget is reparented -- which the workspace
+    // rebuild, pane close and break/join paths all do. Overwriting the handle
+    // here abandoned the old surface completely: its renderer, io and io-reader
+    // threads kept running, and its PTY and child shell stayed alive, for the
+    // rest of the process. Surface count grew monotonically with pane churn.
+    if (self.surface != null) {
+        {
+            surface_registry_mutex.lock();
+            defer surface_registry_mutex.unlock();
+            _ = surface_registry.remove(@intFromPtr(self.surface));
+        }
+        c.ghostty_surface_free(self.surface);
+        self.surface = null;
+        log.info("Freed previous surface before re-realize", .{});
+    }
+
     // Create the Ghostty surface
     self.surface = c.ghostty_surface_new(self.app.ghostty_app, &surface_config);
     if (self.surface == null) {

@@ -14,6 +14,11 @@ const history = @import("history.zig");
 
 const log = std.log.scoped(.window);
 
+/// Upper bound on the generated `sh -c 'cat "<path>"; exec "$SHELL"'` command
+/// used to replay a saved scrollback. Comfortably larger than a full path plus
+/// the fixed wrapper.
+const max_restore_command_bytes: usize = 4096;
+
 const Window = @This();
 
 const Allocator = std.mem.Allocator;
@@ -612,14 +617,14 @@ pub fn splitFocused(self: *Window, direction: PaneTree.SplitDirection) !void {
 /// Build a shell command that cats the history file then execs the user's shell.
 fn buildHistoryRestoreCommand(self: *Window, hist_id: []const u8) ?[*:0]const u8 {
     // Resolve the history file path
-    var path_buf: [4096]u8 = undefined;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = history.entryFilePathPub(&path_buf, hist_id) orelse return null;
 
     // Verify the file exists
     std.fs.cwd().access(path, .{}) catch return null;
 
     // Build: sh -c 'cat "/path/to/file"; exec "$SHELL"'
-    var cmd_buf: [4096]u8 = undefined;
+    var cmd_buf: [max_restore_command_bytes]u8 = undefined;
     const cmd = std.fmt.bufPrintZ(&cmd_buf, "sh -c 'cat \"{s}\"; exec \"$SHELL\"'", .{path}) catch return null;
     // Dupe to heap so it survives this stack frame
     const duped = self.alloc.dupeZ(u8, cmd) catch return null;

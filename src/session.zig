@@ -393,7 +393,7 @@ fn getJsonBool(val: std.json.Value, key: []const u8) ?bool {
 // ------------------------------------------------------------------
 
 /// Get the session file path: $XDG_CONFIG_HOME/amux/session.json or ~/.config/amux/session.json
-fn sessionDir(buf: *[4096]u8) ?[]const u8 {
+fn sessionDir(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
     if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
         const len = std.fmt.bufPrint(buf, "{s}/amux", .{xdg}) catch return null;
         return len;
@@ -405,8 +405,8 @@ fn sessionDir(buf: *[4096]u8) ?[]const u8 {
     return null;
 }
 
-fn sessionFilePath(buf: *[4096]u8) ?[]const u8 {
-    var dir_buf: [4096]u8 = undefined;
+fn sessionFilePath(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = sessionDir(&dir_buf) orelse return null;
     const path = std.fmt.bufPrint(buf, "{s}/session.json", .{dir}) catch return null;
     return path;
@@ -414,7 +414,7 @@ fn sessionFilePath(buf: *[4096]u8) ?[]const u8 {
 
 /// Write session snapshot to disk atomically (write to .tmp, then rename).
 pub fn writeSessionFile(alloc: Allocator, snap: *const SessionSnapshot) !void {
-    var dir_buf: [4096]u8 = undefined;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = sessionDir(&dir_buf) orelse return error.NoConfigDir;
 
     // Ensure directory exists
@@ -427,10 +427,10 @@ pub fn writeSessionFile(alloc: Allocator, snap: *const SessionSnapshot) !void {
     defer alloc.free(json);
 
     // Write to temp file
-    var tmp_path_buf: [4096]u8 = undefined;
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}/session.json.tmp", .{dir}) catch return error.PathTooLong;
 
-    var file_path_buf: [4096]u8 = undefined;
+    var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/session.json", .{dir}) catch return error.PathTooLong;
 
     // Write tmp file
@@ -456,7 +456,7 @@ pub fn writeSessionFile(alloc: Allocator, snap: *const SessionSnapshot) !void {
 
 /// Load session snapshot from disk.
 pub fn loadSessionFile(alloc: Allocator) !SessionSnapshot {
-    var path_buf: [4096]u8 = undefined;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = sessionFilePath(&path_buf) orelse return error.NoConfigDir;
 
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {

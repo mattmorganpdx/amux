@@ -47,6 +47,14 @@ clients: std.AutoHashMapUnmanaged(posix.socket_t, void) = .{},
 /// Number of registered handlers still running.
 active_clients: usize = 0,
 
+/// Largest request line accepted. A longer line is drained and answered with
+/// `request_too_large` rather than being parsed in pieces.
+const max_request_bytes: usize = 8192;
+
+/// Backing store for the null-terminated socket path handed to C. Unix socket
+/// paths are capped at 108 bytes by the kernel, so this is generous.
+const socket_path_buf_len: usize = 256;
+
 /// How long shutdown waits for handlers to finish.
 ///
 /// Sized just above the 10s GTK dispatch timeout in handlers.zig: once the
@@ -85,7 +93,7 @@ pub fn getSocketPathZ(self: *Server) [*:0]const u8 {
     // happens to have a zero byte after it in practice, but let's be safe:
     // socket paths are always < 108 bytes (Unix limit), use a static buffer.
     const Static = struct {
-        var buf: [256]u8 = undefined;
+        var buf: [socket_path_buf_len]u8 = undefined;
         var initialized: bool = false;
     };
     if (!Static.initialized) {
@@ -163,7 +171,15 @@ pub fn start(self: *Server) !void {
     const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     errdefer posix.close(fd);
 
-    try posix.bind(fd, &addr.any, addr.getOsSockLen());
+    // Create the socket as 0600. bind() applies the umask to the new inode, so
+    // setting it around the call is atomic -- chmod()ing the path afterwards
+    // would leave a window where another local user could connect. Anyone who
+    // can connect can drive every terminal amux owns.
+    {
+        const prev_umask = std.c.umask(0o177);
+        defer _ = std.c.umask(prev_umask);
+        try posix.bind(fd, &addr.any, addr.getOsSockLen());
+    }
     try posix.listen(fd, 5);
 
     self.listen_fd = fd;
@@ -247,7 +263,7 @@ fn handleClient(self: *Server, client_fd: posix.socket_t) void {
     }
 
     const stream = std.net.Stream{ .handle = client_fd };
-    var buf: [8192]u8 = undefined;
+    var buf: [max_request_bytes]u8 = undefined;
     var leftover: usize = 0;
     var overflow = false; // true when a line exceeds the buffer
 
@@ -271,11 +287,17 @@ fn handleClient(self: *Server, client_fd: posix.socket_t) void {
                 if (overflow) {
                     // Discard the oversized line and send an error
                     overflow = false;
+                    var msg_buf: [64]u8 = undefined;
+                    const msg = std.fmt.bufPrint(
+                        &msg_buf,
+                        "Request exceeds maximum size of {d} bytes",
+                        .{max_request_bytes},
+                    ) catch "Request too large";
                     const err_resp = protocol.errorResponse(
                         self.alloc,
                         0,
                         "request_too_large",
-                        "Request exceeds maximum size of 8192 bytes",
+                        msg,
                     ) catch {
                         line_start = i + 1;
                         continue;

@@ -2,6 +2,37 @@ const std = @import("std");
 const posix = std.posix;
 const net = std.net;
 
+// --- Buffer sizes -------------------------------------------------------
+//
+// Request params are built into fixed stack buffers, tiered by what the
+// command carries. Overflow is always reported, never truncated.
+
+/// Server-side cap on one request line; keep in sync with `max_request_bytes`
+/// in src/socket/server.zig, which rejects anything longer.
+const max_request_bytes: usize = 8192;
+
+/// Room reserved for the `{"id":N,"method":"...","params":...}` envelope that
+/// wraps the params object. Without this the largest params object would build
+/// fine and then fail to fit in the request line.
+const request_envelope_reserve: usize = 256;
+
+/// Ids, enums and flags only.
+const params_small: usize = 256;
+/// Params carrying a short user string: titles, branches, log lines, colours.
+const params_medium: usize = 4096;
+/// Params carrying arbitrary terminal text: send, run, and the Claude hook.
+const params_large: usize = max_request_bytes - request_envelope_reserve;
+
+/// Read granularity when draining a response.
+const response_chunk_bytes: usize = 65536;
+
+// Claude Code hook payload fields, extracted from stdin JSON.
+const max_hook_stdin: usize = 8192;
+const max_session_id: usize = 256;
+const max_event_name: usize = 256;
+const max_hook_message: usize = 2048;
+const max_cwd: usize = 512;
+
 const usage_text =
     \\amux - agent-first terminal multiplexer for AI agents
     \\
@@ -79,7 +110,7 @@ pub fn main() !void {
             // Optional: amux-cli workspace create "My Title"
             const title = args.next();
             if (title) |t| {
-                var params_buf: [4096]u8 = undefined;
+                var params_buf: [params_medium]u8 = undefined;
                 var p = Params.init(&params_buf);
                 p.str("title", t);
                 const params = p.finish() orelse {
@@ -101,7 +132,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid id: must be an integer\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("id", id);
             const params = p.finish() orelse {
@@ -118,7 +149,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid id: must be an integer\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("id", id);
             const params = p.finish() orelse {
@@ -133,7 +164,7 @@ pub fn main() !void {
                 return;
             };
             // If there's a second arg, rename_arg1 is the ID and second is the title
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             if (args.next()) |rename_title| {
                 const id = argInt(rename_arg1) orelse {
                     try stderr.writeAll("Invalid id: must be an integer\n");
@@ -174,7 +205,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid id: must be an integer\n");
                 return;
             };
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("id", id);
             p.str("branch", branch);
@@ -202,7 +233,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid id: must be an integer\n");
                 return;
             };
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("id", id);
             p.str("key", key);
@@ -223,7 +254,7 @@ pub fn main() !void {
                 return;
             };
             if (args.next()) |key| {
-                var params_buf: [4096]u8 = undefined;
+                var params_buf: [params_medium]u8 = undefined;
                 var p = Params.init(&params_buf);
                 p.int("id", id);
                 p.str("key", key);
@@ -233,7 +264,7 @@ pub fn main() !void {
                 };
                 try sendAndPrint(socket_path, "workspace.clear_status", params, stdout, stderr);
             } else {
-                var params_buf: [256]u8 = undefined;
+                var params_buf: [params_small]u8 = undefined;
                 var p = Params.init(&params_buf);
                 p.int("id", id);
                 const params = p.finish() orelse {
@@ -256,7 +287,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid id: must be an integer\n");
                 return;
             };
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("id", id);
             p.str("text", text);
@@ -275,7 +306,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid id: must be an integer\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("id", id);
             const params = p.finish() orelse {
@@ -302,7 +333,7 @@ pub fn main() !void {
                 return;
             };
             if (args.next()) |label| {
-                var params_buf: [4096]u8 = undefined;
+                var params_buf: [params_medium]u8 = undefined;
                 var p = Params.init(&params_buf);
                 p.int("id", id);
                 p.float("fraction", fraction_val);
@@ -313,7 +344,7 @@ pub fn main() !void {
                 };
                 try sendAndPrint(socket_path, "workspace.set_progress", params, stdout, stderr);
             } else {
-                var params_buf: [256]u8 = undefined;
+                var params_buf: [params_small]u8 = undefined;
                 var p = Params.init(&params_buf);
                 p.int("id", id);
                 p.float("fraction", fraction_val);
@@ -341,7 +372,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid value: must be true or false\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("id", id);
             p.boolean("pinned", pinned);
@@ -364,7 +395,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid id: must be an integer\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("id", id);
             p.str("color", if (std.mem.eql(u8, color_val, "clear")) "" else color_val);
@@ -393,7 +424,7 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux surface search <text>\n");
                 return;
             };
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var p = Params.init(&params_buf);
             p.str("text", search_text);
             const params = p.finish() orelse {
@@ -412,7 +443,7 @@ pub fn main() !void {
                     surface_id = arg;
                 }
             }
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             if (surface_id) |sid| {
                 const sid_val = argInt(sid) orelse {
@@ -450,7 +481,7 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux surface send-key [--surface <id>] <key>\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.str("key", key_name);
             if (surface_id) |sid| {
@@ -471,7 +502,7 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux surface split <left|right|up|down>\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.str("direction", direction);
             const params = p.finish() orelse {
@@ -498,7 +529,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid pane_id: must be an integer\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("pane_id", pane_id_val);
             const params = p.finish() orelse {
@@ -523,7 +554,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid workspace_id: must be an integer\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("pane_id", pane_id_val);
             p.int("workspace_id", ws_id_val);
@@ -546,7 +577,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid pane_id: must be an integer\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("pane_id", pane_id_val);
             p.str("direction", direction);
@@ -580,7 +611,7 @@ pub fn main() !void {
                 try stderr.writeAll("Invalid pane_b: must be an integer\n");
                 return;
             };
-            var params_buf: [256]u8 = undefined;
+            var params_buf: [params_small]u8 = undefined;
             var p = Params.init(&params_buf);
             p.int("pane_a", pane_a_val);
             p.int("pane_b", pane_b_val);
@@ -626,7 +657,7 @@ pub fn main() !void {
         };
 
         // Build JSON params
-        var params_buf: [8192]u8 = undefined;
+        var params_buf: [params_large]u8 = undefined;
         var p = Params.init(&params_buf);
         p.str("command", cmd);
         if (surface_id) |sid| {
@@ -676,7 +707,7 @@ pub fn main() !void {
             return;
         };
         // Build params JSON with properly escaped text
-        var params_buf: [8192]u8 = undefined;
+        var params_buf: [params_large]u8 = undefined;
         var p = Params.init(&params_buf);
         p.strCat("text", send_text, if (append_enter) "\n" else "");
         if (surface_id) |sid| {
@@ -709,7 +740,7 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux notification create <title> [body]\n");
                 return;
             };
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var p = Params.init(&params_buf);
             p.str("title", title);
             if (args.next()) |body| p.str("body", body);
@@ -724,7 +755,7 @@ pub fn main() !void {
                     try stderr.writeAll("Invalid id: must be an integer\n");
                     return;
                 };
-                var params_buf: [256]u8 = undefined;
+                var params_buf: [params_small]u8 = undefined;
                 var p = Params.init(&params_buf);
                 p.int("id", id);
                 const params = p.finish() orelse {
@@ -747,7 +778,7 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux palette execute <action-name>\n");
                 return;
             };
-            var params_buf: [512]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var p = Params.init(&params_buf);
             p.str("action", action_name);
             const params = p.finish() orelse {
@@ -767,7 +798,7 @@ pub fn main() !void {
         };
 
         // Read stdin (Claude Code pipes hook JSON payload via stdin)
-        var stdin_buf: [8192]u8 = undefined;
+        var stdin_buf: [max_hook_stdin]u8 = undefined;
         var stdin_len: usize = 0;
         const stdin = std.fs.File.stdin();
         while (stdin_len < stdin_buf.len) {
@@ -777,17 +808,25 @@ pub fn main() !void {
         }
 
         // Extract fields from stdin JSON into stack buffers.
-        var sid_buf: [256]u8 = undefined;
+        var sid_buf: [max_session_id]u8 = undefined;
         var sid_len: usize = 0;
-        var msg_buf: [2048]u8 = undefined;
+        var msg_buf: [max_hook_message]u8 = undefined;
         var msg_len: usize = 0;
-        var evt_buf: [256]u8 = undefined;
+        var evt_buf: [max_event_name]u8 = undefined;
         var evt_len: usize = 0;
-        var cwd_buf: [512]u8 = undefined;
+        var cwd_buf: [max_cwd]u8 = undefined;
         var cwd_len: usize = 0;
 
         if (stdin_len > 0) {
-            const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, stdin_buf[0..stdin_len], .{}) catch null;
+            // A malformed payload should not fail the hook -- the workspace/surface
+            // ids come from the environment, not stdin -- but swallowing it
+            // silently made a broken payload look like an empty one.
+            const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, stdin_buf[0..stdin_len], .{}) catch |err| blk: {
+                try stderr.writeAll("Warning: could not parse hook JSON from stdin (");
+                try stderr.writeAll(@errorName(err));
+                try stderr.writeAll("); continuing without its fields\n");
+                break :blk null;
+            };
             if (parsed) |p| {
                 defer p.deinit();
                 if (p.value == .object) {
@@ -851,7 +890,7 @@ pub fn main() !void {
         // Build params JSON. The workspace/surface ids come from the environment
         // amux injects into each pane; if they are missing or malformed, omit them
         // rather than emitting an invalid JSON number.
-        var params_buf: [8192]u8 = undefined;
+        var params_buf: [params_large]u8 = undefined;
         var p = Params.init(&params_buf);
         p.str("subcommand", hook_sub);
         if (session_id) |sid| p.str("session_id", sid);
@@ -873,7 +912,7 @@ pub fn main() !void {
         const sub = args.next() orelse "list";
         if (std.mem.eql(u8, sub, "list")) {
             // Optional: --workspace <id> --limit <n>
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var params: []const u8 = "{}";
             // Check for optional flags
             var ws_id_str: ?[]const u8 = null;
@@ -912,7 +951,7 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux history show <id>\n");
                 return;
             };
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var p = Params.init(&params_buf);
             p.str("id", id_str);
             const params = p.finish() orelse {
@@ -925,7 +964,7 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux history search <query>\n");
                 return;
             };
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var p = Params.init(&params_buf);
             p.str("query", query);
             const params = p.finish() orelse {
@@ -938,7 +977,7 @@ pub fn main() !void {
                 try stderr.writeAll("Usage: amux history delete <id>\n");
                 return;
             };
-            var params_buf: [4096]u8 = undefined;
+            var params_buf: [params_medium]u8 = undefined;
             var p = Params.init(&params_buf);
             p.str("id", id_str);
             const params = p.finish() orelse {
@@ -1139,7 +1178,7 @@ fn sendAndPrint(socket_path: []const u8, method: []const u8, params: []const u8,
     const id = next_req_id;
     next_req_id += 1;
 
-    var req_buf: [8192]u8 = undefined;
+    var req_buf: [max_request_bytes]u8 = undefined;
     const req_line = std.fmt.bufPrint(&req_buf,
         \\{{"id":{d},"method":"{s}","params":{s}}}
     , .{ id, method, params }) catch {
@@ -1160,7 +1199,7 @@ fn sendAndPrint(socket_path: []const u8, method: []const u8, params: []const u8,
     var response_buf: std.ArrayListUnmanaged(u8) = .{};
     defer response_buf.deinit(alloc);
 
-    var chunk: [65536]u8 = undefined;
+    var chunk: [response_chunk_bytes]u8 = undefined;
     while (true) {
         const n = stream.read(&chunk) catch {
             try stderr.writeAll("Failed to read response\n");

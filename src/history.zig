@@ -43,7 +43,7 @@ fn getMaxBytes() usize {
 }
 
 /// Get the history directory: $XDG_CONFIG_HOME/amux/history or ~/.config/amux/history
-fn historyDir(buf: *[4096]u8) ?[]const u8 {
+fn historyDir(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
     if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
         return std.fmt.bufPrint(buf, "{s}/amux/history", .{xdg}) catch null;
     }
@@ -53,8 +53,8 @@ fn historyDir(buf: *[4096]u8) ?[]const u8 {
     return null;
 }
 
-fn indexFilePath(buf: *[4096]u8) ?[]const u8 {
-    var dir_buf: [4096]u8 = undefined;
+fn indexFilePath(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = historyDir(&dir_buf) orelse return null;
     return std.fmt.bufPrint(buf, "{s}/index.json", .{dir}) catch null;
 }
@@ -74,15 +74,15 @@ pub fn isValidEntryId(id: []const u8) bool {
     return true;
 }
 
-pub fn entryFilePathPub(buf: *[4096]u8, id: []const u8) ?[]const u8 {
+pub fn entryFilePathPub(buf: *[std.fs.max_path_bytes]u8, id: []const u8) ?[]const u8 {
     return entryFilePath(buf, id);
 }
 
 /// Returns null for an invalid id or a missing config dir. Validation lives
 /// here because every filesystem path in this module is built through it.
-fn entryFilePath(buf: *[4096]u8, id: []const u8) ?[]const u8 {
+fn entryFilePath(buf: *[std.fs.max_path_bytes]u8, id: []const u8) ?[]const u8 {
     if (!isValidEntryId(id)) return null;
-    var dir_buf: [4096]u8 = undefined;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = historyDir(&dir_buf) orelse return null;
     return std.fmt.bufPrint(buf, "{s}/{s}.txt", .{ dir, id }) catch null;
 }
@@ -154,7 +154,7 @@ pub fn saveScrollback(
     const id = std.fmt.bufPrint(&id_buf, "{d}_ws{d}_p{d}", .{ timestamp, workspace_id, pane_id }) catch return null;
 
     // Ensure history directory exists
-    var dir_buf: [4096]u8 = undefined;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = historyDir(&dir_buf) orelse return null;
     std.fs.cwd().makePath(dir) catch |err| {
         log.warn("Failed to create history dir: {}", .{err});
@@ -168,10 +168,10 @@ pub fn saveScrollback(
         newline_count;
 
     // Write scrollback text file atomically
-    var txt_path_buf: [4096]u8 = undefined;
+    var txt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const txt_path = entryFilePath(&txt_path_buf, id) orelse return null;
 
-    var tmp_path_buf: [4096]u8 = undefined;
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{txt_path}) catch return null;
 
     const tmp_file = std.fs.cwd().createFile(tmp_path, .{}) catch |err| {
@@ -226,7 +226,7 @@ pub fn saveScrollback(
 
 /// Load the history index from disk.
 pub fn loadIndex(alloc: Allocator) !HistoryIndex {
-    var path_buf: [4096]u8 = undefined;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = indexFilePath(&path_buf) orelse return error.NoConfigDir;
 
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
@@ -246,7 +246,7 @@ pub fn loadIndex(alloc: Allocator) !HistoryIndex {
 /// Load the text content of a specific history entry.
 pub fn loadEntryText(alloc: Allocator, id: []const u8) ![]const u8 {
     if (!isValidEntryId(id)) return error.InvalidEntryId;
-    var path_buf: [4096]u8 = undefined;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = entryFilePath(&path_buf, id) orelse return error.NoConfigDir;
 
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
@@ -473,7 +473,7 @@ fn getJsonInt(val: std.json.Value, key: []const u8) ?i64 {
 // ------------------------------------------------------------------
 
 fn writeIndex(alloc: Allocator, index: *const HistoryIndex) !void {
-    var dir_buf: [4096]u8 = undefined;
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = historyDir(&dir_buf) orelse return error.NoConfigDir;
 
     std.fs.cwd().makePath(dir) catch |err| {
@@ -484,8 +484,8 @@ fn writeIndex(alloc: Allocator, index: *const HistoryIndex) !void {
     const json = try serializeIndex(alloc, index);
     defer alloc.free(json);
 
-    var tmp_path_buf: [4096]u8 = undefined;
-    var file_path_buf: [4096]u8 = undefined;
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}/index.json.tmp", .{dir}) catch return error.PathTooLong;
     const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/index.json", .{dir}) catch return error.PathTooLong;
 
@@ -507,7 +507,7 @@ fn writeIndex(alloc: Allocator, index: *const HistoryIndex) !void {
 }
 
 fn deleteEntryFile(id: []const u8) void {
-    var path_buf: [4096]u8 = undefined;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = entryFilePath(&path_buf, id) orelse return;
     std.fs.cwd().deleteFile(path) catch {};
 }

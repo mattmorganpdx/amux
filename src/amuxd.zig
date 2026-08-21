@@ -4,13 +4,15 @@
 //! sessions exist independently of any GUI. No GTK, no libghostty, no GL: it is
 //! meant to run under a systemd user unit with no display.
 //!
-//! It does not serve the socket yet. That arrives with work-plan item 4, when
-//! the request handlers move behind this process. Until then `--self-check`
-//! demonstrates that terminal hosting works end to end.
+//! It serves the amux socket protocol, so `amux-cli` talks to it directly and
+//! sessions no longer depend on a GUI being open. `--self-check` still
+//! demonstrates terminal hosting on its own.
 
 const std = @import("std");
 const posix = std.posix;
-const Registry = @import("Registry.zig");
+const Registry = @import("daemon/Registry.zig");
+const Server = @import("daemon/server.zig");
+const State = @import("daemon/State.zig");
 
 const log = std.log.scoped(.amuxd);
 
@@ -49,7 +51,9 @@ fn printUsage() !void {
         \\  --self-check   Spawn a shell, run a command, print the screen, exit
         \\  -h, --help     Show this message
         \\
-        \\The socket API is not served yet; see docs/plan item 4.
+        \\Environment:
+        \\  AMUX_SOCKET       Socket path override
+        \\  AMUX_SOCKET_PATH  Socket path override (fallback)
         \\
     ;
     _ = try posix.write(1, usage);
@@ -58,21 +62,45 @@ fn printUsage() !void {
 /// Run until signalled. Panes outlive every client, so shutdown is the only
 /// thing that closes them.
 fn serve(alloc: std.mem.Allocator) !u8 {
-    var registry = Registry.init(alloc);
-    defer registry.deinit();
+    var state = State.init(alloc);
+    defer state.deinit();
+
+    const restored = state.restoreSession() catch |err| blk: {
+        log.warn("could not restore session: {}", .{err});
+        break :blk 0;
+    };
+    if (restored == 0) {
+        // Always come up with somewhere to work.
+        _ = state.createWorkspace(null, null) catch |err| {
+            log.err("could not create initial workspace: {}", .{err});
+            return 1;
+        };
+    }
+
+    const server = try Server.init(alloc, &state, socketPath());
+    defer server.deinit();
+    try server.start();
 
     installSignalHandlers();
-
-    log.info("amuxd started (pid {d}); no socket yet, idling until signalled", .{
+    log.info("amuxd ready (pid {d}), {d} workspace(s)", .{
         std.os.linux.getpid(),
+        state.workspaceCount(),
     });
 
     while (!shutdown_requested.load(.acquire)) {
         std.Thread.sleep(200 * std.time.ns_per_ms);
     }
 
-    log.info("shutting down: closing {d} pane(s)", .{registry.count()});
+    log.info("shutting down", .{});
+    state.saveSession() catch |err| log.warn("could not save session: {}", .{err});
     return 0;
+}
+
+/// Same resolution order the CLI uses.
+fn socketPath() []const u8 {
+    return posix.getenv("AMUX_SOCKET") orelse
+        posix.getenv("AMUX_SOCKET_PATH") orelse
+        "/tmp/amux.sock";
 }
 
 /// Prove the terminal hosting works: spawn a shell, run a command through the
@@ -81,7 +109,8 @@ fn selfCheck(alloc: std.mem.Allocator) !u8 {
     var registry = Registry.init(alloc);
     defer registry.deinit();
 
-    const id = try registry.open(.{
+    const id: u64 = 1;
+    try registry.open(id, .{
         .argv = &.{ "/bin/sh", "-i" },
         .env = &.{ "TERM=xterm-256color", "PS1=$ " },
         .cols = 80,
@@ -137,6 +166,10 @@ fn onSignal(_: c_int) callconv(.c) void {
 
 test {
     _ = Registry;
-    _ = @import("Pane.zig");
-    _ = @import("Pty.zig");
+    _ = State;
+    _ = @import("daemon/handlers.zig");
+    _ = @import("daemon/server.zig");
+    _ = @import("daemon/Pane.zig");
+    _ = @import("daemon/Pty.zig");
+    _ = @import("daemon/State.zig");
 }

@@ -95,12 +95,12 @@ pub fn build(b: *std.Build) void {
     const amuxd = b.addExecutable(.{
         .name = "amuxd",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/daemon/main.zig"),
+            .root_source_file = b.path("src/amuxd.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "vt", .module = vt_mod },
+                .{ .name = "ghostty_vt", .module = ghostty_vt },
             },
         }),
     });
@@ -137,12 +137,12 @@ pub fn build(b: *std.Build) void {
 
     const daemon_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/daemon/main.zig"),
+            .root_source_file = b.path("src/amuxd.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "vt", .module = vt_mod },
+                .{ .name = "ghostty_vt", .module = ghostty_vt },
             },
         }),
     });

@@ -130,9 +130,25 @@ This produces three binaries in `zig-out/bin/`:
 - `amux-cli` — standalone socket client (libc only)
 - `amuxd` — the terminal daemon (libc only; no GTK, no libghostty, no display)
 
-`amuxd` owns pseudoterminals and terminal state so sessions outlive the GUI. It
-does not serve the socket yet — see `docs/plan/README.md`. `amuxd --self-check`
-spawns a shell, runs a command and reads it back off the parsed screen.
+`amuxd` owns pseudoterminals and terminal state so sessions outlive the GUI, and
+it serves the socket protocol — so `amux-cli` works against it with no display
+and no GUI running:
+
+```bash
+AMUX_SOCKET=/tmp/amuxd.sock amuxd &
+AMUX_SOCKET=/tmp/amuxd.sock amux-cli run "echo hello"
+```
+
+It answers 18 methods (`system.capabilities` lists them, and reports
+`"daemon": true`). Notifications, the command palette, the Claude hooks and the
+sidebar metadata methods are GUI chrome and are not served yet.
+
+**The GUI still runs its own socket server too, and both default to
+`/tmp/amux.sock`** — give one an `AMUX_SOCKET` override while both exist. The
+GUI becomes a client of the daemon in work-plan item 6.
+
+`amuxd --self-check` spawns a shell, runs a command and reads it back off the
+parsed screen.
 
 Tests:
 

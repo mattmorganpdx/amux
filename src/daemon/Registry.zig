@@ -20,7 +20,6 @@ const log = std.log.scoped(.registry);
 alloc: std.mem.Allocator,
 mutex: std.Thread.Mutex = .{},
 panes: std.AutoHashMapUnmanaged(u64, *Pane) = .{},
-next_id: u64 = 1,
 
 pub const Error = error{PaneNotFound};
 
@@ -36,19 +35,21 @@ pub fn deinit(self: *Registry) void {
     self.mutex.unlock();
 }
 
-/// Spawn a pane and return its id.
-pub fn open(self: *Registry, opts: Pane.Options) !u64 {
+/// Spawn a pane under `id`.
+///
+/// The caller owns the id space: pane ids are pane-tree node ids, so the tree
+/// and the registry cannot drift apart.
+pub fn open(self: *Registry, id: u64, opts: Pane.Options) !void {
     self.mutex.lock();
     defer self.mutex.unlock();
 
-    const id = self.next_id;
+    if (self.panes.contains(id)) return error.PaneExists;
+
     const pane = try Pane.create(self.alloc, id, opts);
     errdefer pane.destroy();
 
     try self.panes.put(self.alloc, id, pane);
-    self.next_id += 1;
     log.info("opened pane {d}", .{id});
-    return id;
 }
 
 pub fn close(self: *Registry, id: u64) Error!void {
@@ -124,10 +125,12 @@ test "opens, tracks and closes panes by id" {
 
     try std.testing.expectEqual(@as(usize, 0), reg.count());
 
-    const a = try reg.open(.{ .argv = &.{ "/bin/sh", "-i" } });
-    const b = try reg.open(.{ .argv = &.{ "/bin/sh", "-i" } });
+    const a: u64 = 1;
+    const b: u64 = 2;
+    try reg.open(a, .{ .argv = &.{ "/bin/sh", "-i" } });
+    try reg.open(b, .{ .argv = &.{ "/bin/sh", "-i" } });
     try std.testing.expectEqual(@as(usize, 2), reg.count());
-    try std.testing.expect(a != b);
+    try std.testing.expectError(error.PaneExists, reg.open(a, .{ .argv = &.{"/bin/sh"} }));
 
     const live = try reg.ids(alloc);
     defer alloc.free(live);
@@ -156,8 +159,10 @@ test "routes writes and snapshots to the right pane" {
     var reg = init(alloc);
     defer reg.deinit();
 
-    const a = try reg.open(.{ .argv = &.{ "/bin/sh", "-i" }, .env = &.{"PS1=$ "} });
-    const b = try reg.open(.{ .argv = &.{ "/bin/sh", "-i" }, .env = &.{"PS1=$ "} });
+    const a: u64 = 1;
+    const b: u64 = 2;
+    try reg.open(a, .{ .argv = &.{ "/bin/sh", "-i" }, .env = &.{"PS1=$ "} });
+    try reg.open(b, .{ .argv = &.{ "/bin/sh", "-i" }, .env = &.{"PS1=$ "} });
 
     try reg.write(a, "echo only_in_pane_a\n");
     try reg.write(b, "echo only_in_pane_b\n");
@@ -183,8 +188,8 @@ test "deinit closes every pane still open" {
     const alloc = std.testing.allocator;
 
     var reg = init(alloc);
-    _ = try reg.open(.{ .argv = &.{ "/bin/sh", "-i" } });
-    _ = try reg.open(.{ .argv = &.{ "/bin/sh", "-i" } });
+    try reg.open(1, .{ .argv = &.{ "/bin/sh", "-i" } });
+    try reg.open(2, .{ .argv = &.{ "/bin/sh", "-i" } });
     try std.testing.expectEqual(@as(usize, 2), reg.count());
     // The allocator checks for leaks when the test ends, so a pane left behind
     // here would fail the test.

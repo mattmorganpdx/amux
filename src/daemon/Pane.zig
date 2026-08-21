@@ -5,7 +5,7 @@
 //! anything is attached to look at it, which is the whole point of the daemon.
 
 const std = @import("std");
-const vt = @import("vt");
+const vt = @import("../vt.zig");
 const Pty = @import("Pty.zig");
 
 const Pane = @This();

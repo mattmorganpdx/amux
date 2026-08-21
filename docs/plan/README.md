@@ -13,7 +13,7 @@ Roughly dependency-ordered. **D** = de-risking, do early.
 | 1 | ~~**D** Prototype: Ghostty OpenGL renderer drawing an amux-owned `Terminal`~~ **done** | — |
 | 2 | ~~Wire `ghostty-vt` into amux's build as a Zig module~~ **done** | — |
 | 3 | ~~`amuxd`: own PTYs and terminal state~~ **done** | 2 |
-| 4 | Move socket handlers behind the daemon, and the pane tree / workspaces with them | 3 |
+| 4 | ~~Move socket handlers behind the daemon, and the pane tree / workspaces with them~~ **done** | 3 |
 | 5 | Screen-state wire protocol (snapshot + delta) | 3 |
 | 6 | GUI becomes an attach client | 1, 5 |
 | 7 | systemd socket activation | 4 |
@@ -113,18 +113,75 @@ everything. Confirmed the assertions bite by mutation.
 have no consumer until the handlers move, so relocating them now would be code
 nothing calls. They land with item 4.
 
-## 4. Move socket handlers behind the daemon
+## 4. Move socket handlers behind the daemon — **DONE**
 
-Now also carries the pane tree, workspaces and session persistence, deferred
-from item 3 because they need the handlers as consumers.
+`amuxd` serves the amux socket protocol. `amux-cli` talks to it directly, with
+no display and no GUI running, and sessions survive a daemon restart.
 
-`src/socket/handlers/` should largely move as-is — this is the payoff from the
-per-domain split. `server.zig` becomes the daemon's front door. Handlers that
-currently dispatch to the GTK main thread instead act directly on daemon state,
-which removes `runOnMainThread` from those paths entirely.
+**The model layer moved as-is, and that was the payoff.** `TabManager`,
+`Workspace` and `PaneTree` never depended on GTK, so `src/daemon/State.zig`
+composes them with the pane Registry unchanged. `session.zig` is reused too --
+only its `onAutosave` GTK timer callback is GUI-specific, and the daemon does
+not use it.
 
-Watch: `handlers/surface.zig` and `handlers/pane.zig` reach into `Window`, so
-they need the equivalent daemon-side accessors before they can move.
+**Deviation: the handlers were rewritten, not moved.** The plan expected
+`src/socket/handlers/` to come across largely as-is. That held for the
+*protocol* -- `protocol.zig` is reused unchanged and method names and response
+shapes match -- but not for the bodies. The GUI's surface and pane handlers are
+written around `Window`: they drive GtkPaned trees, rebuild the sidebar, and hop
+onto the GTK main thread for every read. `src/daemon/handlers.zig` is new code
+against `State`.
+
+The upside is that all the machinery built to make the GUI safe simply is not
+needed here: no `runOnMainThread`, no resolve-on-the-main-thread dance, no
+leak-on-timeout contexts. There is no second thread to defer to, so a handler
+takes the state lock and does the work.
+
+`src/daemon/server.zig` is a fresh socket front door carrying every hardening
+lesson from the GUI's, each noted in place: 0600 via umask around `bind`,
+detached client threads, a request-size cap, `shutdown()` before `close()` so a
+blocked `accept()` returns, and an in-flight drain on stop.
+
+Implemented: `system.ping/identify/capabilities`, `workspace.list/create/
+current/select/close/rename`, `surface.list/current/send_text/read_text/
+send_key/split/close/run`, `pane.list`. 18 methods, reported by
+`system.capabilities` along with `"daemon": true` so a client can tell what it
+is talking to.
+
+Deliberately not implemented: notifications, the command palette, the Claude
+hooks and the sidebar metadata methods. Those exist to drive GUI chrome and
+belong with item 6.
+
+21 daemon tests. Verified live: headless (no `DISPLAY` in the process
+environment), socket at 0600, send/read round-trip, `surface.run`, splits,
+workspace lifecycle, error paths, and a full save-on-SIGTERM / restore-on-start
+cycle that brought back three workspaces with their pane counts and respawned
+working shells.
+
+### Two things found on the way
+
+**A latent inconsistency in `PaneTree`.** `TabManager.createWorkspace` already
+creates the root pane, and `PaneTree.paneCount` counts every pane node in the
+map rather than only those reachable from the root. Creating a second root
+therefore reported one pane more than existed. State avoids it, and the restore
+path clears the auto-created node before rebuilding a saved layout. The GUI has
+the same shape and the same latent issue; `paneCount` was left alone because the
+GUI's last-pane guard depends on its current behaviour.
+
+**`surface.run` output extraction is a heuristic.** Two things break naive
+matching, both observed: the terminal wraps the echoed command at the column
+limit, so the echo on screen contains newlines the command string does not; and
+the screen can scroll between snapshots, so the "before" text is not a prefix of
+the "after" text. The daemon handles both. The real fix is semantic prompts --
+shell integration emits OSC 133 marks and the VT engine already parses them, so
+the daemon could know exactly where output starts and stops instead of guessing.
+Worth doing when shell integration moves across.
+
+### Operational note
+
+The GUI still runs its own socket server until item 6, and both default to
+`/tmp/amux.sock`. They cannot both use the default path; give one an
+`AMUX_SOCKET` override while both exist.
 
 ## 5. Screen-state wire protocol
 
@@ -136,6 +193,10 @@ more than getting it cheap, and this is the piece that made the "output tee"
 alternative unworkable.
 
 ## 6. GUI becomes an attach client
+
+Also deletes the GUI's own socket server and the `Window`-based handlers, which
+the daemon now supersedes, and picks up the GUI-chrome methods left out of item
+4: notifications, the command palette, the Claude hooks and sidebar metadata.
 
 Drop PTY ownership from the GUI. `terminal_widget.zig` becomes a renderer over a
 locally-held `Terminal` populated from item 5; most of `window.zig`'s widget

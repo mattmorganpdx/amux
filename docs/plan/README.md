@@ -12,8 +12,8 @@ Roughly dependency-ordered. **D** = de-risking, do early.
 |---|------|-----------|
 | 1 | ~~**D** Prototype: Ghostty OpenGL renderer drawing an amux-owned `Terminal`~~ **done** | — |
 | 2 | ~~Wire `ghostty-vt` into amux's build as a Zig module~~ **done** | — |
-| 3 | `amuxd`: own PTYs and terminal state | 2 |
-| 4 | Move socket handlers behind the daemon | 3 |
+| 3 | ~~`amuxd`: own PTYs and terminal state~~ **done** | 2 |
+| 4 | Move socket handlers behind the daemon, and the pane tree / workspaces with them | 3 |
 | 5 | Screen-state wire protocol (snapshot + delta) | 3 |
 | 6 | GUI becomes an attach client | 1, 5 |
 | 7 | systemd socket activation | 4 |
@@ -69,16 +69,54 @@ the 44-response API probe is unchanged.
 The module is declared for the GUI executable too, so item 6 can `@import` it
 without touching `build.zig`, but nothing in the GUI uses it yet.
 
-## 3. `amuxd`: own PTYs and terminal state
+## 3. `amuxd`: own PTYs and terminal state — **DONE**
 
-The daemon proper. Spawn shells on PTYs, feed output through a `ghostty-vt`
-`Terminal` per pane, expose read/write. No GL, no GTK — it must run under
-systemd with no display.
+`amuxd` is a third binary from the same `build.zig`, linking **only libc and
+libm** — no GTK, no libghostty, no GL — so it runs under a systemd user unit
+with no display. Verified with `ldd`.
 
-Also moves here: the pane tree, workspaces, session persistence. Terminal size
-is fixed (settled decision), so no client size negotiation.
+- `src/daemon/Pty.zig` — a pty with a child on the far end. `forkpty` (libc,
+  glibc >= 2.34) handles setsid/TIOCSCTTY/dup2; the child only chdirs and execs.
+  argv, envp and cwd are all built *before* the fork, since only
+  async-signal-safe calls are legal after it. Read, write, resize, reap.
+- `src/daemon/Pane.zig` — a pty plus the terminal state its output parses into.
+  A reader thread pumps pty bytes through a VT stream into a `Terminal` under a
+  mutex. Exposes `write`, `snapshot`, `snapshotScrollback`, `resize` and exit
+  detection.
+- `src/daemon/Registry.zig` — panes keyed by id.
+- `src/daemon/main.zig` — serve mode (idle until SIGTERM/SIGINT) plus
+  `--self-check`, which spawns a shell, runs a command and reads the result back
+  off the parsed screen. Runnable proof without a socket.
+
+Two things worth knowing:
+
+**The VT stream came for free.** `ghostty-vt` does not re-export
+`ReadonlyStream`, but the type is reachable as
+`@typeInfo(@TypeOf(Terminal.vtHandler)).@"fn".return_type`, so no change to the
+fork was needed. Upstream describes that stream as intended for exactly this —
+driving terminal state from a byte stream you are not interactively answering.
+
+**The registry deliberately never hands out a `*Pane`.** Every operation takes
+an id and does the work holding the lock. The GUI's `pane_widgets` was a bare
+map callers looked into, and it produced precisely one use-after-free and one
+data race. The cost is holding the lock across a pty write or a snapshot; both
+are short, and it makes the hazard unrepresentable rather than merely avoided.
+
+12 tests, all passing in under a second: pty round-trip and EOF, env and cwd
+reaching the child, a hosted shell parsed into terminal state, escape sequences
+interpreted rather than echoed (asserted by checking no raw ESC byte reaches the
+screen), scrollback retention, child-exit detection, registry lifecycle,
+unknown-id errors, write/snapshot routing between two panes, and deinit closing
+everything. Confirmed the assertions bite by mutation.
+
+**Deferred to item 4:** the pane tree, workspaces and session persistence. They
+have no consumer until the handlers move, so relocating them now would be code
+nothing calls. They land with item 4.
 
 ## 4. Move socket handlers behind the daemon
+
+Now also carries the pane tree, workspaces and session persistence, deferred
+from item 3 because they need the handlers as consumers.
 
 `src/socket/handlers/` should largely move as-is — this is the payoff from the
 per-domain split. `server.zig` becomes the daemon's front door. Handlers that

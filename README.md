@@ -57,7 +57,7 @@ amux speaks the [cmux](https://cmux.dev) V2 socket protocol (newline-delimited J
 git clone --recursive https://github.com/mattmorganpdx/amux.git
 cd amux
 ./setup.sh      # builds the Ghostty library (takes a few minutes first time)
-zig build        # produces zig-out/bin/amux and zig-out/bin/amux-cli
+zig build        # produces zig-out/bin/{amux, amux-cli, amuxd}
 ```
 
 ### Install

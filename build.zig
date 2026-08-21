@@ -45,6 +45,17 @@ pub fn build(b: *std.Build) void {
     });
     const ghostty_vt = ghostty_dep.module("ghostty-vt");
 
+    // amux's seam onto that engine (src/vt.zig), as a module so the daemon, the
+    // GUI and the tests all name the same thing.
+    const vt_mod = b.createModule(.{
+        .root_source_file = b.path("src/vt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ghostty_vt", .module = ghostty_vt },
+        },
+    });
+
     // --- Main executable ---
     const exe = b.addExecutable(.{
         .name = "amux",
@@ -53,7 +64,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ghostty_vt", .module = ghostty_vt },
+                .{ .name = "vt", .module = vt_mod },
             },
         }),
     });
@@ -75,6 +86,25 @@ pub fn build(b: *std.Build) void {
     exe.linkLibC();
 
     b.installArtifact(exe);
+
+    // --- Daemon executable ---
+    //
+    // No GTK and no libghostty: amuxd owns pseudoterminals and terminal state
+    // only, so it runs under systemd with no display. It shares the terminal
+    // engine with everything else via the ghostty_vt module.
+    const amuxd = b.addExecutable(.{
+        .name = "amuxd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/daemon/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "vt", .module = vt_mod },
+            },
+        }),
+    });
+    b.installArtifact(amuxd);
 
     // --- CLI executable ---
     const cli = b.addExecutable(.{
@@ -104,8 +134,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_vt_tests = b.addRunArtifact(vt_tests);
+
+    const daemon_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/daemon/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "vt", .module = vt_mod },
+            },
+        }),
+    });
+    const run_daemon_tests = b.addRunArtifact(daemon_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_vt_tests.step);
+    test_step.dependOn(&run_daemon_tests.step);
 
     // --- Run step ---
     const run_cmd = b.addRunArtifact(exe);

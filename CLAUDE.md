@@ -125,9 +125,14 @@ translate-c cannot process the GTK4 headers).
 zig build
 ```
 
-This produces two binaries in `zig-out/bin/`:
+This produces three binaries in `zig-out/bin/`:
 - `amux` — the GUI terminal (requires GTK4, libghostty, libnotify)
 - `amux-cli` — standalone socket client (libc only)
+- `amuxd` — the terminal daemon (libc only; no GTK, no libghostty, no display)
+
+`amuxd` owns pseudoterminals and terminal state so sessions outlive the GUI. It
+does not serve the socket yet — see `docs/plan/README.md`. `amuxd --self-check`
+spawns a shell, runs a command and reads it back off the parsed screen.
 
 Tests:
 

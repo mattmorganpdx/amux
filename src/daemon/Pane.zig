@@ -8,6 +8,7 @@ const std = @import("std");
 const vt = @import("../vt.zig");
 const Pty = @import("Pty.zig");
 const screen_json = @import("screen_json.zig");
+const vt_paint = @import("vt_paint.zig");
 
 const Pane = @This();
 
@@ -25,6 +26,14 @@ const Stream = vt.Stream(Handler);
 
 /// How much pty output to take per read.
 const read_chunk_bytes = 4096;
+
+/// Raw pty output retained per pane, so a client that looked away can replay
+/// what it missed rather than being repainted from scratch every time.
+///
+/// A client that falls further behind than this gets told there is a gap and
+/// repaints instead. That is the right failure: the alternative is stalling the
+/// terminal until the slowest viewer catches up.
+const default_output_ring_bytes = 256 * 1024;
 
 /// Scrollback retained per pane, in lines.
 const default_scrollback_lines = 10_000;
@@ -67,6 +76,17 @@ running: std.atomic.Value(bool) = .init(false),
 /// True once the child has exited and the pty reached EOF.
 exited: std.atomic.Value(bool) = .init(false),
 
+/// Raw pty output, as bytes rather than as parsed screen state. A relay feeds
+/// these straight into a terminal of its own, which is why they are kept
+/// verbatim: re-encoding parsed state would lose anything the parser normalised.
+/// Guarded by `mutex` along with `terminal`.
+out_ring: []u8 = &.{},
+/// Absolute offset just past the newest byte held.
+out_end: u64 = 0,
+/// Absolute offset of the oldest byte still held. `out_end - out_start` is how
+/// much history is available.
+out_start: u64 = 0,
+
 /// Bumped whenever something may have changed the terminal. Only a hint, and
 /// deliberately not the sequence number: a waiting client can read this without
 /// taking the pane lock or rebuilding the render state, so an idle wake-up costs
@@ -85,6 +105,7 @@ pub const Options = struct {
     cols: u16 = 80,
     rows: u16 = 24,
     scrollback: usize = default_scrollback_lines,
+    output_ring: usize = default_output_ring_bytes,
     notify: ?Notify = null,
 };
 
@@ -107,6 +128,9 @@ pub fn create(alloc: std.mem.Allocator, id: u64, opts: Options) !*Pane {
     });
     errdefer pty.deinit();
 
+    const ring = try alloc.alloc(u8, opts.output_ring);
+    errdefer alloc.free(ring);
+
     self.* = .{
         .alloc = alloc,
         .id = id,
@@ -114,6 +138,7 @@ pub fn create(alloc: std.mem.Allocator, id: u64, opts: Options) !*Pane {
         .terminal = term,
         // Patched below: the handler needs the final address of `terminal`.
         .stream = undefined,
+        .out_ring = ring,
         .notify = opts.notify,
     };
     self.stream = .{
@@ -140,6 +165,7 @@ pub fn destroy(self: *Pane) void {
 
     self.render.deinit(self.alloc);
     self.alloc.free(self.row_seq);
+    self.alloc.free(self.out_ring);
     self.terminal.deinit(self.alloc);
     const alloc = self.alloc;
     alloc.destroy(self);
@@ -263,6 +289,104 @@ pub fn generation(self: *const Pane) u64 {
     return self.gen.load(.acquire);
 }
 
+/// Append pty output to the ring. Caller holds `mutex`.
+fn appendOutputLocked(self: *Pane, bytes: []const u8) void {
+    if (self.out_ring.len == 0) return;
+
+    const cap = self.out_ring.len;
+
+    // A write larger than the ring can only keep its tail, but the offset
+    // advances by the *whole* write: an offset is a position in the total output
+    // stream, so not counting dropped bytes would hide the fact that a client
+    // had fallen behind -- it would be handed a later part of the stream while
+    // being told it was continuous.
+    var src = bytes;
+    if (src.len > cap) src = src[src.len - cap ..];
+
+    const new_end = self.out_end + bytes.len;
+
+    // Place the kept tail so that the ring holds exactly the last `cap` bytes
+    // of the stream ending at `new_end`.
+    const write_at: usize = @intCast((new_end - src.len) % cap);
+    const first = @min(src.len, cap - write_at);
+    @memcpy(self.out_ring[write_at..][0..first], src[0..first]);
+    if (first < src.len) @memcpy(self.out_ring[0 .. src.len - first], src[first..]);
+
+    self.out_end = new_end;
+    self.out_start = new_end - @min(cap, new_end);
+}
+
+pub const Output = struct {
+    /// Offset just past the last byte returned. Pass it back to continue.
+    offset: u64,
+    /// Bytes appended, owned by the caller.
+    data: []const u8,
+    /// The requested offset was older than anything still held, so `data`
+    /// starts later than asked. A client that sees this has missed output and
+    /// must repaint rather than assume continuity.
+    gap: bool,
+};
+
+/// Raw output from `from` onwards, or null if there is none yet.
+///
+/// Caller frees `Output.data`.
+pub fn outputSince(self: *Pane, alloc: std.mem.Allocator, from: u64) !?Output {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    var start = from;
+    var gap = false;
+    if (start < self.out_start) {
+        start = self.out_start;
+        gap = true;
+    }
+    // A client ahead of us -- a pane that was replaced under the same id --
+    // is treated as a gap rather than trusted, since we cannot produce bytes
+    // we never had.
+    if (start > self.out_end) {
+        start = self.out_start;
+        gap = true;
+    }
+    if (start == self.out_end and !gap) return null;
+
+    const len: usize = @intCast(self.out_end - start);
+    const data = try alloc.alloc(u8, len);
+    errdefer alloc.free(data);
+
+    const cap = self.out_ring.len;
+    const read_at: usize = @intCast(start % cap);
+    const first = @min(len, cap - read_at);
+    @memcpy(data[0..first], self.out_ring[read_at..][0..first]);
+    if (first < len) @memcpy(data[first..], self.out_ring[0 .. len - first]);
+
+    return .{ .offset = self.out_end, .data = data, .gap = gap };
+}
+
+/// Paint the current screen as VT bytes, and report the output offset to stream
+/// from afterwards.
+///
+/// Both under one lock: taking the offset separately would let output land in
+/// between, and the relay would then replay bytes already reflected in the
+/// paint -- doubling whatever arrived in that window.
+pub fn paint(self: *Pane, alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !u64 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    _ = try self.refreshLocked();
+    try vt_paint.write(alloc, out, &self.render);
+    return self.out_end;
+}
+
+/// Terminal dimensions, for a client sizing itself to match.
+pub fn size(self: *Pane) struct { cols: u16, rows: u16 } {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    return .{
+        .cols = @intCast(self.terminal.cols),
+        .rows = @intCast(self.terminal.rows),
+    };
+}
+
 /// Pumps pty output into the terminal until EOF or shutdown.
 fn readLoop(self: *Pane) void {
     var buf: [read_chunk_bytes]u8 = undefined;
@@ -278,6 +402,7 @@ fn readLoop(self: *Pane) void {
             // A malformed sequence should cost us that sequence, not the pane.
             log.warn("pane {d}: stream error: {}", .{ self.id, err });
         };
+        self.appendOutputLocked(buf[0..n]);
         self.mutex.unlock();
 
         _ = self.gen.fetchAdd(1, .release);
@@ -380,4 +505,97 @@ test "notices when its child exits" {
         waited += 50;
     }
     try std.testing.expect(pane.hasExited());
+}
+
+/// A pane with a child that produces no output, so ring tests see only what
+/// they put in. `sleep` rather than a shell: a shell prints a prompt.
+fn quietPane(alloc: std.mem.Allocator, ring: usize) !*Pane {
+    return create(alloc, 1, .{
+        .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+        .output_ring = ring,
+    });
+}
+
+test "the output ring replays what a client missed" {
+    const alloc = std.testing.allocator;
+    var pane = try quietPane(alloc, 1024);
+    defer pane.destroy();
+
+    pane.mutex.lock();
+    pane.appendOutputLocked("hello");
+    pane.mutex.unlock();
+
+    const from_start = (try pane.outputSince(alloc, 0)).?;
+    defer alloc.free(from_start.data);
+    try std.testing.expectEqualStrings("hello", from_start.data);
+    try std.testing.expect(!from_start.gap);
+    try std.testing.expectEqual(@as(u64, 5), from_start.offset);
+
+    pane.mutex.lock();
+    pane.appendOutputLocked(" world");
+    pane.mutex.unlock();
+
+    // Continuing from the offset returns only what arrived since.
+    const rest = (try pane.outputSince(alloc, from_start.offset)).?;
+    defer alloc.free(rest.data);
+    try std.testing.expectEqualStrings(" world", rest.data);
+    try std.testing.expect(!rest.gap);
+
+    // Caught up: nothing to report rather than an empty answer.
+    try std.testing.expect((try pane.outputSince(alloc, rest.offset)) == null);
+}
+
+test "the output ring wraps without corrupting what it still holds" {
+    const alloc = std.testing.allocator;
+    // Deliberately tiny, so the modular arithmetic is exercised rather than
+    // merely present.
+    var pane = try quietPane(alloc, 8);
+    defer pane.destroy();
+
+    pane.mutex.lock();
+    pane.appendOutputLocked("abcde");
+    pane.appendOutputLocked("fghij"); // crosses the end of the ring
+    pane.mutex.unlock();
+
+    // 10 bytes written into 8: the last 8 survive, in order.
+    const got = (try pane.outputSince(alloc, 2)).?;
+    defer alloc.free(got.data);
+    try std.testing.expectEqualStrings("cdefghij", got.data);
+    try std.testing.expectEqual(@as(u64, 10), got.offset);
+    try std.testing.expect(!got.gap);
+}
+
+test "a client further behind than the ring is told there is a gap" {
+    const alloc = std.testing.allocator;
+    var pane = try quietPane(alloc, 8);
+    defer pane.destroy();
+
+    pane.mutex.lock();
+    pane.appendOutputLocked("0123456789ab");
+    pane.mutex.unlock();
+
+    // Asking from the beginning, which has been overwritten. Silently returning
+    // the oldest bytes we still have would hand back a stream starting
+    // mid-escape-sequence; the flag is what lets the caller repaint instead.
+    const got = (try pane.outputSince(alloc, 0)).?;
+    defer alloc.free(got.data);
+    try std.testing.expect(got.gap);
+    try std.testing.expectEqualStrings("456789ab", got.data);
+}
+
+test "a write larger than the ring keeps its tail" {
+    const alloc = std.testing.allocator;
+    var pane = try quietPane(alloc, 4);
+    defer pane.destroy();
+
+    pane.mutex.lock();
+    pane.appendOutputLocked("abcdefghij");
+    pane.mutex.unlock();
+
+    const got = (try pane.outputSince(alloc, 0)).?;
+    defer alloc.free(got.data);
+    try std.testing.expect(got.gap);
+    try std.testing.expectEqualStrings("ghij", got.data);
+    // The offset still counts every byte that went past, not just the kept ones.
+    try std.testing.expectEqual(@as(u64, 10), got.offset);
 }

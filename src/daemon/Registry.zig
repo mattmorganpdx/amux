@@ -175,6 +175,105 @@ pub fn screen(
     }
 }
 
+pub const OutputResult = struct {
+    offset: u64,
+    /// Raw bytes to feed a terminal, owned by the caller. Empty when this is a
+    /// repaint carried in `paint` instead.
+    data: []const u8 = &.{},
+    /// A repaint: either the client is attaching, or it fell so far behind that
+    /// continuing from where it was would show a corrupted screen.
+    paint: ?[]const u8 = null,
+    cols: u16 = 0,
+    rows: u16 = 0,
+    exited: bool = false,
+};
+
+/// Raw output for a relay, optionally waiting for some.
+///
+/// `from` null means attaching: the answer is a repaint of the current screen
+/// plus the offset to continue from. Otherwise it is the bytes since `from`,
+/// unless that offset has aged out of the pane's ring -- then it is a repaint
+/// again, because bytes we no longer hold cannot be replayed.
+///
+/// Same waiting rules as `screen`: the registry lock is held, `timedWait`
+/// releases it, and the pane is looked up again after every wake.
+pub fn output(
+    self: *Registry,
+    id: u64,
+    alloc: std.mem.Allocator,
+    from: ?u64,
+    timeout_ms: u32,
+) !?OutputResult {
+    const total_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
+    var timer: ?std.time.Timer = std.time.Timer.start() catch null;
+
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    var last_gen: ?u64 = null;
+    while (true) {
+        const pane = self.panes.get(id) orelse return Error.PaneNotFound;
+        const dims = pane.size();
+
+        if (from == null) {
+            var buf: std.ArrayListUnmanaged(u8) = .{};
+            errdefer buf.deinit(alloc);
+            const offset = try pane.paint(alloc, &buf);
+            return .{
+                .offset = offset,
+                .paint = try buf.toOwnedSlice(alloc),
+                .cols = dims.cols,
+                .rows = dims.rows,
+                .exited = pane.hasExited(),
+            };
+        }
+
+        const gen = pane.generation();
+        if (last_gen == null or gen != last_gen.?) {
+            last_gen = gen;
+            if (try pane.outputSince(alloc, from.?)) |got| {
+                if (!got.gap) {
+                    return .{
+                        .offset = got.offset,
+                        .data = got.data,
+                        .cols = dims.cols,
+                        .rows = dims.rows,
+                        .exited = pane.hasExited(),
+                    };
+                }
+                // Behind by more than the ring holds. Repaint rather than hand
+                // back a stream that starts mid-escape-sequence.
+                alloc.free(got.data);
+                var buf: std.ArrayListUnmanaged(u8) = .{};
+                errdefer buf.deinit(alloc);
+                const offset = try pane.paint(alloc, &buf);
+                return .{
+                    .offset = offset,
+                    .paint = try buf.toOwnedSlice(alloc),
+                    .cols = dims.cols,
+                    .rows = dims.rows,
+                    .exited = pane.hasExited(),
+                };
+            }
+            // A dead pane will never produce more, so waiting for it is a way
+            // of hanging rather than a way of being patient.
+            if (pane.hasExited()) {
+                return .{
+                    .offset = from.?,
+                    .cols = dims.cols,
+                    .rows = dims.rows,
+                    .exited = true,
+                };
+            }
+        }
+
+        const elapsed = if (timer) |*t| t.read() else total_ns;
+        if (elapsed >= total_ns) return null;
+        const slice = @min(total_ns - elapsed, wait_slice_ns);
+        self.change.timedWait(&self.mutex, slice) catch {};
+    }
+}
+
 pub fn hasExited(self: *Registry, id: u64) Error!bool {
     self.mutex.lock();
     defer self.mutex.unlock();

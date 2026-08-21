@@ -45,6 +45,7 @@ const usage_text =
     \\  tree          Show workspace/pane hierarchy
     \\  workspace     Workspace management (list, create, current, select, close, rename,
     \\                  report-git, set-status, clear-status, add-log, clear-log, set-progress, set-pinned, set-color)
+    \\  attach        Relay a daemon-owned pane through this terminal
     \\  surface       Surface management (list, current, search, read-text, screen, send-key, split, close)
     \\  pane          Pane management (list, break, join, resize, swap)
     \\  window        Window management (list, current)
@@ -411,6 +412,20 @@ pub fn main() !void {
         } else {
             try stderr.writeAll("Unknown workspace subcommand. Use: list, create, current, select, close, rename,\n  report-git, set-status, clear-status, add-log, clear-log, set-progress, set-pinned, set-color, next, previous, last\n");
         }
+    } else if (std.mem.eql(u8, subcommand, "attach")) {
+        // amux-cli attach [surface_id]
+        //
+        // Relays a daemon-owned pane through this terminal: paints what is
+        // already on screen, then streams. This is what the GUI runs inside each
+        // of its terminal widgets, so the pty stays in the daemon.
+        var sid: ?i64 = null;
+        if (args.next()) |arg| {
+            sid = argInt(arg) orelse {
+                try stderr.writeAll("Invalid surface id: must be an integer\n");
+                return;
+            };
+        }
+        try attachCommand(socket_path, sid, stderr);
     } else if (std.mem.eql(u8, subcommand, "surface")) {
         const sub = args.next() orelse "list";
         if (std.mem.eql(u8, sub, "list")) {
@@ -1296,4 +1311,224 @@ fn sendAndPrint(socket_path: []const u8, method: []const u8, params: []const u8,
 
     try stdout.writeAll(response);
     try stdout.writeAll("\n");
+}
+
+// ------------------------------------------------------------------
+// attach: relay a daemon-owned pane through this terminal
+// ------------------------------------------------------------------
+
+/// A connection held open across many requests.
+///
+/// The daemon serves newline-delimited requests in a loop per connection, so a
+/// relay can keep one rather than reconnecting for every keystroke.
+const Conn = struct {
+    stream: net.Stream,
+    alloc: std.mem.Allocator,
+    buf: std.ArrayListUnmanaged(u8) = .{},
+
+    fn open(alloc: std.mem.Allocator, socket_path: []const u8) !Conn {
+        const addr = try net.Address.initUnix(socket_path);
+        const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        errdefer posix.close(fd);
+        try posix.connect(fd, &addr.any, addr.getOsSockLen());
+        return .{ .stream = .{ .handle = fd }, .alloc = alloc };
+    }
+
+    fn close(self: *Conn) void {
+        self.buf.deinit(self.alloc);
+        posix.close(self.stream.handle);
+    }
+
+    /// Send one request and return its response line, valid until the next call.
+    fn call(self: *Conn, method: []const u8, params: []const u8) ![]const u8 {
+        var req_buf: [max_request_bytes]u8 = undefined;
+        const line = try std.fmt.bufPrint(&req_buf,
+            \\{{"id":1,"method":"{s}","params":{s}}}
+        , .{ method, params });
+        try self.stream.writeAll(line);
+        try self.stream.writeAll("\n");
+
+        self.buf.clearRetainingCapacity();
+        var chunk: [response_chunk_bytes]u8 = undefined;
+        while (true) {
+            const n = try self.stream.read(&chunk);
+            if (n == 0) return error.ConnectionClosed;
+            try self.buf.appendSlice(self.alloc, chunk[0..n]);
+            if (std.mem.indexOfScalar(u8, chunk[0..n], '\n') != null) break;
+        }
+        var line_out: []const u8 = self.buf.items;
+        while (line_out.len > 0 and (line_out[line_out.len - 1] == '\n' or line_out[line_out.len - 1] == '\r')) {
+            line_out = line_out[0 .. line_out.len - 1];
+        }
+        return line_out;
+    }
+};
+
+/// Shared between the relay's two directions.
+const Relay = struct {
+    socket_path: []const u8,
+    surface_id: ?i64,
+    running: std.atomic.Value(bool) = .init(true),
+
+    /// Params naming just the surface: what attaching sends, since omitting the
+    /// offset is what asks for a repaint.
+    fn attachParams(self: *const Relay, buf: []u8) ?[]const u8 {
+        var p = Params.init(buf);
+        if (self.surface_id) |sid| p.int("surface_id", sid);
+        return p.finish();
+    }
+};
+
+/// stdin -> daemon. Runs on its own thread because both directions block: this
+/// one on the terminal, the other on the daemon.
+fn relayInput(relay: *Relay) void {
+    const alloc = std.heap.page_allocator;
+    var conn = Conn.open(alloc, relay.socket_path) catch return;
+    defer conn.close();
+
+    var in: [4096]u8 = undefined;
+    // Sized for the largest read above: base64 is four bytes per three, and the
+    // params object adds the surface id and the quoting around it.
+    var encoded: [4096 * 4 / 3 + 64]u8 = undefined;
+    var params_buf: [encoded.len + 128]u8 = undefined;
+
+    const stdin = std.fs.File{ .handle = posix.STDIN_FILENO };
+    while (relay.running.load(.acquire)) {
+        const n = stdin.read(&in) catch break;
+        if (n == 0) break;
+
+        const b64len = std.base64.standard.Encoder.calcSize(n);
+        if (b64len > encoded.len) continue;
+        _ = std.base64.standard.Encoder.encode(encoded[0..b64len], in[0..n]);
+
+        var p = Params.init(&params_buf);
+        if (relay.surface_id) |sid| p.int("surface_id", sid);
+        p.str("data", encoded[0..b64len]);
+        const params = p.finish() orelse continue;
+
+        _ = conn.call("surface.input", params) catch break;
+    }
+    relay.running.store(false, .release);
+}
+
+/// Put the terminal in raw mode so keystrokes reach the daemon unchanged.
+///
+/// Without this the local line discipline would echo, buffer until Enter, and
+/// turn Ctrl-C into a signal for the relay instead of a byte for the pane. The
+/// pane's own terminal state is the one that decides what those mean.
+fn rawMode() ?posix.termios {
+    const saved = posix.tcgetattr(posix.STDIN_FILENO) catch return null;
+    var raw = saved;
+    raw.lflag.ECHO = false;
+    raw.lflag.ICANON = false;
+    raw.lflag.ISIG = false;
+    raw.lflag.IEXTEN = false;
+    raw.iflag.IXON = false;
+    raw.iflag.ICRNL = false;
+    raw.iflag.BRKINT = false;
+    raw.iflag.INPCK = false;
+    raw.iflag.ISTRIP = false;
+    raw.oflag.OPOST = false;
+    posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, raw) catch return null;
+    return saved;
+}
+
+fn attachCommand(socket_path: []const u8, surface_id: ?i64, stderr: std.fs.File) !void {
+    const alloc = std.heap.page_allocator;
+
+    var out_conn = Conn.open(alloc, socket_path) catch {
+        try stderr.writeAll("Failed to connect to amux (is it running?)\n");
+        return;
+    };
+    defer out_conn.close();
+
+    var relay: Relay = .{ .socket_path = socket_path, .surface_id = surface_id };
+
+    const saved = rawMode();
+    defer if (saved) |s| posix.tcsetattr(posix.STDIN_FILENO, .FLUSH, s) catch {};
+
+    const stdout = std.fs.File{ .handle = posix.STDOUT_FILENO };
+
+    // Attach: no offset asks for a repaint of what is already on screen, plus
+    // the offset to stream from. Streaming alone would show an empty terminal
+    // until the program next wrote something.
+    var offset: i64 = 0;
+    var decode_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer decode_buf.deinit(alloc);
+
+    var params_buf: [128]u8 = undefined;
+    {
+        const params = relay.attachParams(&params_buf) orelse return;
+        const resp = out_conn.call("surface.output", params) catch {
+            try stderr.writeAll("Failed to attach\n");
+            return;
+        };
+        offset = try writeRelayChunk(alloc, resp, stdout, &decode_buf, stderr) orelse return;
+    }
+
+    const input_thread = std.Thread.spawn(.{}, relayInput, .{&relay}) catch null;
+    defer if (input_thread) |t| t.detach();
+
+    while (relay.running.load(.acquire)) {
+        var p = Params.init(&params_buf);
+        if (relay.surface_id) |sid| p.int("surface_id", sid);
+        p.int("offset", offset);
+        // Long enough that an idle pane costs almost nothing, short enough that
+        // a daemon that went away is noticed.
+        p.int("timeout_ms", 20_000);
+        const params = p.finish() orelse break;
+
+        const resp = out_conn.call("surface.output", params) catch break;
+        const next = writeRelayChunk(alloc, resp, stdout, &decode_buf, stderr) catch break;
+        offset = next orelse break;
+    }
+    relay.running.store(false, .release);
+}
+
+/// Decode one `surface.output` reply onto the terminal. Returns the offset to
+/// continue from, or null when the relay should stop.
+fn writeRelayChunk(
+    alloc: std.mem.Allocator,
+    resp: []const u8,
+    stdout: std.fs.File,
+    decode_buf: *std.ArrayListUnmanaged(u8),
+    stderr: std.fs.File,
+) !?i64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, resp, .{}) catch return null;
+    defer parsed.deinit();
+    const root = parsed.value;
+    if (root != .object) return null;
+
+    if (root.object.get("ok")) |ok| {
+        if (ok == .bool and !ok.bool) {
+            // The pane is gone: say so on the terminal, since this relay is
+            // running inside a window someone is looking at.
+            try stderr.writeAll("\r\n[amux: pane is gone]\r\n");
+            return null;
+        }
+    }
+    const result = root.object.get("result") orelse return null;
+    if (result != .object) return null;
+
+    const offset: i64 = if (result.object.get("offset")) |v| switch (v) {
+        .integer => |i| i,
+        else => return null,
+    } else return null;
+
+    if (result.object.get("data")) |d| {
+        if (d == .string and d.string.len > 0) {
+            const n = std.base64.standard.Decoder.calcSizeForSlice(d.string) catch return offset;
+            try decode_buf.resize(alloc, n);
+            std.base64.standard.Decoder.decode(decode_buf.items, d.string) catch return offset;
+            try stdout.writeAll(decode_buf.items);
+        }
+    }
+
+    if (result.object.get("exited")) |e| {
+        if (e == .bool and e.bool) {
+            try stderr.writeAll("\r\n[amux: pane exited]\r\n");
+            return null;
+        }
+    }
+    return offset;
 }

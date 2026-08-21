@@ -139,7 +139,7 @@ AMUX_SOCKET=/tmp/amuxd.sock amuxd &
 AMUX_SOCKET=/tmp/amuxd.sock amux-cli run "echo hello"
 ```
 
-It answers 23 methods (`system.capabilities` lists them, and reports
+It answers 25 methods (`system.capabilities` lists them, and reports
 `"daemon": true`). Notifications, the command palette, the Claude hooks and the
 sidebar metadata methods are GUI chrome and are not served yet.
 
@@ -199,6 +199,29 @@ position from character widths.
 This is deliberately not `surface.watch`, which the roadmap reserves for Smart
 Wake's semantic events (TUI detected, prompt waiting). Different question, same
 underlying change notification.
+
+### Attaching a terminal to a daemon pane
+
+`amux-cli attach [surface_id]` relays a daemon-owned pane through the terminal it
+is run in: it paints what is already on screen, then streams new output, and
+sends keystrokes back. Run it in any terminal to get a view of a pane whose pty
+lives in the daemon — the same way `tmux attach` works.
+
+```bash
+amux-cli attach          # the focused pane
+amux-cli attach 3        # a specific one
+```
+
+It rests on two methods. `surface.output` returns raw pty bytes, base64-encoded;
+omit `offset` to attach (the reply is a repaint of the current screen plus the
+offset to stream from), pass it back to continue, and `timeout_ms` waits for
+output. A client that falls further behind than the pane's 256KB output ring is
+sent a fresh repaint rather than a stream starting mid-escape-sequence.
+`surface.input` sends raw bytes the other way.
+
+The repaint is reconstructed from the same cell data `surface.screen` serves —
+cursor positioning, SGR runs and text — because new output says nothing about
+what is already on screen.
 
 ### Session history
 

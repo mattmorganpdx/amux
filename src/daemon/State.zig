@@ -198,6 +198,18 @@ pub fn paneScreen(
     return self.registry.screen(pane_id, alloc, out, opts);
 }
 
+/// Raw output for a relay. Like `paneScreen`, deliberately without the state
+/// lock: it blocks, and nothing it touches is what that lock protects.
+pub fn paneOutput(
+    self: *State,
+    pane_id: u64,
+    alloc: Allocator,
+    from: ?u64,
+    timeout_ms: u32,
+) !?Registry.OutputResult {
+    return self.registry.output(pane_id, alloc, from, timeout_ms);
+}
+
 pub fn resolvePane(self: *State, explicit: ?u64) Error!u64 {
     self.mutex.lock();
     defer self.mutex.unlock();

@@ -44,6 +44,8 @@ const methods = [_][]const u8{
     "surface.send_text",
     "surface.read_text",
     "surface.screen",
+    "surface.output",
+    "surface.input",
     "surface.send_key",
     "surface.split",
     "surface.close",
@@ -77,6 +79,8 @@ pub fn dispatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     if (eq(m, "surface.send_text")) return sendText(alloc, state, req);
     if (eq(m, "surface.read_text")) return readText(alloc, state, req);
     if (eq(m, "surface.screen")) return surfaceScreen(alloc, state, req);
+    if (eq(m, "surface.output")) return surfaceOutput(alloc, state, req);
+    if (eq(m, "surface.input")) return surfaceInput(alloc, state, req);
     if (eq(m, "surface.send_key")) return sendKey(alloc, state, req);
     if (eq(m, "surface.split")) return split(alloc, state, req);
     if (eq(m, "surface.close")) return closePane(alloc, state, req);
@@ -372,6 +376,92 @@ fn surfaceScreen(alloc: Allocator, state: *State, req: *const protocol.Request) 
     }
 
     return protocol.successResponse(alloc, req.id, out.items);
+}
+
+const b64 = std.base64.standard;
+
+/// Raw pty bytes, for a relay that owns a terminal of its own.
+///
+/// Base64 rather than JSON string escaping. These are arbitrary bytes including
+/// escape sequences, and `\u00xx` costs six bytes for every control character in
+/// a stream that is mostly control characters. Base64 costs a flat third, and
+/// cannot be got wrong by a client that forgets to unescape.
+///
+/// Omit `offset` to attach: the answer is a repaint of the current screen plus
+/// the offset to stream from. This mirrors `surface.screen`, where omitting
+/// `since` means "send everything".
+fn surfaceOutput(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const explicit = optionalIdParam(alloc, req, "surface_id");
+    const from: ?u64 = if (req.getIntParam(alloc, "offset")) |v| toU64(v) else null;
+    const timeout: u32 = if (req.getIntParam(alloc, "timeout_ms")) |v|
+        @intCast(@max(0, @min(v, @as(i64, max_screen_timeout_ms))))
+    else
+        0;
+
+    const pane_id = state.resolvePane(explicit) catch |err| return stateError(alloc, req.id, err);
+
+    const res = state.paneOutput(pane_id, alloc, from, timeout) catch |err|
+        return stateError(alloc, req.id, err);
+
+    if (res == null) {
+        const body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"surface_id\":{d},\"offset\":{d},\"changed\":false}}",
+            .{ pane_id, from orelse 0 },
+        );
+        defer alloc.free(body);
+        return protocol.successResponse(alloc, req.id, body);
+    }
+
+    const r = res.?;
+    defer alloc.free(r.data);
+    defer if (r.paint) |p| alloc.free(p);
+
+    const bytes = r.paint orelse r.data;
+    const encoded = try alloc.alloc(u8, b64.Encoder.calcSize(bytes.len));
+    defer alloc.free(encoded);
+    _ = b64.Encoder.encode(encoded, bytes);
+
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"surface_id\":{d},\"offset\":{d},\"cols\":{d},\"rows\":{d}," ++
+            "\"painted\":{s},\"exited\":{s},\"data\":\"{s}\"}}",
+        .{
+            pane_id,
+            r.offset,
+            r.cols,
+            r.rows,
+            if (r.paint != null) "true" else "false",
+            if (r.exited) "true" else "false",
+            encoded,
+        },
+    );
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, req.id, body);
+}
+
+/// Raw bytes towards the child's stdin, base64 for the same reason as above:
+/// a keystroke is frequently an escape sequence.
+fn surfaceInput(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const explicit = optionalIdParam(alloc, req, "surface_id");
+    const encoded = req.getStringParam(alloc, "data") orelse
+        return protocol.errorResponse(alloc, req.id, "invalid_params", "data is required");
+
+    const max_len = b64.Decoder.calcSizeUpperBound(encoded.len) catch
+        return protocol.errorResponse(alloc, req.id, "invalid_params", "data is not base64");
+    const decoded = try alloc.alloc(u8, max_len);
+    defer alloc.free(decoded);
+    const n = b64.Decoder.calcSizeForSlice(encoded) catch
+        return protocol.errorResponse(alloc, req.id, "invalid_params", "data is not base64");
+    b64.Decoder.decode(decoded[0..n], encoded) catch
+        return protocol.errorResponse(alloc, req.id, "invalid_params", "data is not base64");
+
+    state.writePane(explicit, decoded[0..n]) catch |err| return stateError(alloc, req.id, err);
+
+    const id = state.resolvePane(explicit) catch 0;
+    const body = try std.fmt.allocPrint(alloc, "{{\"surface_id\":{d},\"wrote\":{d}}}", .{ id, n });
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, req.id, body);
 }
 
 fn sendKey(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {

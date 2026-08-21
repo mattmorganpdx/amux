@@ -21,6 +21,7 @@ const session = @import("session.zig");
 // contributing none. Naming it here puts its tests in the daemon suite.
 test {
     _ = session;
+    _ = @import("daemon/notifications.zig");
 }
 
 const log = std.log.scoped(.amuxd);

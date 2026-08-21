@@ -139,9 +139,9 @@ AMUX_SOCKET=/tmp/amuxd.sock amuxd &
 AMUX_SOCKET=/tmp/amuxd.sock amux-cli run "echo hello"
 ```
 
-It answers 27 methods (`system.capabilities` lists them, and reports
-`"daemon": true`). Notifications, the command palette, the Claude hooks and the
-sidebar metadata methods are GUI chrome and are not served yet.
+It answers 39 methods (`system.capabilities` lists them, and reports
+`"daemon": true`). The command palette and window actions stay in the GUI — they
+drive its chrome, and nothing else can execute them.
 
 ### The GUI as a view onto the daemon
 
@@ -246,6 +246,30 @@ sent a fresh repaint rather than a stream starting mid-escape-sequence.
 The repaint is reconstructed from the same cell data `surface.screen` serves —
 cursor positioning, SGR runs and text — because new output says nothing about
 what is already on screen.
+
+### Reporting status with no GUI running
+
+Workspace metadata and the Claude hooks live in the daemon, so an agent can
+report what it is doing whether or not a window is open — which is the point.
+
+```bash
+amux-cli workspace set-progress 1 0.4 "compiling"
+amux-cli workspace set-status 1 task "item 6"
+amux-cli workspace add-log 1 "started the build"
+amux-cli workspace report-git 1 main --dirty
+echo '{"message":"Needs approval"}' | amux-cli claude-hook notification
+amux-cli workspace list        # carries status, progress, git and log back
+amux-cli notification list     # records kept even with nothing to show them
+```
+
+The daemon keeps notification *records*, not desktop notifications: showing one
+needs libnotify and a session bus, which `amuxd` deliberately does not link. A
+running GUI turns records into desktop notifications; with none running the
+record is still there to read afterwards.
+
+Known gap: the GUI's sidebar still draws from its own workspace objects, so
+daemon-owned status does not appear there yet. The data is on the wire
+(`workspace.list`), the sidebar just does not read it.
 
 ### Session history
 

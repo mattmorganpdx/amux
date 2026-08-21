@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 const PaneTree = @import("../pane_tree.zig");
 const History = @import("History.zig");
 const Registry = @import("Registry.zig");
+const Notifications = @import("notifications.zig");
 const TabManager = @import("../tab_manager.zig");
 const Workspace = @import("../workspace.zig");
 const session = @import("../session.zig");
@@ -52,6 +53,10 @@ socket_path: ?[]const u8 = null,
 /// an edge one. A counter lets it ask "anything since N?" without the daemon
 /// tracking who is watching, the same way the screen protocol works.
 layout_seq: u64 = 1,
+
+/// Recent notification records. See `notifications.zig` for why the daemon
+/// keeps these rather than showing them.
+notifications: Notifications = .{},
 layout_changed: std.Thread.Condition = .{},
 
 pub const Error = error{
@@ -270,6 +275,101 @@ pub fn stopWaiters(self: *State) void {
 /// mismatch shows up immediately as a picture painted for the wrong width.
 pub fn resizePane(self: *State, pane_id: u64, cols: u16, rows: u16) !void {
     return self.registry.resize(pane_id, cols, rows);
+}
+
+// ------------------------------------------------------------------
+// Workspace metadata
+//
+// The fields live on `Workspace`, which the GUI and the daemon share, so this is
+// only about who owns the writes. The daemon does, because an agent reporting
+// progress should not need a window open to be heard -- which was the whole
+// reason these methods existed only in the GUI before.
+//
+// Deliberately *not* bumping `layout_seq`: a progress update every second would
+// have an attached GUI rebuilding its widget tree every second. Metadata is not
+// layout.
+// ------------------------------------------------------------------
+
+/// Run `f` against a workspace under the state lock.
+fn withWorkspaceLocked(
+    self: *State,
+    ws_id: ?u64,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), *Workspace) void,
+) Error!u64 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const ws = try self.resolveWorkspaceLocked(ws_id);
+    f(ctx, ws);
+    return ws.id;
+}
+
+pub fn setWorkspaceStatus(self: *State, ws_id: ?u64, key: []const u8, value: []const u8) Error!u64 {
+    const Ctx = struct { key: []const u8, value: []const u8 };
+    return self.withWorkspaceLocked(ws_id, Ctx{ .key = key, .value = value }, struct {
+        fn apply(ctx: Ctx, ws: *Workspace) void {
+            ws.setStatusEntry(ctx.key, ctx.value);
+        }
+    }.apply);
+}
+
+pub fn clearWorkspaceStatus(self: *State, ws_id: ?u64) Error!u64 {
+    return self.withWorkspaceLocked(ws_id, {}, struct {
+        fn apply(_: void, ws: *Workspace) void {
+            ws.clearStatus();
+        }
+    }.apply);
+}
+
+pub fn addWorkspaceLog(self: *State, ws_id: ?u64, text: []const u8) Error!u64 {
+    return self.withWorkspaceLocked(ws_id, text, struct {
+        fn apply(t: []const u8, ws: *Workspace) void {
+            ws.addLogEntry(t);
+        }
+    }.apply);
+}
+
+pub fn clearWorkspaceLog(self: *State, ws_id: ?u64) Error!u64 {
+    return self.withWorkspaceLocked(ws_id, {}, struct {
+        fn apply(_: void, ws: *Workspace) void {
+            ws.clearLog();
+        }
+    }.apply);
+}
+
+pub fn setWorkspaceProgress(self: *State, ws_id: ?u64, fraction: f32, label: ?[]const u8) Error!u64 {
+    const Ctx = struct { fraction: f32, label: ?[]const u8 };
+    return self.withWorkspaceLocked(ws_id, Ctx{ .fraction = fraction, .label = label }, struct {
+        fn apply(ctx: Ctx, ws: *Workspace) void {
+            ws.setProgress(ctx.fraction, ctx.label);
+        }
+    }.apply);
+}
+
+pub fn reportWorkspaceGit(self: *State, ws_id: ?u64, branch: []const u8, dirty: bool) Error!u64 {
+    const Ctx = struct { branch: []const u8, dirty: bool };
+    return self.withWorkspaceLocked(ws_id, Ctx{ .branch = branch, .dirty = dirty }, struct {
+        fn apply(ctx: Ctx, ws: *Workspace) void {
+            ws.setGitBranch(ctx.branch);
+            ws.setGitDirty(ctx.dirty);
+        }
+    }.apply);
+}
+
+pub fn setWorkspaceColor(self: *State, ws_id: ?u64, color: []const u8) Error!u64 {
+    return self.withWorkspaceLocked(ws_id, color, struct {
+        fn apply(name: []const u8, ws: *Workspace) void {
+            if (name.len == 0) ws.clearColor() else ws.setColor(name);
+        }
+    }.apply);
+}
+
+pub fn setWorkspacePinned(self: *State, ws_id: ?u64, pinned: bool) Error!u64 {
+    return self.withWorkspaceLocked(ws_id, pinned, struct {
+        fn apply(p: bool, ws: *Workspace) void {
+            ws.pinned = p;
+        }
+    }.apply);
 }
 
 pub fn resolvePane(self: *State, explicit: ?u64) Error!u64 {

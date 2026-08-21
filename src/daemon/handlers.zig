@@ -40,6 +40,18 @@ const methods = [_][]const u8{
     "workspace.select",
     "workspace.close",
     "workspace.rename",
+    "workspace.set_status",
+    "workspace.clear_status",
+    "workspace.add_log",
+    "workspace.clear_log",
+    "workspace.set_progress",
+    "workspace.report_git",
+    "workspace.set_color",
+    "workspace.set_pinned",
+    "notification.create",
+    "notification.list",
+    "notification.clear",
+    "claude.hook",
     "surface.list",
     "surface.current",
     "surface.send_text",
@@ -76,6 +88,18 @@ pub fn dispatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     if (eq(m, "workspace.select")) return workspaceSelect(alloc, state, req);
     if (eq(m, "workspace.close")) return workspaceClose(alloc, state, req);
     if (eq(m, "workspace.rename")) return workspaceRename(alloc, state, req);
+    if (eq(m, "workspace.set_status")) return workspaceSetStatus(alloc, state, req);
+    if (eq(m, "workspace.clear_status")) return workspaceClearStatus(alloc, state, req);
+    if (eq(m, "workspace.add_log")) return workspaceAddLog(alloc, state, req);
+    if (eq(m, "workspace.clear_log")) return workspaceClearLog(alloc, state, req);
+    if (eq(m, "workspace.set_progress")) return workspaceSetProgress(alloc, state, req);
+    if (eq(m, "workspace.report_git")) return workspaceReportGit(alloc, state, req);
+    if (eq(m, "workspace.set_color")) return workspaceSetColor(alloc, state, req);
+    if (eq(m, "workspace.set_pinned")) return workspaceSetPinned(alloc, state, req);
+    if (eq(m, "notification.create")) return notificationCreate(alloc, state, req);
+    if (eq(m, "notification.list")) return notificationList(alloc, state, req);
+    if (eq(m, "notification.clear")) return notificationClear(alloc, state, req);
+    if (eq(m, "claude.hook")) return claudeHook(alloc, state, req);
 
     if (eq(m, "surface.list") or eq(m, "pane.list")) return paneList(alloc, state, req);
     if (eq(m, "surface.current")) return surfaceCurrent(alloc, state, req);
@@ -184,7 +208,7 @@ const WorkspaceJson = struct {
         defer self.alloc.free(title);
 
         const json = try std.fmt.allocPrint(self.alloc,
-            \\{{"id":{d},"ref":"workspace:{d}","title":"{s}","index":{d},"selected":{s},"pinned":{s},"pane_count":{d}}}
+            \\{{"id":{d},"ref":"workspace:{d}","title":"{s}","index":{d},"selected":{s},"pinned":{s},"pane_count":{d}
         , .{
             ws.id,
             ws.id,
@@ -196,6 +220,90 @@ const WorkspaceJson = struct {
         });
         defer self.alloc.free(json);
         try self.out.appendSlice(self.alloc, json);
+
+        // Metadata: only what is set, so a workspace nobody has reported on
+        // stays as terse as it was before any of this existed.
+        if (ws.getGitBranch()) |branch| {
+            const esc = try jsonEscape(self.alloc, branch);
+            defer self.alloc.free(esc);
+            const git = try std.fmt.allocPrint(self.alloc, ",\"git_branch\":\"{s}\",\"git_dirty\":{s}", .{
+                esc, if (ws.git_dirty) "true" else "false",
+            });
+            defer self.alloc.free(git);
+            try self.out.appendSlice(self.alloc, git);
+        }
+        if (ws.progress > 0.0) {
+            const prog = try std.fmt.allocPrint(self.alloc, ",\"progress\":{d:.3}", .{ws.progress});
+            defer self.alloc.free(prog);
+            try self.out.appendSlice(self.alloc, prog);
+            if (ws.getProgressLabel()) |label| {
+                const esc = try jsonEscape(self.alloc, label);
+                defer self.alloc.free(esc);
+                const lab = try std.fmt.allocPrint(self.alloc, ",\"progress_label\":\"{s}\"", .{esc});
+                defer self.alloc.free(lab);
+                try self.out.appendSlice(self.alloc, lab);
+            }
+        }
+        if (ws.status_len > 0) try self.appendStatus(ws);
+        if (ws.log_len > 0) try self.appendLog(ws);
+
+        try self.out.append(self.alloc, '}');
+    }
+
+    /// Status entries are packed as NUL-separated key/value pairs, so unpacking
+    /// them here is what turns them into something a client can read.
+    fn appendStatus(self: *WorkspaceJson, ws: *Workspace) !void {
+        try self.out.appendSlice(self.alloc, ",\"status\":{");
+        var pos: usize = 0;
+        var first_entry = true;
+        while (pos < ws.status_len) {
+            var key_end = pos;
+            while (key_end < ws.status_len and ws.status_buf[key_end] != 0) : (key_end += 1) {}
+            const key = ws.status_buf[pos..key_end];
+
+            const val_start = key_end + 1;
+            var val_end = val_start;
+            while (val_end < ws.status_len and ws.status_buf[val_end] != 0) : (val_end += 1) {}
+            if (val_start > ws.status_len) break;
+            const value = ws.status_buf[val_start..@min(val_end, ws.status_len)];
+
+            if (!first_entry) try self.out.append(self.alloc, ',');
+            first_entry = false;
+
+            const k = try jsonEscape(self.alloc, key);
+            defer self.alloc.free(k);
+            const v = try jsonEscape(self.alloc, value);
+            defer self.alloc.free(v);
+            const entry = try std.fmt.allocPrint(self.alloc, "\"{s}\":\"{s}\"", .{ k, v });
+            defer self.alloc.free(entry);
+            try self.out.appendSlice(self.alloc, entry);
+
+            pos = val_end + 1;
+        }
+        try self.out.append(self.alloc, '}');
+    }
+
+    /// Log entries are NUL-separated lines.
+    fn appendLog(self: *WorkspaceJson, ws: *Workspace) !void {
+        try self.out.appendSlice(self.alloc, ",\"log\":[");
+        var pos: usize = 0;
+        var first_entry = true;
+        while (pos < ws.log_len) {
+            var end = pos;
+            while (end < ws.log_len and ws.log_buf[end] != 0) : (end += 1) {}
+            const line = ws.log_buf[pos..end];
+            if (line.len > 0) {
+                if (!first_entry) try self.out.append(self.alloc, ',');
+                first_entry = false;
+                const esc = try jsonEscape(self.alloc, line);
+                defer self.alloc.free(esc);
+                const item = try std.fmt.allocPrint(self.alloc, "\"{s}\"", .{esc});
+                defer self.alloc.free(item);
+                try self.out.appendSlice(self.alloc, item);
+            }
+            pos = end + 1;
+        }
+        try self.out.append(self.alloc, ']');
     }
 };
 
@@ -299,6 +407,212 @@ fn workspaceRename(alloc: Allocator, state: *State, req: *const protocol.Request
 }
 
 // --- panes / surfaces --------------------------------------------------
+
+// ------------------------------------------------------------------
+// Workspace metadata, notifications and Claude hooks
+//
+// These were GUI-only, which meant an agent could only report what it was doing
+// while a window happened to be open. They belong to the daemon: it is what
+// outlives the window.
+// ------------------------------------------------------------------
+
+/// A one-field reply naming the workspace that was changed.
+fn okWorkspace(alloc: Allocator, id: i64, ws_id: u64) ![]const u8 {
+    const body = try std.fmt.allocPrint(alloc, "{{\"workspace_id\":{d}}}", .{ws_id});
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, id, body);
+}
+
+fn workspaceIdParam(alloc: Allocator, req: *const protocol.Request) ?u64 {
+    return optionalIdParam(alloc, req, "workspace_id");
+}
+
+fn workspaceSetStatus(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const key = req.getStringParam(alloc, "key") orelse
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'key'");
+    defer alloc.free(key);
+    const value = req.getStringParam(alloc, "value") orelse
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'value'");
+    defer alloc.free(value);
+
+    const ws = state.setWorkspaceStatus(workspaceIdParam(alloc, req), key, value) catch |err|
+        return stateError(alloc, req.id, err);
+    return okWorkspace(alloc, req.id, ws);
+}
+
+fn workspaceClearStatus(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const ws = state.clearWorkspaceStatus(workspaceIdParam(alloc, req)) catch |err|
+        return stateError(alloc, req.id, err);
+    return okWorkspace(alloc, req.id, ws);
+}
+
+fn workspaceAddLog(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const text = req.getStringParam(alloc, "text") orelse
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'text'");
+    defer alloc.free(text);
+
+    const ws = state.addWorkspaceLog(workspaceIdParam(alloc, req), text) catch |err|
+        return stateError(alloc, req.id, err);
+    return okWorkspace(alloc, req.id, ws);
+}
+
+fn workspaceClearLog(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const ws = state.clearWorkspaceLog(workspaceIdParam(alloc, req)) catch |err|
+        return stateError(alloc, req.id, err);
+    return okWorkspace(alloc, req.id, ws);
+}
+
+fn workspaceSetProgress(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const frac = req.getFloatParam(alloc, "fraction") orelse
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'fraction'");
+    const label = req.getStringParam(alloc, "label");
+    defer if (label) |l| alloc.free(l);
+
+    const clamped: f32 = @floatCast(@max(0.0, @min(1.0, frac)));
+    const ws = state.setWorkspaceProgress(workspaceIdParam(alloc, req), clamped, label) catch |err|
+        return stateError(alloc, req.id, err);
+    return okWorkspace(alloc, req.id, ws);
+}
+
+fn workspaceReportGit(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const branch = req.getStringParam(alloc, "branch") orelse
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'branch'");
+    defer alloc.free(branch);
+    const dirty = req.getBoolParam(alloc, "dirty") orelse false;
+
+    const ws = state.reportWorkspaceGit(workspaceIdParam(alloc, req), branch, dirty) catch |err|
+        return stateError(alloc, req.id, err);
+    return okWorkspace(alloc, req.id, ws);
+}
+
+fn workspaceSetColor(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const color = req.getStringParam(alloc, "color") orelse "";
+    defer if (color.len > 0) alloc.free(color);
+
+    const ws = state.setWorkspaceColor(workspaceIdParam(alloc, req), color) catch |err|
+        return stateError(alloc, req.id, err);
+    return okWorkspace(alloc, req.id, ws);
+}
+
+fn workspaceSetPinned(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const pinned = req.getBoolParam(alloc, "pinned") orelse true;
+    const ws = state.setWorkspacePinned(workspaceIdParam(alloc, req), pinned) catch |err|
+        return stateError(alloc, req.id, err);
+    return okWorkspace(alloc, req.id, ws);
+}
+
+fn notificationCreate(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const title = req.getStringParam(alloc, "title") orelse try alloc.dupe(u8, "amux");
+    defer alloc.free(title);
+    const body_text = req.getStringParam(alloc, "body") orelse try alloc.dupe(u8, "");
+    defer alloc.free(body_text);
+
+    const id = state.notifications.add(title, body_text, workspaceIdParam(alloc, req));
+    const body = try std.fmt.allocPrint(alloc, "{{\"id\":{d}}}", .{id});
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, req.id, body);
+}
+
+fn notificationList(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const limit = historyLimit(alloc, req);
+    const records = try state.notifications.list(alloc, limit);
+    defer alloc.free(records);
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"notifications\":[");
+    var first = true;
+    for (records) |rec| {
+        if (rec.id == 0) continue; // cleared
+        if (!first) try out.append(alloc, ',');
+        first = false;
+
+        const title = try jsonEscape(alloc, rec.titleSlice());
+        defer alloc.free(title);
+        const body_text = try jsonEscape(alloc, rec.bodySlice());
+        defer alloc.free(body_text);
+
+        const item = try std.fmt.allocPrint(alloc,
+            \\{{"id":{d},"title":"{s}","body":"{s}","workspace_id":{?d},"at":{d}}}
+        , .{ rec.id, title, body_text, rec.workspace_id, rec.at });
+        defer alloc.free(item);
+        try out.appendSlice(alloc, item);
+    }
+    try out.appendSlice(alloc, "]}");
+    return protocol.successResponse(alloc, req.id, out.items);
+}
+
+fn notificationClear(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const id: ?u64 = if (req.getIntParam(alloc, "id")) |v| toU64(v) else null;
+    const cleared = state.notifications.clear(id);
+    const body = try std.fmt.allocPrint(alloc, "{{\"cleared\":{s}}}", .{
+        if (cleared) "true" else "false",
+    });
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, req.id, body);
+}
+
+/// A Claude Code lifecycle hook.
+///
+/// Records what the agent is doing on the workspace, and leaves a notification
+/// record for the events worth interrupting someone over. No desktop
+/// notification: that needs libnotify and a session bus, which amuxd does not
+/// link -- a GUI turns the records into desktop notifications, and when none is
+/// running the record survives to be read afterwards.
+fn claudeHook(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    // `subcommand` is the hook name the CLI sends (session-start, stop,
+    // notification, prompt-submit); `event` is a field out of the hook's own
+    // JSON payload and only sometimes present. The GUI's handler reads the same
+    // field, so both front doors agree.
+    const event = req.getStringParam(alloc, "subcommand") orelse
+        req.getStringParam(alloc, "event") orelse
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'subcommand'");
+    defer alloc.free(event);
+
+    const message = req.getStringParam(alloc, "message");
+    defer if (message) |m| alloc.free(m);
+
+    const ws_param = workspaceIdParam(alloc, req);
+
+    // The status word the sidebar shows, and whether it is worth a record.
+    const status: []const u8 = if (eq(event, "session-start") or eq(event, "active"))
+        "Running"
+    else if (eq(event, "stop") or eq(event, "idle"))
+        "Waiting"
+    else if (eq(event, "notification") or eq(event, "notify"))
+        "Attention"
+    else if (eq(event, "permission"))
+        "Permission"
+    else if (eq(event, "error"))
+        "Error"
+    else if (eq(event, "prompt-submit"))
+        "Running"
+    else
+        "Unknown";
+
+    const ws_id = state.setWorkspaceStatus(ws_param, "claude", status) catch |err|
+        return stateError(alloc, req.id, err);
+
+    // Only events a person would want to know about while looking elsewhere.
+    const notify = eq(event, "stop") or eq(event, "idle") or
+        eq(event, "notification") or eq(event, "notify") or
+        eq(event, "permission") or eq(event, "error");
+
+    var notif_id: u64 = 0;
+    if (notify) {
+        const text = message orelse status;
+        notif_id = state.notifications.add("Claude Code", text, ws_id);
+        _ = state.addWorkspaceLog(ws_id, text) catch {};
+    }
+
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"workspace_id\":{d},\"status\":\"{s}\",\"notification_id\":{d}}}",
+        .{ ws_id, status, notif_id },
+    );
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, req.id, body);
+}
 
 fn paneList(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
     const panes = state.listPanes(alloc) catch |err| return stateError(alloc, req.id, err);

@@ -15,7 +15,7 @@ Roughly dependency-ordered. **D** = de-risking, do early.
 | 3 | ~~`amuxd`: own PTYs and terminal state~~ **done** | 2 |
 | 4 | ~~Move socket handlers behind the daemon, and the pane tree / workspaces with them~~ **done** | 3 |
 | 5 | ~~Screen-state wire protocol (snapshot + delta)~~ **done** | 3 |
-| 6 | GUI becomes an attach client | 1, 5 |
+| 6 | ~~GUI becomes an attach client~~ **done** | 1, 5 |
 | 7 | ~~systemd socket activation~~ **done** | 4 |
 | 8 | ~~Scrollback + history into the daemon; pick a store~~ **done** | 3 |
 
@@ -299,144 +299,104 @@ the delta test, and looking the pane up once instead of on every wake turns the
 close-under-a-waiting-client test into the use-after-free it was written to
 catch.
 
-## 6. GUI becomes an attach client
+## 6. GUI becomes an attach client — **DONE**
 
-Also deletes the GUI's own socket server and the `Window`-based handlers, which
-the daemon now supersedes, and picks up the GUI-chrome methods left out of item
-4: notifications, the command palette, the Claude hooks and sidebar metadata.
+With a daemon reachable the GUI owns no terminals. It fetches `system.layout`,
+builds its workspaces and pane tree from it, and each terminal widget runs
+`amux-cli --socket <path> attach <pane>` onto a daemon-owned pty. Close the
+window and the shells keep running; open it again and they are still there with
+the screen they had.
 
-Drop PTY ownership from the GUI. `terminal_widget.zig` becomes a renderer over a
-locally-held `Terminal` populated from item 5; most of `window.zig`'s widget
-lifecycle logic goes away with it.
+### The plan's approach was not affordable, and this is why
 
-These are the two most recently hardened files in the codebase, so expect to
-retire fixes along with the code — including the `onRealize` surface-leak fix,
-which only exists because the GUI owns surfaces.
+Item 6 called for `terminal_widget.zig` to become a renderer over a locally-held
+`Terminal` populated by item 5. That is not reachable from where amux stands:
 
-## 7. systemd socket activation — **DONE**
+- **The renderer is Zig-only and the C API cannot drive it.** `libghostty.so`
+  exposes surfaces, which own ptys. There is no entry point to feed bytes into
+  one or to point a renderer at a terminal the embedder owns.
+- **A `Terminal` pointer cannot be handed across.** amux compiles its own copy of
+  those types through `ghostty-vt`, and Zig does not guarantee struct layout
+  across two separate builds — amux Debug against libghostty ReleaseFast is a
+  silent-corruption hazard, not a shortcut.
+- **So the renderer would have to be compiled in.** `renderer/OpenGL.zig` imports
+  `../apprt.zig` and `../config.zig`: the whole app runtime and config system,
+  plus font discovery, harfbuzz and shadertoy. That is the doubling item 1
+  thought it had retired, arriving through a different door — with the spike's
+  unsolved `drawFrame` segfault still on top.
 
-`dist/systemd/` holds `amuxd.socket`, `amuxd.service` and an `install.sh` that
-resolves the binary path and enables the socket. After that the first
-`amux-cli` call starts the daemon: nothing is running beforehand and nothing has
-to be launched by hand. Measured at 230ms for the activating call.
+The surface config has a `command` field, which makes the tmux approach
+available: the daemon paints and streams, and the GUI runs a relay inside an
+ordinary Ghostty surface. **That was put to the user as a decision and they chose
+the relay.** The cost is real and worth naming: the GUI's surface still owns a
+pty (of the relay, not the shell), and the byte stream is interpreted twice —
+once by the daemon's `Terminal`, once by the GUI's.
 
-- The socket lives at `%t/amux.sock` (`/run/user/<uid>/amux.sock`): per-user,
-  cleaned up on logout, and not in world-writable `/tmp`.
-- `SocketMode=0600`, which is systemd's equivalent of the umask `server.zig`
-  applies when it binds the socket itself.
-- `Accept=no` (the default), so systemd hands over the listening socket and one
-  daemon serves every client.
-- The daemon implements the `sd_listen_fds` handshake directly rather than
-  linking libsystemd: check `LISTEN_PID` against our own pid, take fd 3, then
-  clear the variables so spawned shells do not inherit them.
+What is *not* a cost: item 5 is what makes attaching work. The repaint is
+reconstructed from the same cell data `surface.screen` serves, because new output
+says nothing about what is already on screen.
 
-Two discovery fixes went with it:
+### What the relay needed
 
-- **The daemon injects `AMUX_SOCKET_PATH` into every pane**, which the GUI did
-  but the daemon had been missing. `amux-cli` run inside a pane therefore
-  reaches the daemon that owns it with no configuration.
-- **The CLI probes `$XDG_RUNTIME_DIR/amux.sock`** between the environment
-  variables and the `/tmp` default. A probe rather than an unconditional
-  preference, so a GUI still serving `/tmp/amux.sock` keeps working.
+`surface.output` returns raw pty bytes; omit the offset to attach and get a
+repaint plus a position to stream from. `surface.input` sends bytes back. Both
+base64, since these streams are mostly control characters, where `\u00xx` costs
+six bytes each against base64's flat third. Panes keep a 256KB ring so a client
+that looked away replays what it missed; falling further behind is reported as a
+gap and answered with a repaint.
 
-### Two bugs that only a real restart could find
+**`surface.resize`, which item 5 had deliberately deferred.** A pane sized
+differently from the window is not merely cramped: the paint positions rows
+explicitly, so an 80-column screen drawn into a 103-column terminal put content
+in the wrong places and dropped the character at the row edge. The attached
+client owns the size, because it is what knows the window.
 
-**`stop()` was breaking systemd's socket permanently.** It called
-`shutdown()` on the listener to wake a blocked `accept()`. That is right for a
-socket we created and wrong for an inherited one: systemd hands the *same*
-socket to the next start, so after the first stop every `accept()` failed with
-`SocketNotListening` forever. Activation worked once and never again. `shutdown()`
-is now only used on a socket we own, and the accept loop `poll()`s with a
-timeout so it notices shutdown without needing the socket broken.
+### Following changes the window did not make
 
-**The accept loop could spin.** With the listener permanently broken it retried
-in a tight loop: 64,946 failures in two minutes, one core saturated, journal
-flooded. It now gives up after 16 consecutive failures, because a listener that
-keeps erroring will not fix itself.
+An agent splitting a pane from the CLI is the normal case here, so the GUI
+watches `system.layout` and rebuilds. Structural actions in the GUI are forwarded
+to the daemon and then applied locally; both sides produce the same ids because
+both run the same `pane_tree.zig` from the same state, and the GUI checks that
+rather than trusting it. A window records the sequence number it has accounted
+for, so its own splits do not trigger a rebuild.
 
-Descriptors are also `CLOEXEC` now -- the listener and every accepted
-connection. Without that each spawned shell inherited the listening socket,
-leaking a descriptor per pane and keeping the socket alive if the daemon died.
+The rebuild restarts every relay in the workspace, which is affordable **only**
+because a relay repaints on attach. In a design where the GUI held the only copy
+of the screen, none of this would be safe.
 
-Verified against real systemd user units: socket listening at 0600 with the
-service inactive, activation on first connect, three stop/restart cycles each
-re-activating cleanly, 0 accept errors and 7.6% CPU on the current instance,
-`AMUX_SOCKET_PATH` present in panes, and `amux-cli` working from inside a pane
-with the daemon's own environment stripped. The units were uninstalled and the
-session file restored afterwards, so nothing was left behind.
+### Deviation: the GUI keeps its socket server
 
-## 8. Scrollback and history into the daemon — **DONE**
+The plan said to delete it. That turned out to be wrong once the daemon owned the
+terminals: the GUI's server is the only way to drive GUI-only chrome — the
+command palette, window actions, sidebar toggles — and the daemon cannot execute
+those. Serving them from the daemon would need server-to-client push, which the
+protocol deliberately avoids (see item 5). So the division is by *ownership*
+rather than by process: terminals, layout and metadata belong to the daemon;
+drawing and chrome belong to the GUI.
 
-The store is **SQLite with FTS5**, linked from the system library (3.45.1 here,
-FTS5 compiled in). Not vendored: it is already a dependency of everything else
-on the machine, `amuxd` still links only libc plus sqlite3, and vendoring
-370k lines to gain nothing was not worth the build time.
+What did move, because it must work with no window open: workspace status,
+progress, logs and git reporting, notification **records**, and the Claude hooks.
+An agent reporting "needs approval" with nothing running should not lose the
+message. The daemon keeps records rather than showing notifications — that needs
+libnotify and a session bus, which `amuxd` does not link.
 
-`src/daemon/History.zig` owns it:
+### Known gaps
 
-- A `sessions` table plus an **external-content FTS5 index** over the content
-  column, kept in sync by `sessions_ai`/`sessions_ad` triggers. External-content
-  means the text is stored once, not once per index.
-- WAL journal, `synchronous=NORMAL`. WAL is checkpointed on close, so a stopped
-  daemon leaves a single self-contained `history.db`.
-- Retention: 5000 entries or 10 MB, whichever binds first, pruned oldest-first
-  on write. Both are overridable (`AMUX_HISTORY_MAX_ENTRIES`,
-  `AMUX_HISTORY_MAX_BYTES`), and `AMUX_HISTORY=0` disables archiving entirely.
-- `record` skips blank scrollback, truncates from the *tail* on a UTF-8
-  boundary (so a split codepoint never reaches the database), and dedups
-  against the previous entry for the same workspace+pane -- otherwise closing a
-  pane that had already been archived stored the same screen twice.
+- **The GUI's sidebar does not show daemon-owned metadata yet.** It draws from
+  its own workspace objects, which come from the layout snapshot; the metadata is
+  on the wire in `workspace.list` but the sidebar does not read it. Wiring it
+  needs a second sequence number, because bumping the layout one on every
+  progress update would rebuild the widget tree every second.
+- **Two VT interpretations**, inherent to relaying. Item 5's cell protocol is
+  still the better answer if the renderer ever becomes compilable.
+- **Memory under heavy layout churn.** 24 externally driven split/close cycles
+  grow RSS by 33MB. Measured against a control: the same churn on a standalone
+  GUI with local panes grows it by 30MB and plateaus, so this is Ghostty surface
+  creation and teardown, which predates this work. Not chased into libghostty.
 
-`State` archives on all three paths that end a terminal: pane close, workspace
-close, and daemon exit, each recorded with its `reason`. Scrollback only exists
-while the terminal does, so `archiveAll` runs before teardown.
-
-Handlers: `history.list` (optionally scoped to a workspace), `history.show`,
-`history.search`, `history.delete`.
-
-**Known gap: `cwd` is recorded but nothing in the daemon sets it yet.** The
-column is wired end to end and asserted by test, but a workspace only gets a cwd
-from the GUI or the Claude hooks, and neither is served by the daemon before
-item 6. So it reads back empty today. Worth a `workspace create --cwd` flag
-whenever a caller needs it -- knowing *where* an archived session ran is most of
-what makes it findable later.
-
-### Where live search ends and database search begins
-
-The plan asked this to be decided deliberately. It is: **`ghostty-vt`'s
-`PageList` search is for live panes, and SQL/FTS5 is for closed sessions.** They
-do not overlap, because they cannot answer each other's question -- FTS5 has no
-row for a pane that is still open, and the `PageList` is gone once the pty
-closes. The seam is the archive write. A future "search everything" call is a
-union of the two, not a third mechanism.
-
-### Query strings are untrusted input
-
-FTS5's `MATCH` grammar makes ordinary text a syntax error: `a-b`, `"unclosed`,
-`NEAR(`, a bare `OR`. A search box that reports "malformed MATCH expression" is
-useless, so `search` **falls back to `LIKE`** when the FTS query does not parse.
-Verified against each of those inputs plus `deploy*`; all return results or an
-empty set, never an error.
-
-### The bug this turn actually found
-
-**Shutdown aborted the daemon.** Wiring archive-on-exit meant stopping the
-daemon for real, repeatedly, and that exposed a race left by item 7. `stop()`
-closed the listening descriptor *before* joining the accept thread. A client
-arriving in that window left `accept()` running on a closed fd, and Zig's std
-maps `EBADF` to `unreachable` -- so a clean SIGTERM became SIGABRT and a core
-dump, taking the archive-on-exit write with it.
-
-The fix is ordering: join first, then close. The accept loop already polls with
-a timeout, so it notices `running` going false on its own and needs no wake-up.
-This is the third bug in this exact teardown path, and the pattern in all three
-is the same -- a resource freed while another thread could still touch it. The
-regression test connects a client and stops in the same breath, twelve rounds;
-reverting the ordering reproduces the abort, so the test bites.
-
-9 store tests, 37 total. Verified live end to end: archive on pane close, on
-workspace close and on daemon exit; entries queryable after a full daemon
-restart; FTS finding a marker in the right pane; workspace-scoped listing;
-delete removing the row *and* its index entry; and two consecutive clean
-shutdowns at exit 0 with the WAL checkpointed.
-
+63 tests. Verified live: a GUI showing content that existed before it opened,
+live output arriving, GUI-initiated splits creating daemon panes with matching
+ids, an agent's split and new workspace appearing in the GUI, panes surviving the
+window closing and reopening, 48 rebuilds under external churn with no panics,
+agent status and hooks recorded with no GUI running, the no-daemon path still
+running local shells, and clean daemon exits with relays attached.

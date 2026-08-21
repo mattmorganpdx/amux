@@ -33,6 +33,7 @@ const methods = [_][]const u8{
     "system.ping",
     "system.identify",
     "system.capabilities",
+    "system.layout",
     "workspace.list",
     "workspace.create",
     "workspace.current",
@@ -46,6 +47,7 @@ const methods = [_][]const u8{
     "surface.screen",
     "surface.output",
     "surface.input",
+    "surface.resize",
     "surface.send_key",
     "surface.split",
     "surface.close",
@@ -66,6 +68,7 @@ pub fn dispatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     if (eq(m, "system.ping")) return protocol.successResponse(alloc, req.id, "{\"pong\":true}");
     if (eq(m, "system.capabilities")) return capabilities(alloc, req);
     if (eq(m, "system.identify")) return identify(alloc, state, req);
+    if (eq(m, "system.layout")) return systemLayout(alloc, state, req);
 
     if (eq(m, "workspace.list")) return workspaceList(alloc, state, req);
     if (eq(m, "workspace.create")) return workspaceCreate(alloc, state, req);
@@ -81,6 +84,7 @@ pub fn dispatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     if (eq(m, "surface.screen")) return surfaceScreen(alloc, state, req);
     if (eq(m, "surface.output")) return surfaceOutput(alloc, state, req);
     if (eq(m, "surface.input")) return surfaceInput(alloc, state, req);
+    if (eq(m, "surface.resize")) return surfaceResize(alloc, state, req);
     if (eq(m, "surface.send_key")) return sendKey(alloc, state, req);
     if (eq(m, "surface.split")) return split(alloc, state, req);
     if (eq(m, "surface.close")) return closePane(alloc, state, req);
@@ -194,6 +198,41 @@ const WorkspaceJson = struct {
         try self.out.appendSlice(self.alloc, json);
     }
 };
+
+/// The whole layout: workspaces, their pane trees and which is selected.
+///
+/// The body is the same JSON `session.zig` writes to disk, so a client restores
+/// from the daemon using the code it already had for restoring from a file --
+/// and pane node ids survive, which is what makes a client's pane ids and the
+/// daemon's the same numbers.
+///
+/// `since` plus `timeout_ms` makes it a wait, so a GUI learns about a pane an
+/// agent split from the CLI without polling for it.
+fn systemLayout(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const since: u64 = if (req.getIntParam(alloc, "since")) |v| toU64(v) orelse 0 else 0;
+    const timeout: u32 = if (req.getIntParam(alloc, "timeout_ms")) |v|
+        @intCast(@max(0, @min(v, @as(i64, max_screen_timeout_ms))))
+    else
+        0;
+
+    const res = state.layoutJson(alloc, since, timeout) catch |err|
+        return stateError(alloc, req.id, err);
+
+    if (res == null) {
+        const body = try std.fmt.allocPrint(alloc, "{{\"seq\":{d},\"changed\":false}}", .{since});
+        defer alloc.free(body);
+        return protocol.successResponse(alloc, req.id, body);
+    }
+
+    defer alloc.free(res.?.json);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"seq\":{d},\"layout\":{s}}}",
+        .{ res.?.seq, res.?.json },
+    );
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, req.id, body);
+}
 
 fn workspaceList(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .{};
@@ -460,6 +499,35 @@ fn surfaceInput(alloc: Allocator, state: *State, req: *const protocol.Request) !
 
     const id = state.resolvePane(explicit) catch 0;
     const body = try std.fmt.allocPrint(alloc, "{{\"surface_id\":{d},\"wrote\":{d}}}", .{ id, n });
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, req.id, body);
+}
+
+/// Set a pane's terminal size.
+///
+/// Driven by whatever is attached, because that is what knows how big the window
+/// is. A pane painted for 80 columns into a 103-column terminal does not merely
+/// look narrow -- rows land in the wrong places and characters at the edge go
+/// missing, which is how this turned out to be needed.
+fn surfaceResize(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const explicit = optionalIdParam(alloc, req, "surface_id");
+    const cols_i = req.getIntParam(alloc, "cols") orelse
+        return protocol.errorResponse(alloc, req.id, "invalid_params", "cols is required");
+    const rows_i = req.getIntParam(alloc, "rows") orelse
+        return protocol.errorResponse(alloc, req.id, "invalid_params", "rows is required");
+    if (cols_i < 1 or rows_i < 1 or cols_i > 10_000 or rows_i > 10_000) {
+        return protocol.errorResponse(alloc, req.id, "invalid_params", "cols and rows must be sane");
+    }
+
+    const pane_id = state.resolvePane(explicit) catch |err| return stateError(alloc, req.id, err);
+    state.resizePane(pane_id, @intCast(cols_i), @intCast(rows_i)) catch |err|
+        return stateError(alloc, req.id, err);
+
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"surface_id\":{d},\"cols\":{d},\"rows\":{d}}}",
+        .{ pane_id, cols_i, rows_i },
+    );
     defer alloc.free(body);
     return protocol.successResponse(alloc, req.id, body);
 }

@@ -5,6 +5,7 @@ const Window = @import("window.zig");
 const Server = @import("socket/server.zig");
 const shortcuts = @import("shortcuts.zig");
 const session = @import("session.zig");
+const daemon_client = @import("daemon_client.zig");
 
 const log = std.log.scoped(.main);
 
@@ -42,7 +43,9 @@ pub fn main() !void {
     );
 
     // Save session before cleanup (include history IDs from the close-request save)
-    if (global_window) |window| {
+    // Not when the daemon owns the layout: it persists its own, and a second
+    // description of the same session on disk is only there to go stale.
+    if (global_window) |window| if (window.daemon_socket == null) {
         const alloc = std.heap.c_allocator;
         if (session.captureSessionWithHistory(alloc, &window.tab_manager, &window.pane_history_ids)) |snap| {
             defer session.freeSessionSnapshot(alloc, &snap);
@@ -52,7 +55,7 @@ pub fn main() !void {
         } else |err| {
             log.warn("Failed to capture session on exit: {}", .{err});
         }
-    }
+    };
 
     // Cleanup — order matters: drain socket handlers, then free every surface,
     // then the ghostty app. Freeing the app while any surface is still alive
@@ -223,7 +226,7 @@ fn onCloseRequest(_: *c.GtkWindow, _: c.gpointer) callconv(.c) c.gboolean {
     }
 
     // Save session before the window is destroyed (include history IDs)
-    if (global_window) |window| {
+    if (global_window) |window| if (window.daemon_socket == null) {
         const alloc = std.heap.c_allocator;
         if (session.captureSessionWithHistory(alloc, &window.tab_manager, &window.pane_history_ids)) |snap| {
             defer session.freeSessionSnapshot(alloc, &snap);
@@ -233,7 +236,7 @@ fn onCloseRequest(_: *c.GtkWindow, _: c.gpointer) callconv(.c) c.gboolean {
         } else |err| {
             log.warn("Failed to capture session on close: {}", .{err});
         }
-    }
+    };
 
     return 0; // let GTK destroy the window, which quits the application
 }
@@ -269,11 +272,46 @@ fn onActivate(gtk_app: *c.GtkApplication, _: c.gpointer) callconv(.c) void {
     // each other's layout when both are running.
     session.bindInstance(@import("socket_path.zig").forServer());
 
-    // Try to restore session from disk
+    // Prefer the daemon's layout over the local session file.
+    //
+    // The daemon owns the terminals, so its layout is the truth about what
+    // exists; the file on disk only describes what this GUI last drew. When a
+    // daemon is reachable the window becomes a view onto it, and closing the
+    // window leaves the shells running.
+    const alloc_c = std.heap.c_allocator;
+    const daemon_sock: ?[]const u8 = blk_sock: {
+        const own: ?[]const u8 = if (global_server) |srv| srv.socket_path else null;
+        break :blk_sock daemon_client.discover(alloc_c, own);
+    };
+
     const window = blk: {
+        if (daemon_sock) |sock| {
+            if (daemon_client.layout(alloc_c, sock, 0, 0)) |maybe| {
+                if (maybe) |lay| {
+                    defer alloc_c.free(lay.json);
+                    if (session.deserializeSession(alloc_c, lay.json)) |snap| {
+                        defer session.freeSessionSnapshot(alloc_c, &snap);
+                        if (Window.createFromSession(gtk_app, app, &snap, sock)) |w| {
+                            w.layout_seq = lay.seq;
+                            log.info("attached to daemon at {s} ({d} workspaces)", .{ sock, snap.workspaces.len });
+                            break :blk w;
+                        } else |err| {
+                            log.warn("could not build a window from the daemon layout: {}", .{err});
+                        }
+                    } else |err| {
+                        log.warn("could not parse the daemon layout: {}", .{err});
+                    }
+                }
+            } else |err| {
+                log.warn("could not read the daemon layout: {}", .{err});
+            }
+        } else {
+            log.info("no daemon found; running terminals locally", .{});
+        }
+
         if (!session.isRestoreDisabled()) {
             if (session.loadSessionFile(std.heap.c_allocator)) |snap| {
-                if (Window.createFromSession(gtk_app, app, &snap)) |w| {
+                if (Window.createFromSession(gtk_app, app, &snap, null)) |w| {
                     log.info("Session restored ({d} workspaces)", .{snap.workspaces.len});
                     break :blk w;
                 } else |err| {

@@ -44,6 +44,16 @@ history: ?*History = null,
 /// amuxd before serving; tests leave it null.
 socket_path: ?[]const u8 = null,
 
+/// Bumped whenever the shape of things changes: a workspace or pane appearing,
+/// disappearing, being renamed or being selected.
+///
+/// A GUI showing the daemon's layout has to learn about changes it did not
+/// make -- an agent splitting a pane from the CLI is the normal case here, not
+/// an edge one. A counter lets it ask "anything since N?" without the daemon
+/// tracking who is watching, the same way the screen protocol works.
+layout_seq: u64 = 1,
+layout_changed: std.Thread.Condition = .{},
+
 pub const Error = error{
     WorkspaceNotFound,
     PaneNotFound,
@@ -85,6 +95,7 @@ pub fn createWorkspace(self: *State, title: ?[]const u8, cwd: ?[]const u8) !u64 
     try self.spawnPaneLocked(pane_id, ws);
 
     self.tab_manager.selectById(ws.id);
+    self.bumpLayoutLocked();
     return ws.id;
 }
 
@@ -103,6 +114,7 @@ pub fn closeWorkspace(self: *State, ws_id: u64) Error!void {
     }
 
     _ = self.tab_manager.closeWorkspaceById(ws_id);
+    self.bumpLayoutLocked();
 }
 
 pub fn selectWorkspace(self: *State, ws_id: u64) Error!void {
@@ -110,6 +122,7 @@ pub fn selectWorkspace(self: *State, ws_id: u64) Error!void {
     defer self.mutex.unlock();
     if (self.tab_manager.findById(ws_id) == null) return error.WorkspaceNotFound;
     self.tab_manager.selectById(ws_id);
+    self.bumpLayoutLocked();
 }
 
 pub fn renameWorkspace(self: *State, ws_id: ?u64, title: []const u8) Error!u64 {
@@ -117,6 +130,7 @@ pub fn renameWorkspace(self: *State, ws_id: ?u64, title: []const u8) Error!u64 {
     defer self.mutex.unlock();
     const ws = try self.resolveWorkspaceLocked(ws_id);
     ws.setTitle(title);
+    self.bumpLayoutLocked();
     return ws.id;
 }
 
@@ -145,6 +159,7 @@ pub fn splitPane(self: *State, pane_id: u64, direction: PaneTree.SplitDirection)
     errdefer _ = ws.pane_tree.close(new_id) catch {};
 
     try self.spawnPaneLocked(new_id, ws);
+    self.bumpLayoutLocked();
     return new_id;
 }
 
@@ -160,6 +175,7 @@ pub fn closePane(self: *State, pane_id: u64) Error!void {
     self.archivePaneLocked(pane_id, ws, "pane_close");
     _ = ws.pane_tree.close(pane_id) catch return error.PaneNotFound;
     self.registry.close(pane_id) catch {};
+    self.bumpLayoutLocked();
 }
 
 pub fn writePane(self: *State, pane_id: ?u64, bytes: []const u8) !void {
@@ -208,6 +224,52 @@ pub fn paneOutput(
     timeout_ms: u32,
 ) !?Registry.OutputResult {
     return self.registry.output(pane_id, alloc, from, timeout_ms);
+}
+
+/// Note a structural change. Caller holds `mutex`.
+fn bumpLayoutLocked(self: *State) void {
+    self.layout_seq += 1;
+    self.layout_changed.broadcast();
+}
+
+/// The current layout as the same JSON `session.zig` writes to disk.
+///
+/// Reusing that format is what lets the GUI restore from the daemon with the
+/// code it already had for restoring from a file -- including preserving pane
+/// node ids, which is what makes the GUI's pane ids and the daemon's the same
+/// numbers.
+pub fn layoutJson(self: *State, alloc: Allocator, since: u64, timeout_ms: u32) !?struct { seq: u64, json: []const u8 } {
+    const total_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
+    var timer: ?std.time.Timer = std.time.Timer.start() catch null;
+
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    while (true) {
+        if (self.layout_seq != since) {
+            var snap = try session.captureSession(alloc, &self.tab_manager);
+            defer session.freeSessionSnapshot(alloc, &snap);
+            const json = try session.serializeSession(alloc, &snap);
+            return .{ .seq = self.layout_seq, .json = json };
+        }
+        const elapsed = if (timer) |*t| t.read() else total_ns;
+        if (elapsed >= total_ns) return null;
+        const slice = @min(total_ns - elapsed, 250 * std.time.ns_per_ms);
+        self.layout_changed.timedWait(&self.mutex, slice) catch {};
+    }
+}
+
+/// Release clients blocked in a wait. Called on the way out, before teardown.
+pub fn stopWaiters(self: *State) void {
+    self.registry.stopWaiters();
+}
+
+/// Resize a pane's terminal and its pty.
+///
+/// The attached client drives this: it knows how big its window is, and a
+/// mismatch shows up immediately as a picture painted for the wrong width.
+pub fn resizePane(self: *State, pane_id: u64, cols: u16, rows: u16) !void {
+    return self.registry.resize(pane_id, cols, rows);
 }
 
 pub fn resolvePane(self: *State, explicit: ?u64) Error!u64 {
@@ -332,6 +394,7 @@ pub fn restoreSession(self: *State) !usize {
     }
 
     if (snap.selected_workspace_index) |i| self.tab_manager.selectIndex(i);
+    self.bumpLayoutLocked();
     log.info("restored {d} workspace(s)", .{snap.workspaces.len});
     return snap.workspaces.len;
 }

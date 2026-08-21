@@ -566,6 +566,11 @@ pub fn onAutosave(userdata: c.gpointer) callconv(.c) c.gboolean {
     const Window = @import("window.zig");
     const window: *Window = @ptrCast(@alignCast(userdata));
 
+    // The daemon owns the layout when the window is a view onto it, and it
+    // persists its own. Writing ours too would leave a second, staler
+    // description of the same session on disk.
+    if (window.daemon_socket != null) return 1;
+
     const alloc = std.heap.c_allocator;
     const snap = captureSessionWithHistory(alloc, &window.tab_manager, &window.pane_history_ids) catch |err| {
         log.warn("Failed to capture session: {}", .{err});

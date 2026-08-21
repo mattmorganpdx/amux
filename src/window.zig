@@ -10,6 +10,7 @@ const CommandPalette = @import("command_palette.zig");
 const SearchOverlay = @import("search_overlay.zig");
 const HistoryBrowser = @import("history_browser.zig");
 const session = @import("session.zig");
+const daemon_client = @import("daemon_client.zig");
 const history = @import("history.zig");
 
 const log = std.log.scoped(.window);
@@ -72,6 +73,20 @@ history_browser: *HistoryBrowser,
 /// Map from pane ID to the last saved history entry ID.
 /// Populated by saveTerminalHistory, consumed by session capture.
 pane_history_ids: std.AutoHashMap(PaneTree.NodeId, []const u8),
+
+/// The daemon this window is a view onto, or null when running standalone.
+///
+/// When set, every pane's content comes from a daemon-owned pty via
+/// `amux-cli attach`, so closing the window leaves the shells running and
+/// reopening it shows them again. When null the GUI runs terminals of its own,
+/// which is the fallback for no daemon being reachable.
+daemon_socket: ?[]const u8 = null,
+
+/// The layout sequence this window has applied. See `system.layout`.
+layout_seq: u64 = 0,
+
+/// `daemon_socket` with a NUL terminator, for the surface config.
+daemon_socket_z: ?[:0]const u8 = null,
 
 /// Allocator
 alloc: Allocator,
@@ -177,7 +192,16 @@ pub fn create(gtk_app: *c.GtkApplication, app: *App) !*Window {
 }
 
 /// Create a window and restore state from a session snapshot.
-pub fn createFromSession(gtk_app: *c.GtkApplication, app: *App, snap: *const session.SessionSnapshot) !*Window {
+///
+/// `daemon_socket` has to arrive here rather than being assigned afterwards:
+/// this builds the pane widgets, and each one decides at construction time
+/// whether it runs a relay onto a daemon pane or a shell of its own.
+pub fn createFromSession(
+    gtk_app: *c.GtkApplication,
+    app: *App,
+    snap: *const session.SessionSnapshot,
+    daemon_socket: ?[]const u8,
+) !*Window {
     const alloc = std.heap.c_allocator;
 
     // Create the application window (same setup as create)
@@ -216,6 +240,7 @@ pub fn createFromSession(gtk_app: *c.GtkApplication, app: *App, snap: *const ses
         .command_palette = undefined,
         .search_overlay = undefined,
         .history_browser = undefined,
+        .daemon_socket = daemon_socket,
         .alloc = alloc,
     };
 
@@ -411,11 +436,28 @@ fn buildNodeWidget(self: *Window, ws: *Workspace, node_id: PaneTree.NodeId) !*c.
 
             // Create a new terminal widget for this pane
             const main_mod = @import("main.zig");
-            const sock_path: ?[*:0]const u8 = if (main_mod.global_server) |srv| srv.getSocketPathZ() else null;
+            const sock_path: ?[*:0]const u8 = if (self.daemonSocketZ()) |dz|
+                dz
+            else if (main_mod.global_server) |srv|
+                srv.getSocketPathZ()
+            else
+                null;
             const tw = try TerminalWidget.create(self.app, ws.getCwd(), node_id, ws.id, sock_path);
 
-            // If there's a saved history for this pane, set up a command to restore scrollback
-            if (self.pane_history_ids.get(node_id)) |hist_id| {
+            if (self.daemon_socket != null) {
+                // The pane's pty lives in the daemon, so this terminal runs a
+                // relay onto it rather than a shell of its own. Pane node ids
+                // are the daemon's pane ids -- the layout came from there, and
+                // the session format preserves them -- so the id needs no
+                // translation.
+                if (self.buildAttachCommand(node_id)) |cmd| {
+                    tw.command = cmd;
+                } else {
+                    log.warn("could not build attach command for pane {d}; running a local shell", .{node_id});
+                }
+            } else if (self.pane_history_ids.get(node_id)) |hist_id| {
+                // Only meaningful for a locally-owned terminal: a daemon pane
+                // already has its scrollback.
                 const cmd = self.buildHistoryRestoreCommand(hist_id);
                 if (cmd) |c_str| {
                     tw.command = c_str;
@@ -518,8 +560,35 @@ pub fn splitFocused(self: *Window, direction: PaneTree.SplitDirection) !void {
     // Get the current widget for the focused pane
     const old_widget = self.node_widgets.get(focused) orelse return;
 
+    // When the daemon owns the terminals, it has to make the pane -- a widget
+    // relaying onto a pane that does not exist shows nothing but an error.
+    //
+    // Both sides then split their own copy of the tree. That produces the same
+    // ids rather than by luck: the GUI's tree came from the daemon's, the id
+    // counters came with it, and both run the same `pane_tree.zig`. It is still
+    // checked below, because "should be identical" is not "is identical" once
+    // anything else has touched the daemon.
+    var daemon_pane: ?u64 = null;
+    if (self.daemon_socket) |sock| {
+        daemon_pane = daemon_client.splitPane(self.alloc, sock, focused, directionName(direction)) catch |err| {
+            log.warn("daemon refused the split: {}", .{err});
+            return;
+        };
+    }
+
     // Perform the tree split
     const new_pane_id = try ws.pane_tree.split(focused, direction);
+
+    if (daemon_pane) |remote| {
+        if (remote != new_pane_id) {
+            // The trees have drifted, so this pane would relay onto the wrong
+            // terminal. Say so rather than silently showing the wrong output.
+            log.err(
+                "pane id drift: daemon made {d}, this window made {d}; pane will not attach",
+                .{ remote, new_pane_id },
+            );
+        }
+    }
 
     // Now we need to update the GTK widget tree:
     // The old pane is now a child of a new split node.
@@ -537,8 +606,16 @@ pub fn splitFocused(self: *Window, direction: PaneTree.SplitDirection) !void {
 
     // Create a new terminal widget for the new pane, inheriting workspace cwd
     const main_mod = @import("main.zig");
-    const sock_path: ?[*:0]const u8 = if (main_mod.global_server) |srv| srv.getSocketPathZ() else null;
+    const sock_path: ?[*:0]const u8 = if (self.daemonSocketZ()) |dz|
+        dz
+    else if (main_mod.global_server) |srv|
+        srv.getSocketPathZ()
+    else
+        null;
     const new_tw = try TerminalWidget.create(self.app, ws.getCwd(), new_pane_id, ws.id, sock_path);
+    if (self.daemon_socket != null) {
+        if (self.buildAttachCommand(new_pane_id)) |cmd| new_tw.command = cmd;
+    }
     try self.pane_widgets.put(new_pane_id, new_tw);
     try self.node_widgets.put(new_pane_id, new_tw.widget());
 
@@ -615,6 +692,46 @@ pub fn splitFocused(self: *Window, direction: PaneTree.SplitDirection) !void {
 }
 
 /// Build a shell command that cats the history file then execs the user's shell.
+/// The wire name for a split direction.
+fn directionName(direction: PaneTree.SplitDirection) []const u8 {
+    return switch (direction) {
+        .left => "left",
+        .right => "right",
+        .up => "up",
+        .down => "down",
+    };
+}
+
+/// The daemon socket as a NUL-terminated string, cached for the surface config.
+fn daemonSocketZ(self: *Window) ?[*:0]const u8 {
+    const sock = self.daemon_socket orelse return null;
+    if (self.daemon_socket_z == null) {
+        const duped = self.alloc.dupeZ(u8, sock) catch return null;
+        self.daemon_socket_z = duped;
+    }
+    return self.daemon_socket_z.?.ptr;
+}
+
+/// `amux-cli --socket <path> attach <pane>`, the command that makes a terminal a
+/// view onto a daemon-owned pane.
+///
+/// The socket is named on the command line rather than left to the relay's
+/// environment. Ghostty does not hand the child this process's environment, so
+/// an inherited `AMUX_SOCKET` is not there to be found -- the first version
+/// relied on it and every pane came up reporting it could not connect.
+fn buildAttachCommand(self: *Window, node_id: PaneTree.NodeId) ?[*:0]const u8 {
+    const sock = self.daemon_socket orelse return null;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cli = daemon_client.cliPath(&path_buf) orelse return null;
+
+    var cmd_buf: [2 * std.fs.max_path_bytes + 64]u8 = undefined;
+    const cmd = std.fmt.bufPrintZ(&cmd_buf, "{s} --socket {s} attach {d}", .{
+        cli, sock, node_id,
+    }) catch return null;
+    const duped = self.alloc.dupeZ(u8, cmd) catch return null;
+    return duped.ptr;
+}
+
 fn buildHistoryRestoreCommand(self: *Window, hist_id: []const u8) ?[*:0]const u8 {
     // Resolve the history file path
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -652,6 +769,7 @@ fn extractHistoryIds(self: *Window, layout: *const session.LayoutSnapshot) void 
 /// Save scrollback history for a single terminal pane.
 /// Must be called on the GTK main thread (before the terminal is destroyed).
 pub fn saveTerminalHistory(self: *Window, ws: *Workspace, pane_id: PaneTree.NodeId, reason: []const u8) void {
+    if (self.daemon_socket != null) return; // see saveAllHistory
     const tw = self.pane_widgets.get(pane_id) orelse {
         log.warn("History: pane {d} not in pane_widgets", .{pane_id});
         return;
@@ -732,6 +850,10 @@ fn collectAndSavePanes(self: *Window, ws: *Workspace, node_id_opt: ?PaneTree.Nod
 
 /// Save scrollback history for all panes across all workspaces.
 pub fn saveAllHistory(self: *Window, reason: []const u8) void {
+    // A daemon-backed pane's scrollback belongs to the daemon, which archives it
+    // when the pane closes. Saving here would store the relay's view of it a
+    // second time, under this window's history rather than the session's.
+    if (self.daemon_socket != null) return;
     log.info("Saving history for {d} workspaces (reason: {s})", .{ self.tab_manager.workspaces.items.len, reason });
     for (self.tab_manager.workspaces.items) |ws| {
         self.saveWorkspaceHistory(ws, reason);
@@ -749,8 +871,18 @@ pub fn closeFocused(self: *Window) !void {
     // Get the terminal widget for cleanup
     const tw = self.pane_widgets.get(focused) orelse return;
 
-    // Save scrollback before destroying the terminal
-    self.saveTerminalHistory(ws, focused, "pane_close");
+    // The daemon owns the pty, so closing the widget alone would leave the
+    // terminal running with nothing attached to it.
+    if (self.daemon_socket) |sock| {
+        daemon_client.closePane(self.alloc, sock, focused) catch |err| {
+            log.warn("daemon refused the close: {}", .{err});
+            return;
+        };
+    } else {
+        // Only worth saving for a locally-owned terminal: the daemon archives
+        // its own panes when it closes them.
+        self.saveTerminalHistory(ws, focused, "pane_close");
+    }
 
     // Get parent info before closing
     const pane_node = ws.pane_tree.getNode(focused) orelse return;
@@ -839,6 +971,15 @@ pub fn closeFocused(self: *Window) !void {
 
 /// Create a new workspace and switch to it.
 pub fn createWorkspace(self: *Window) !void {
+    // Same reasoning as `splitFocused`: the daemon has to make the workspace,
+    // because it is what will own the pane inside it.
+    if (self.daemon_socket) |sock| {
+        daemon_client.createWorkspace(self.alloc, sock) catch |err| {
+            log.warn("daemon refused the new workspace: {}", .{err});
+            return;
+        };
+    }
+
     const ws = try self.tab_manager.createWorkspace();
     self.tab_manager.selectIndex(self.tab_manager.workspaces.items.len - 1);
 

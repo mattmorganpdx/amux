@@ -139,9 +139,33 @@ AMUX_SOCKET=/tmp/amuxd.sock amuxd &
 AMUX_SOCKET=/tmp/amuxd.sock amux-cli run "echo hello"
 ```
 
-It answers 25 methods (`system.capabilities` lists them, and reports
+It answers 27 methods (`system.capabilities` lists them, and reports
 `"daemon": true`). Notifications, the command palette, the Claude hooks and the
 sidebar metadata methods are GUI chrome and are not served yet.
+
+### The GUI as a view onto the daemon
+
+When a daemon is reachable, the GUI is a client of it rather than an owner of
+terminals. On startup it fetches `system.layout` — the same session format
+`session.zig` writes to disk, so pane node ids come across unchanged and a GUI
+pane id *is* a daemon pane id — and each terminal widget runs
+`amux-cli --socket <path> attach <pane>` instead of a shell. Close the window and
+the shells keep running; open it again and they are still there.
+
+Splits, closes and new workspaces are forwarded to the daemon, which owns them.
+Both sides then apply the change to their own copy of the tree, which yields the
+same ids because both run the same `pane_tree.zig` from the same state; the GUI
+checks that and logs loudly if they ever drift.
+
+The GUI finds the daemon via `AMUX_DAEMON_SOCKET`, else `$XDG_RUNTIME_DIR/amux.sock`,
+else `/tmp/amux.sock` — skipping its own socket and requiring `"daemon": true`
+from `system.capabilities`, so it cannot end up mirroring itself. With no daemon
+reachable it runs terminals locally exactly as before.
+
+An attached client owns the terminal size: the relay sends `surface.resize` for
+its window and repaints. A pane sized differently from the window does not just
+look cramped — the paint positions rows explicitly, so content lands in the wrong
+places.
 
 **The GUI still runs its own socket server too, and both default to
 `/tmp/amux.sock`** — give one an `AMUX_SOCKET` override while both exist. The

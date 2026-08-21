@@ -124,6 +124,9 @@ fn serve(alloc: std.mem.Allocator) !u8 {
     }
 
     log.info("shutting down", .{});
+    // Before anything is torn down: a client parked in a long poll is holding
+    // the registry it is about to lose.
+    state.stopWaiters();
     // Scrollback only exists while the terminal does, so capture it before the
     // panes go away with the process.
     state.archiveAll("daemon_exit");

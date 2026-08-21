@@ -1411,6 +1411,33 @@ fn relayInput(relay: *Relay) void {
     relay.running.store(false, .release);
 }
 
+/// This terminal's size, or null if it is not a terminal.
+fn terminalSize() ?struct { cols: u16, rows: u16 } {
+    var ws: posix.winsize = undefined;
+    switch (posix.errno(std.c.ioctl(posix.STDIN_FILENO, posix.T.IOCGWINSZ, &ws))) {
+        .SUCCESS => {},
+        else => return null,
+    }
+    if (ws.col == 0 or ws.row == 0) return null;
+    return .{ .cols = ws.col, .rows = ws.row };
+}
+
+/// Tell the daemon how big this terminal is.
+///
+/// The attached client owns the size: the daemon paints row by row with explicit
+/// positioning, so a pane sized differently from the window puts content in the
+/// wrong places rather than merely looking cramped.
+fn sendResize(conn: *Conn, surface_id: ?i64, cols: u16, rows: u16) bool {
+    var buf: [96]u8 = undefined;
+    var p = Params.init(&buf);
+    if (surface_id) |sid| p.int("surface_id", sid);
+    p.int("cols", @intCast(cols));
+    p.int("rows", @intCast(rows));
+    const params = p.finish() orelse return false;
+    _ = conn.call("surface.resize", params) catch return false;
+    return true;
+}
+
 /// Put the terminal in raw mode so keystrokes reach the daemon unchanged.
 ///
 /// Without this the local line discipline would echo, buffer until Enter, and
@@ -1456,6 +1483,11 @@ fn attachCommand(socket_path: []const u8, surface_id: ?i64, stderr: std.fs.File)
     var decode_buf: std.ArrayListUnmanaged(u8) = .{};
     defer decode_buf.deinit(alloc);
 
+    // Match the pane to this window before painting it, so the paint is built
+    // for the size it is about to be drawn at.
+    var size = terminalSize();
+    if (size) |sz| _ = sendResize(&out_conn, surface_id, sz.cols, sz.rows);
+
     var params_buf: [128]u8 = undefined;
     {
         const params = relay.attachParams(&params_buf) orelse return;
@@ -1470,12 +1502,33 @@ fn attachCommand(socket_path: []const u8, surface_id: ?i64, stderr: std.fs.File)
     defer if (input_thread) |t| t.detach();
 
     while (relay.running.load(.acquire)) {
+        // A window that changed size needs the pane resized and repainted.
+        // Checked on each pass rather than driven by SIGWINCH: the wait below is
+        // where this thread spends its time, and a signal landing in the middle
+        // of it would have to be turned into something the loop could see
+        // anyway. One ioctl a second is cheaper than that machinery.
+        if (terminalSize()) |now| {
+            const changed = if (size) |was| was.cols != now.cols or was.rows != now.rows else true;
+            if (changed) {
+                size = now;
+                if (sendResize(&out_conn, relay.surface_id, now.cols, now.rows)) {
+                    // Repaint at the new size: offsets from before the resize
+                    // describe a differently shaped screen.
+                    const attach = relay.attachParams(&params_buf) orelse break;
+                    const resp = out_conn.call("surface.output", attach) catch break;
+                    const next = writeRelayChunk(alloc, resp, stdout, &decode_buf, stderr) catch break;
+                    offset = next orelse break;
+                    continue;
+                }
+            }
+        }
+
         var p = Params.init(&params_buf);
         if (relay.surface_id) |sid| p.int("surface_id", sid);
         p.int("offset", offset);
-        // Long enough that an idle pane costs almost nothing, short enough that
-        // a daemon that went away is noticed.
-        p.int("timeout_ms", 20_000);
+        // Short enough that a resize is noticed promptly, long enough that an
+        // idle pane costs about one request a second.
+        p.int("timeout_ms", 1000);
         const params = p.finish() orelse break;
 
         const resp = out_conn.call("surface.output", params) catch break;

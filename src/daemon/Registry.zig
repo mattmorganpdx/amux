@@ -29,6 +29,16 @@ panes: std.AutoHashMapUnmanaged(u64, *Pane) = .{},
 /// hold an id, never a pointer.
 change: std.Thread.Condition = .{},
 
+/// Set on the way out, so a client parked in a long wait is answered instead of
+/// being left holding a registry that is about to be freed.
+///
+/// Without this, shutdown raced the waiters: a relay's twenty-second poll almost
+/// always had a thread inside `screen` or `output` when the daemon stopped, the
+/// client drain gave up on it, and teardown freed the pane map underneath it.
+/// That surfaced as "incorrect alignment" in the hash map -- a use-after-free by
+/// another name.
+stopping: bool = false,
+
 pub const Error = error{PaneNotFound};
 
 pub fn init(alloc: std.mem.Allocator) Registry {
@@ -70,6 +80,14 @@ pub fn open(self: *Registry, id: u64, opts: Pane.Options) !void {
 /// deadlock the two against each other. Skipping a broadcast costs only latency,
 /// because a waiter re-checks on its own timer regardless. That backstop is what
 /// makes the non-blocking notify safe rather than merely convenient.
+/// Release every waiter and refuse new waits. Call before tearing anything down.
+pub fn stopWaiters(self: *Registry) void {
+    self.mutex.lock();
+    self.stopping = true;
+    self.change.broadcast();
+    self.mutex.unlock();
+}
+
 fn notifyChanged(ctx: *anyopaque) void {
     const self: *Registry = @ptrCast(@alignCast(ctx));
     if (!self.mutex.tryLock()) return;
@@ -157,6 +175,7 @@ pub fn screen(
 
     var last_gen: ?u64 = null;
     while (true) {
+        if (self.stopping) return null;
         const pane = self.panes.get(id) orelse return Error.PaneNotFound;
 
         // Only rebuild the render state when the cheap hint says something may
@@ -212,6 +231,7 @@ pub fn output(
 
     var last_gen: ?u64 = null;
     while (true) {
+        if (self.stopping) return null;
         const pane = self.panes.get(id) orelse return Error.PaneNotFound;
         const dims = pane.size();
 

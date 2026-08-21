@@ -410,6 +410,10 @@ fn testOpen(alloc: Allocator, tag: []const u8, buf: []u8) !History {
     _ = unsetenv("AMUX_HISTORY_MAX_ENTRIES");
     _ = unsetenv("AMUX_HISTORY_MAX_BYTES");
 
+    // Callers recover the path with sliceTo(buf, 0); bufPrint does not
+    // terminate, so without this they would slice undefined memory and the
+    // cleanup delete would silently miss (it did -- every run leaked a db).
+    @memset(buf, 0);
     const path = try std.fmt.bufPrint(buf, "/tmp/amux-histtest-{d}-{s}.db", .{
         std.os.linux.getpid(), tag,
     });

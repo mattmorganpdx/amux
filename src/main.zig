@@ -241,6 +241,71 @@ fn onCloseRequest(_: *c.GtkWindow, _: c.gpointer) callconv(.c) c.gboolean {
     return 0; // let GTK destroy the window, which quits the application
 }
 
+// ------------------------------------------------------------------
+// Following the daemon's layout
+// ------------------------------------------------------------------
+
+/// Set false on the way out so the watcher stops asking.
+var layout_watcher_running: std.atomic.Value(bool) = .init(true);
+
+/// A layout the watcher fetched, handed to the GTK main thread.
+const LayoutUpdate = struct {
+    json: []const u8,
+    seq: u64,
+};
+
+/// Apply a fetched layout. Runs on the GTK main thread via `g_idle_add`,
+/// because everything it touches is GTK state the watcher thread must not.
+fn onLayoutUpdate(data: c.gpointer) callconv(.c) c.gboolean {
+    const alloc = std.heap.c_allocator;
+    const upd: *LayoutUpdate = @ptrCast(@alignCast(data));
+    defer {
+        alloc.free(upd.json);
+        alloc.destroy(upd);
+    }
+
+    const window = global_window orelse return 0;
+    if (window.closing) return 0;
+    // Already accounted for -- typically a change this window made itself, whose
+    // sequence number it recorded so this rebuild could be skipped.
+    if (upd.seq <= window.layout_seq) return 0;
+
+    if (session.deserializeSession(alloc, upd.json)) |snap| {
+        defer session.freeSessionSnapshot(alloc, &snap);
+        window.layout_seq = upd.seq;
+        window.applyDaemonLayout(&snap);
+    } else |err| {
+        log.warn("could not parse a layout update: {}", .{err});
+    }
+    return 0; // G_SOURCE_REMOVE
+}
+
+/// Watch the daemon for layout changes this window did not make.
+///
+/// An agent splitting a pane from the CLI is the normal case, not an edge one --
+/// the daemon is shared, so the window has to be told rather than assuming it is
+/// the only thing making changes.
+fn layoutWatcher(socket_path: []const u8) void {
+    const alloc = std.heap.c_allocator;
+    while (layout_watcher_running.load(.acquire)) {
+        const seq = if (global_window) |w| w.layout_seq else 0;
+
+        const res = daemon_client.layout(alloc, socket_path, seq, 10_000) catch {
+            // The daemon may be restarting. Back off rather than spin.
+            std.Thread.sleep(2 * std.time.ns_per_s);
+            continue;
+        };
+        const lay = res orelse continue; // nothing changed within the timeout
+
+        const upd = alloc.create(LayoutUpdate) catch {
+            alloc.free(lay.json);
+            continue;
+        };
+        upd.* = .{ .json = lay.json, .seq = lay.seq };
+        _ = c.g_idle_add(&onLayoutUpdate, @ptrCast(upd));
+    }
+}
+
 fn onActivate(gtk_app: *c.GtkApplication, _: c.gpointer) callconv(.c) void {
     // Initialize libnotify for desktop notifications
     _ = c.notify_init("amux");
@@ -341,6 +406,15 @@ fn onActivate(gtk_app: *c.GtkApplication, _: c.gpointer) callconv(.c) void {
 
     // Start autosave timer (every 8 seconds)
     _ = c.g_timeout_add_seconds(8, &session.onAutosave, @as(c.gpointer, @ptrCast(window)));
+
+    // Follow the daemon's layout, so changes made elsewhere show up here.
+    if (window.daemon_socket) |sock| {
+        if (std.Thread.spawn(.{}, layoutWatcher, .{sock})) |t| {
+            t.detach();
+        } else |err| {
+            log.warn("could not start the layout watcher: {}", .{err});
+        }
+    }
 
     // Install keyboard shortcuts
     shortcuts.install(window);

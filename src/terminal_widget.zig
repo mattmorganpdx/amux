@@ -238,6 +238,12 @@ pub fn deinit(self: *TerminalWidget) void {
     // Release our GObject reference on the GtkGLArea
     c.g_object_unref(@as(c.gpointer, @ptrCast(self.gl_area)));
 
+    // The command string is heap-allocated by whoever set it (a relay attach or
+    // a history restore), and both use this allocator. It used to be leaked once
+    // per pane at startup, which was invisible; a pane now gets a fresh one on
+    // every layout rebuild, which would not have stayed invisible.
+    if (self.command) |cmd| std.heap.c_allocator.free(std.mem.span(cmd));
+
     std.heap.c_allocator.destroy(self);
 }
 

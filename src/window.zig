@@ -688,10 +688,109 @@ pub fn splitFocused(self: *Window, direction: PaneTree.SplitDirection) !void {
     _ = c.gtk_widget_grab_focus(new_tw.widget());
 
     self.sidebar.rebuild();
+    self.noteDaemonSeq();
     log.info("Split created: pane {d} -> new pane {d}", .{ focused, new_pane_id });
 }
 
 /// Build a shell command that cats the history file then execs the user's shell.
+/// Replace this window's layout with the one the daemon reported.
+///
+/// Must run on the GTK main thread. The teardown order is the one the pane and
+/// workspace close paths already established, and for the same reason: remove
+/// from the stack first so GTK unrealizes each surface and Ghostty stops calling
+/// back into it, and only then free the surfaces. Freeing a realized, parented
+/// surface crashed on a glib worker thread.
+///
+/// Every pane's relay restarts as a result. That is affordable only because a
+/// relay repaints from daemon state when it attaches: the content comes back, so
+/// a rebuild costs a flicker rather than a loss. Nothing here would be safe in a
+/// design where the GUI held the only copy of the screen.
+pub fn applyDaemonLayout(self: *Window, snap: *const session.SessionSnapshot) void {
+    if (self.closing) return;
+
+    // Stack removal first, for every workspace, so GTK unrealizes the surfaces
+    // before any of them is freed.
+    for (self.tab_manager.workspaces.items) |ws| self.removeWorkspaceFromStack(ws.id);
+
+    // Then free every widget by walking what is actually held, not what the pane
+    // trees say is held. `destroyWorkspaceWidgets` enumerates via the trees, and
+    // clearing the map afterwards dropped any widget the trees no longer
+    // mentioned -- still owning a Ghostty surface, a GL area and a font atlas.
+    // That leaked about half a megabyte per rebuild.
+    var widgets = self.pane_widgets.valueIterator();
+    while (widgets.next()) |tw| tw.*.deinit();
+    self.pane_widgets.clearRetainingCapacity();
+    self.node_widgets.clearRetainingCapacity();
+
+    for (self.tab_manager.workspaces.items) |ws| {
+        ws.deinit();
+        self.alloc.destroy(ws);
+    }
+    self.tab_manager.workspaces.clearRetainingCapacity();
+
+    var max_node_id: PaneTree.NodeId = 1;
+    for (snap.workspaces) |*ws_snap| {
+        if (ws_snap.next_node_id > max_node_id) max_node_id = ws_snap.next_node_id;
+    }
+    self.tab_manager.next_node_id = max_node_id;
+
+    for (snap.workspaces) |*ws_snap| {
+        const ws = self.alloc.create(Workspace) catch {
+            log.err("out of memory applying the daemon layout", .{});
+            return;
+        };
+        ws.* = Workspace.initShared(self.alloc, ws_snap.id, &self.tab_manager.next_node_id);
+        ws.setTitle(ws_snap.title);
+        if (ws_snap.cwd.len > 0) ws.setCwd(ws_snap.cwd);
+        ws.pinned = ws_snap.pinned;
+        if (ws_snap.color.len > 0) ws.setColor(ws_snap.color);
+
+        _ = session.restorePaneTree(&ws.pane_tree, ws_snap) catch |err| {
+            log.warn("could not restore workspace {d} from the daemon: {}", .{ ws_snap.id, err });
+            _ = ws.pane_tree.createRoot() catch {};
+        };
+
+        self.tab_manager.workspaces.append(self.alloc, ws) catch {
+            ws.deinit();
+            self.alloc.destroy(ws);
+            return;
+        };
+    }
+
+    self.tab_manager.next_id = snap.next_workspace_id;
+    self.tab_manager.selected_index = if (snap.selected_workspace_index) |idx|
+        if (idx < self.tab_manager.workspaces.items.len) idx else 0
+    else
+        0;
+
+    if (self.tab_manager.selectedWorkspace()) |ws| {
+        self.buildWorkspaceWidgets(ws) catch |err| {
+            log.err("could not build widgets for the daemon layout: {}", .{err});
+            return;
+        };
+        self.showWorkspaceInStack(ws.id);
+        if (ws.pane_tree.focused_pane) |pane_id| {
+            if (self.pane_widgets.get(pane_id)) |tw| _ = c.gtk_widget_grab_focus(tw.widget());
+        }
+    }
+
+    self.sidebar.rebuild();
+    log.info("applied daemon layout ({d} workspaces)", .{snap.workspaces.len});
+}
+
+/// Record the daemon's current layout sequence as already applied.
+///
+/// Called after this window forwards a structural change: it has just made the
+/// same change locally, so rebuilding from the daemon would only restart every
+/// relay to arrive at the picture already on screen.
+fn noteDaemonSeq(self: *Window) void {
+    const sock = self.daemon_socket orelse return;
+    const res = daemon_client.layout(self.alloc, sock, 0, 0) catch return;
+    const lay = res orelse return;
+    defer self.alloc.free(lay.json);
+    self.layout_seq = lay.seq;
+}
+
 /// The wire name for a split direction.
 fn directionName(direction: PaneTree.SplitDirection) []const u8 {
     return switch (direction) {

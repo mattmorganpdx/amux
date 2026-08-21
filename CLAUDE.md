@@ -129,6 +129,16 @@ This produces two binaries in `zig-out/bin/`:
 - `amux` — the GUI terminal (requires GTK4, libghostty, libnotify)
 - `amux-cli` — standalone socket client (libc only)
 
+Tests:
+
+```bash
+zig build test
+```
+
+Covers what can be tested without GTK or libghostty — currently `src/vt.zig`,
+the seam onto the `ghostty-vt` headless terminal engine. The GUI still has to be
+exercised by running it.
+
 ### Rebuilding libghostty
 
 If the Ghostty submodule changes, rebuild via the setup script:

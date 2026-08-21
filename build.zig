@@ -35,6 +35,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The headless terminal engine from the Ghostty fork. Compiled in as a Zig
+    // module rather than linked as a library: the generated C headers expose
+    // only OSC/color/SGR/key, while the Zig module exports Terminal, Screen,
+    // PageList, Parser, Stream and search.
+    const ghostty_dep = b.dependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ghostty_vt = ghostty_dep.module("ghostty-vt");
+
     // --- Main executable ---
     const exe = b.addExecutable(.{
         .name = "amux",
@@ -42,6 +52,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ghostty_vt", .module = ghostty_vt },
+            },
         }),
     });
 
@@ -75,6 +88,24 @@ pub fn build(b: *std.Build) void {
     cli.linkLibC();
 
     b.installArtifact(cli);
+
+    // --- Tests ---
+    //
+    // `zig build test`. Only modules that do not need GTK or libghostty can be
+    // tested this way; the GUI still has to be exercised by running it.
+    const vt_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vt.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ghostty_vt", .module = ghostty_vt },
+            },
+        }),
+    });
+    const run_vt_tests = b.addRunArtifact(vt_tests);
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_vt_tests.step);
 
     // --- Run step ---
     const run_cmd = b.addRunArtifact(exe);

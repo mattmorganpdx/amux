@@ -4,4 +4,13 @@
     .paths = .{""},
     .fingerprint = 0xee4763b44fbdeb22,
     .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // The Ghostty fork, consumed two ways:
+        //   - libghostty.so, linked by the GUI for terminal surfaces (built by
+        //     setup.sh, since it needs the whole app runtime)
+        //   - the `ghostty-vt` Zig module below, which is the headless terminal
+        //     engine: VT parser, Screen, PageList/scrollback and search, with no
+        //     GL or GTK. This is what the daemon will own terminals with.
+        .ghostty = .{ .path = "ghostty" },
+    },
 }

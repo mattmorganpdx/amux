@@ -11,7 +11,7 @@ Roughly dependency-ordered. **D** = de-risking, do early.
 | # | Item | Depends on |
 |---|------|-----------|
 | 1 | ~~**D** Prototype: Ghostty OpenGL renderer drawing an amux-owned `Terminal`~~ **done** | — |
-| 2 | Wire `ghostty-vt` into amux's build as a Zig module | — |
+| 2 | ~~Wire `ghostty-vt` into amux's build as a Zig module~~ **done** | — |
 | 3 | `amuxd`: own PTYs and terminal state | 2 |
 | 4 | Move socket handlers behind the daemon | 3 |
 | 5 | Screen-state wire protocol (snapshot + delta) | 3 |
@@ -38,15 +38,36 @@ already required the renderer to read our terminal.
 **The expensive risk in this plan is retired: the GUI does not need its own text
 renderer.**
 
-## 2. Wire `ghostty-vt` into the build
+## 2. Wire `ghostty-vt` into the build — **DONE**
 
-`zig build lib-vt` in the submodule already produces `libghostty-vt.so` and the
-`ghostty-vt` Zig module; verified building clean. Consume the **Zig module**,
-not the C API — the generated headers cover only OSC/color/SGR/key, while the
-module exports `Terminal`, `Screen`, `PageList`, `Parser`, `Stream`, `search`.
+ghostty exposes `ghostty-vt` via `b.addModule` (`src/build/GhosttyZig.zig`), so
+it is a consumable Zig package module with unicode tables, uucode and SIMD
+already wired. amux now takes the fork as a path dependency in `build.zig.zon`
+and pulls the module from it.
 
-Extend `setup.sh` to build it alongside `libghostty.so`, and add the module to
-`build.zig` so both `amuxd` and the GUI can import it.
+**Deviation from the original plan:** no `setup.sh` change and no
+`libghostty-vt.so`. Compiling the module in is simpler than building, installing
+and linking a second shared library, and it is the only option that gets
+`Terminal`/`Screen`/`PageList` at all — the generated C headers expose only
+OSC/color/SGR/key. `libghostty.so` is still built by `setup.sh` for the GUI's
+terminal surfaces; that is unchanged.
+
+`src/vt.zig` is the seam: one file naming exactly what amux depends on, so there
+is one place to adapt when the upstream API shifts (it is documented as
+unstable). It carries three tests, run by a new `zig build test` step — amux's
+first tests:
+
+- the engine constructs and reports its dimensions
+- printed text reads back off the screen
+- lines scrolled off the active area are still in scrollback
+
+Verified by mutation: flipping the scrollback assertion fails the run, so the
+assertions bite. Clean build cost is negligible (~8.5s, dependency artifacts sit
+in the global Zig cache). The GUI still builds, runs, and shuts down clean, and
+the 44-response API probe is unchanged.
+
+The module is declared for the GUI executable too, so item 6 can `@import` it
+without touching `build.zig`, but nothing in the GUI uses it yet.
 
 ## 3. `amuxd`: own PTYs and terminal state
 

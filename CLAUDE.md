@@ -147,6 +147,15 @@ sidebar metadata methods are GUI chrome and are not served yet.
 `/tmp/amux.sock`** — give one an `AMUX_SOCKET` override while both exist. The
 GUI becomes a client of the daemon in work-plan item 6.
 
+Each server's **session file is scoped to its socket**, so the two no longer
+overwrite each other's layout: `/tmp/amux.sock` keeps the historical
+`session.json`, and any other socket gets `session-<slug>.json` beside it
+(`/run/user/1000/amux.sock` → `session-run-user-1000-amux.json`). Two servers
+cannot bind one socket, so they cannot share a file; a restart on the same
+socket deliberately restores the same layout. `AMUX_SESSION=<path>` pins it
+explicitly, which is the safe way to keep a test daemon away from your real
+session.
+
 `amuxd --self-check` spawns a shell, runs a command and reads it back off the
 parsed screen.
 

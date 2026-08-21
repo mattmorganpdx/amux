@@ -264,6 +264,11 @@ fn onActivate(gtk_app: *c.GtkApplication, _: c.gpointer) callconv(.c) void {
 
     const app = global_app orelse return;
 
+    // Scope the session file to the socket this GUI will bind, before the
+    // restore reads it. The daemon does the same, so the two cannot clobber
+    // each other's layout when both are running.
+    session.bindInstance(@import("socket_path.zig").forServer());
+
     // Try to restore session from disk
     const window = blk: {
         if (!session.isRestoreDisabled()) {

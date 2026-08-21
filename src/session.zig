@@ -392,6 +392,87 @@ fn getJsonBool(val: std.json.Value, key: []const u8) ?bool {
 // File I/O
 // ------------------------------------------------------------------
 
+/// Which session file this process owns.
+///
+/// A session file records live terminals, so it belongs to the server instance
+/// that owns them -- not to the user and not to the machine. The GUI and `amuxd`
+/// both wrote plain `session.json`, so running both had them overwrite each
+/// other's layout.
+///
+/// The socket path is the natural identity: two servers cannot bind the same
+/// path, so scoping the file to the socket makes a collision *structurally*
+/// impossible rather than merely unlikely. It also gets the two cases right for
+/// free -- different sockets are different instances and keep separate files,
+/// while a restart on the same socket is the same instance and deliberately
+/// restores the same layout.
+var instance_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+var instance_path_len: usize = 0;
+
+/// The socket path a plain `session.json` belongs to. Keeping the historical
+/// name for the historical socket means an existing install does not silently
+/// lose its saved layout the first time it runs this build.
+const legacy_socket = @import("socket_path.zig").default;
+
+/// Call once at startup, before any load or save, with the socket this server
+/// binds. Unbound falls back to the legacy name, which is what every caller did
+/// before -- so forgetting this is the old behaviour, not corruption.
+pub fn bindInstance(socket_path: []const u8) void {
+    const resolved = resolveSessionPath(socket_path, &instance_path_buf) orelse {
+        log.warn("no config dir; session will not persist", .{});
+        return;
+    };
+    instance_path_len = resolved.len;
+    log.info("session file: {s}", .{resolved});
+}
+
+fn resolveSessionPath(socket_path: []const u8, buf: []u8) ?[]const u8 {
+    // An explicit override wins, and is a full path. Mostly for tests, which
+    // otherwise have to move HOME to avoid touching a real session.
+    if (std.posix.getenv("AMUX_SESSION")) |p| {
+        if (p.len == 0 or p.len > buf.len) return null;
+        @memcpy(buf[0..p.len], p);
+        return buf[0..p.len];
+    }
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = sessionDir(&dir_buf) orelse return null;
+
+    if (std.mem.eql(u8, socket_path, legacy_socket)) {
+        return std.fmt.bufPrint(buf, "{s}/session.json", .{dir}) catch null;
+    }
+    var slug_buf: [72]u8 = undefined;
+    const slug = socketSlug(socket_path, &slug_buf);
+    return std.fmt.bufPrint(buf, "{s}/session-{s}.json", .{ dir, slug }) catch null;
+}
+
+/// A filename-safe, human-readable stand-in for a socket path:
+/// `/run/user/1000/amux.sock` -> `run-user-1000-amux`.
+///
+/// Readable matters -- someone looking at the config dir should be able to tell
+/// which file belongs to which socket without running anything. Paths too long
+/// to stay readable fall back to a hash of the whole path, because a truncated
+/// slug could collide and a colliding slug is the bug this is here to prevent.
+fn socketSlug(socket_path: []const u8, buf: *[72]u8) []const u8 {
+    var trimmed = socket_path;
+    if (std.mem.endsWith(u8, trimmed, ".sock")) trimmed = trimmed[0 .. trimmed.len - 5];
+    trimmed = std.mem.trim(u8, trimmed, "/");
+
+    if (trimmed.len == 0 or trimmed.len > 64) {
+        const h = std.hash.Wyhash.hash(0, socket_path);
+        return std.fmt.bufPrint(buf, "{x:0>16}", .{h}) catch unreachable;
+    }
+
+    var n: usize = 0;
+    for (trimmed) |ch| {
+        buf[n] = switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => ch,
+            else => '-',
+        };
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 /// Get the session file path: $XDG_CONFIG_HOME/amux/session.json or ~/.config/amux/session.json
 fn sessionDir(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
     if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
@@ -406,32 +487,35 @@ fn sessionDir(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
 }
 
 fn sessionFilePath(buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = sessionDir(&dir_buf) orelse return null;
-    const path = std.fmt.bufPrint(buf, "{s}/session.json", .{dir}) catch return null;
-    return path;
+    if (instance_path_len > 0) {
+        const p = instance_path_buf[0..instance_path_len];
+        if (p.len > buf.len) return null;
+        @memcpy(buf[0..p.len], p);
+        return buf[0..p.len];
+    }
+    return resolveSessionPath(legacy_socket, buf);
 }
 
 /// Write session snapshot to disk atomically (write to .tmp, then rename).
 pub fn writeSessionFile(alloc: Allocator, snap: *const SessionSnapshot) !void {
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = sessionDir(&dir_buf) orelse return error.NoConfigDir;
+    var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = sessionFilePath(&file_path_buf) orelse return error.NoConfigDir;
 
     // Ensure directory exists
-    std.fs.cwd().makePath(dir) catch |err| {
-        log.warn("Failed to create session dir: {}", .{err});
-        return err;
-    };
+    if (std.fs.path.dirname(file_path)) |dir| {
+        std.fs.cwd().makePath(dir) catch |err| {
+            log.warn("Failed to create session dir: {}", .{err});
+            return err;
+        };
+    }
 
     const json = try serializeSession(alloc, snap);
     defer alloc.free(json);
 
-    // Write to temp file
+    // Temp file alongside the real one, so the rename below stays within a
+    // single filesystem and therefore stays atomic.
     var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}/session.json.tmp", .{dir}) catch return error.PathTooLong;
-
-    var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/session.json", .{dir}) catch return error.PathTooLong;
+    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{file_path}) catch return error.PathTooLong;
 
     // Write tmp file
     const tmp_file = std.fs.cwd().createFile(tmp_path, .{}) catch |err| {
@@ -569,4 +653,83 @@ fn restoreLayoutNode(tree: *PaneTree, layout: *const LayoutSnapshot, parent: ?Pa
 pub fn isRestoreDisabled() bool {
     const val = std.posix.getenv("AMUX_DISABLE_SESSION_RESTORE") orelse return false;
     return std.mem.eql(u8, val, "1");
+}
+
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
+
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+fn unsetenvForTest(comptime name: [*:0]const u8) c_int {
+    return unsetenv(name);
+}
+
+test "the session file is scoped to the socket, so two servers cannot collide" {
+    // An override in the ambient environment would mask what this checks.
+    _ = unsetenvForTest("AMUX_SESSION");
+    var a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var b_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    // The GUI on the historical socket keeps the historical filename: an
+    // existing install must not lose its layout on first run of this build.
+    const gui = resolveSessionPath(legacy_socket, &a_buf).?;
+    try std.testing.expect(std.mem.endsWith(u8, gui, "/session.json"));
+
+    // A daemon on its own socket lands somewhere else entirely.
+    const daemon = resolveSessionPath("/run/user/1000/amux.sock", &b_buf).?;
+    try std.testing.expect(!std.mem.eql(u8, gui, daemon));
+    try std.testing.expect(std.mem.endsWith(u8, daemon, "/session-run-user-1000-amux.json"));
+}
+
+test "distinct sockets never share a session file" {
+    _ = unsetenvForTest("AMUX_SESSION");
+    const paths = [_][]const u8{
+        "/tmp/amux.sock",
+        "/tmp/amux-2.sock",
+        "/run/user/1000/amux.sock",
+        "/run/user/1001/amux.sock",
+        "/tmp/amuxd-test.sock",
+        "/home/someone/.local/state/amux/sock",
+    };
+    var seen: [paths.len][std.fs.max_path_bytes]u8 = undefined;
+    var lens: [paths.len]usize = undefined;
+
+    for (paths, 0..) |p, i| {
+        const r = resolveSessionPath(p, &seen[i]) orelse return error.NoConfigDir;
+        lens[i] = r.len;
+        // Compare against every earlier one: a shared name is the whole bug.
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            try std.testing.expect(!std.mem.eql(u8, r, seen[j][0..lens[j]]));
+        }
+    }
+}
+
+test "a socket path too long to stay readable falls back to a hash" {
+    var buf: [72]u8 = undefined;
+    var long: [200]u8 = undefined;
+    @memset(&long, 'x');
+    long[0] = '/';
+
+    const slug = socketSlug(&long, &buf);
+    try std.testing.expectEqual(@as(usize, 16), slug.len);
+    for (slug) |ch| try std.testing.expect(std.ascii.isHex(ch));
+
+    // Two different long paths must still differ -- truncating instead of
+    // hashing would have collided them, which is what this guards.
+    var other = long;
+    other[150] = 'y';
+    var other_buf: [72]u8 = undefined;
+    const other_slug = socketSlug(&other, &other_buf);
+    try std.testing.expect(!std.mem.eql(u8, slug, other_slug));
+}
+
+test "a slug is filename-safe" {
+    var buf: [72]u8 = undefined;
+    const slug = socketSlug("/tmp/weird dir/amux:1.sock", &buf);
+    for (slug) |ch| switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9', '.', '_', '-' => {},
+        else => return error.UnsafeCharacterInFilename,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, slug, "/") == null);
 }

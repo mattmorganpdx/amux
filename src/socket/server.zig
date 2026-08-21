@@ -66,13 +66,7 @@ const drain_timeout_ns: u64 = 11 * std.time.ns_per_s;
 pub fn init(alloc: Allocator) !*Server {
     const self = try alloc.create(Server);
 
-    // Determine socket path
-    const socket_path = if (std.posix.getenv("AMUX_SOCKET"))
-        |s| try alloc.dupe(u8, s)
-    else if (std.posix.getenv("AMUX_SOCKET_PATH"))
-        |s| try alloc.dupe(u8, s)
-    else
-        try alloc.dupe(u8, "/tmp/amux.sock");
+    const socket_path = try alloc.dupe(u8, @import("../socket_path.zig").forServer());
 
     self.* = .{
         .alloc = alloc,

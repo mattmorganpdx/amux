@@ -14,6 +14,14 @@ const Registry = @import("daemon/Registry.zig");
 const History = @import("daemon/History.zig");
 const Server = @import("daemon/server.zig");
 const State = @import("daemon/State.zig");
+const session = @import("session.zig");
+
+// `zig build test` collects tests from this file's direct imports only, so a
+// file reached one level deeper -- session.zig, via State -- was silently
+// contributing none. Naming it here puts its tests in the daemon suite.
+test {
+    _ = session;
+}
 
 const log = std.log.scoped(.amuxd);
 
@@ -70,6 +78,9 @@ fn serve(alloc: std.mem.Allocator) !u8 {
     // create panes, and they need AMUX_SOCKET_PATH in their environment.
     const sock = socketPath();
     state.socket_path = sock;
+    // Scope the session file to this socket before anything reads or writes it,
+    // so a daemon on its own socket cannot overwrite the GUI's layout.
+    session.bindInstance(sock);
 
     var hist_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var history: ?History = null;
@@ -133,9 +144,7 @@ fn historyPath(buf: []u8) ?[]const u8 {
 
 /// Same resolution order the CLI uses.
 fn socketPath() []const u8 {
-    return posix.getenv("AMUX_SOCKET") orelse
-        posix.getenv("AMUX_SOCKET_PATH") orelse
-        "/tmp/amux.sock";
+    return @import("socket_path.zig").forServer();
 }
 
 /// Prove the terminal hosting works: spawn a shell, run a command through the

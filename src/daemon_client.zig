@@ -183,6 +183,41 @@ fn extractObject(text: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+pub const Metadata = struct {
+    seq: u64,
+    /// The whole response line. Small enough (a few workspaces) that parsing it
+    /// on the GTK thread is cheaper than describing its schema twice.
+    json: []const u8,
+};
+
+/// Per-workspace metadata, or null if nothing changed within `timeout_ms`.
+pub fn metadata(
+    alloc: std.mem.Allocator,
+    socket_path: []const u8,
+    since: u64,
+    timeout_ms: u32,
+) !?Metadata {
+    const params = try std.fmt.allocPrint(
+        alloc,
+        "{{\"since\":{d},\"timeout_ms\":{d}}}",
+        .{ since, timeout_ms },
+    );
+    defer alloc.free(params);
+
+    const resp = try call(alloc, socket_path, "workspace.metadata", params);
+    errdefer alloc.free(resp);
+
+    if (std.mem.indexOf(u8, resp, "\"changed\":false") != null) {
+        alloc.free(resp);
+        return null;
+    }
+    const seq = extractUint(resp, "seq") orelse {
+        alloc.free(resp);
+        return error.BadResponse;
+    };
+    return .{ .seq = seq, .json = resp };
+}
+
 /// Ask the daemon to split a pane, returning the new pane's id.
 pub fn splitPane(
     alloc: std.mem.Allocator,

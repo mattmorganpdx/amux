@@ -382,11 +382,8 @@ libnotify and a session bus, which `amuxd` does not link.
 
 ### Known gaps
 
-- **The GUI's sidebar does not show daemon-owned metadata yet.** It draws from
-  its own workspace objects, which come from the layout snapshot; the metadata is
-  on the wire in `workspace.list` but the sidebar does not read it. Wiring it
-  needs a second sequence number, because bumping the layout one on every
-  progress update would rebuild the widget tree every second.
+- ~~The GUI's sidebar does not show daemon-owned metadata yet.~~ **Done**, see
+  below.
 - **Two VT interpretations**, inherent to relaying. Item 5's cell protocol is
   still the better answer if the renderer ever becomes compilable.
 - **Memory under heavy layout churn.** 24 externally driven split/close cycles
@@ -400,3 +397,28 @@ ids, an agent's split and new workspace appearing in the GUI, panes surviving th
 window closing and reopening, 48 rebuilds under external churn with no panics,
 agent status and hooks recorded with no GUI running, the no-daemon path still
 running local shells, and clean daemon exits with relays attached.
+
+### Follow-up: the sidebar shows the daemon's metadata
+
+`workspace.metadata` returns the same workspace objects `workspace.list` does,
+plus a sequence number to wait on, and the GUI runs a second watcher for it.
+
+**The second sequence number is the whole design.** Metadata could have ridden on
+`layout_seq`, and it would have been wrong: a client following the layout rebuilds
+its widget tree when it changes, so an agent reporting progress once a second
+would have cost a widget tree once a second. Ten progress updates in a row now
+cause zero rebuilds, which is asserted by test and confirmed by mutation --
+bumping the layout sequence from a metadata write fails it.
+
+Nothing in the sidebar needed writing: it already rendered git, status entries
+and a progress bar from `Workspace`, and `updateRow` already existed as the
+"metadata changed" path. The gap was only ever who filled those fields in for a
+daemon-owned workspace.
+
+One bug worth recording. A layout rebuild replaces the workspace objects, so it
+loses their metadata, and resetting the sequence to zero was not enough to get it
+back: the watcher was parked in a ten-second poll and would not look at the
+sequence again until it returned. A split blanked the sidebar for up to ten
+seconds. The rebuild now fetches metadata itself, which is right on its own terms
+-- that is the one moment we *know* the objects have lost it, rather than a
+moment when some thread might eventually notice.

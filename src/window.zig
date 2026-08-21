@@ -85,6 +85,13 @@ daemon_socket: ?[]const u8 = null,
 /// The layout sequence this window has applied. See `system.layout`.
 layout_seq: u64 = 0,
 
+/// The metadata sequence this window has applied. See `workspace.metadata`.
+///
+/// Tracked separately from `layout_seq` so status and progress can be refreshed
+/// without rebuilding a single widget -- an agent reporting progress once a
+/// second must not cost a widget tree once a second.
+meta_seq: u64 = 0,
+
 /// `daemon_socket` with a NUL terminator, for the surface config.
 daemon_socket_z: ?[:0]const u8 = null,
 
@@ -775,6 +782,15 @@ pub fn applyDaemonLayout(self: *Window, snap: *const session.SessionSnapshot) vo
     }
 
     self.sidebar.rebuild();
+
+    // The workspaces here are new objects, so whatever metadata had been applied
+    // to the old ones is gone. Fetched right here rather than left to the
+    // watcher: that thread is parked in a long poll and will not look at
+    // `meta_seq` again until it returns, which left the sidebar blank for up to
+    // ten seconds after every split.
+    self.meta_seq = 0;
+    self.refreshDaemonMetadata();
+
     log.info("applied daemon layout ({d} workspaces)", .{snap.workspaces.len});
 }
 
@@ -789,6 +805,129 @@ fn noteDaemonSeq(self: *Window) void {
     const lay = res orelse return;
     defer self.alloc.free(lay.json);
     self.layout_seq = lay.seq;
+}
+
+/// Fetch and apply metadata now, without waiting.
+///
+/// Called after a layout rebuild, which is the one moment we know the workspace
+/// objects have lost it. Safe to do synchronously: a zero timeout means the
+/// daemon answers on the spot, and the payload is a few workspaces.
+fn refreshDaemonMetadata(self: *Window) void {
+    const sock = self.daemon_socket orelse return;
+    const res = daemon_client.metadata(self.alloc, sock, 0, 0) catch |err| {
+        log.warn("could not refresh workspace metadata: {}", .{err});
+        return;
+    };
+    const meta = res orelse return;
+    defer self.alloc.free(meta.json);
+
+    self.meta_seq = meta.seq;
+    self.applyDaemonMetadata(meta.json);
+}
+
+/// Apply per-workspace metadata the daemon reported: status, progress, git, log.
+///
+/// Must run on the GTK main thread. Touches no widgets beyond the sidebar rows:
+/// the fields live on `Workspace`, which the sidebar already renders, so this is
+/// only about who fills them in. Before this, a daemon-owned workspace showed a
+/// blank sidebar however much an agent reported.
+pub fn applyDaemonMetadata(self: *Window, response: []const u8) void {
+    if (self.closing) return;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, response, .{}) catch |err| {
+        log.warn("could not parse workspace metadata: {}", .{err});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return;
+    const result = root.object.get("result") orelse return;
+    if (result != .object) return;
+    const list = result.object.get("workspaces") orelse return;
+    if (list != .array) return;
+
+    for (list.array.items) |entry| {
+        if (entry != .object) continue;
+        const obj = entry.object;
+
+        const id_val = obj.get("id") orelse continue;
+        if (id_val != .integer) continue;
+        const ws_id: u64 = @intCast(id_val.integer);
+
+        // Find this workspace and its position, since the sidebar addresses
+        // rows by index.
+        var index: ?usize = null;
+        var target: ?*Workspace = null;
+        for (self.tab_manager.workspaces.items, 0..) |ws, i| {
+            if (ws.id == ws_id) {
+                index = i;
+                target = ws;
+                break;
+            }
+        }
+        const ws = target orelse continue;
+
+        applyStatus(ws, obj);
+        applyProgress(ws, obj);
+        applyGit(ws, obj);
+        applyLog(ws, obj);
+
+        if (index) |i| self.sidebar.updateRow(i);
+    }
+}
+
+fn applyStatus(ws: *Workspace, obj: std.json.ObjectMap) void {
+    // Replaced wholesale rather than merged: the daemon's set is authoritative,
+    // and merging would leave a key it had dropped on screen forever.
+    ws.clearStatus();
+    const status = obj.get("status") orelse return;
+    if (status != .object) return;
+    var it = status.object.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.* != .string) continue;
+        ws.setStatusEntry(kv.key_ptr.*, kv.value_ptr.*.string);
+    }
+}
+
+fn applyProgress(ws: *Workspace, obj: std.json.ObjectMap) void {
+    const p = obj.get("progress") orelse {
+        ws.clearProgress();
+        return;
+    };
+    const fraction: f32 = switch (p) {
+        .float => |f| @floatCast(f),
+        .integer => |i| @floatFromInt(i),
+        else => return,
+    };
+    const label: ?[]const u8 = if (obj.get("progress_label")) |l|
+        (if (l == .string) l.string else null)
+    else
+        null;
+    ws.setProgress(fraction, label);
+}
+
+fn applyGit(ws: *Workspace, obj: std.json.ObjectMap) void {
+    const branch = obj.get("git_branch") orelse {
+        ws.setGitBranch("");
+        ws.setGitDirty(false);
+        return;
+    };
+    if (branch != .string) return;
+    ws.setGitBranch(branch.string);
+    if (obj.get("git_dirty")) |d| {
+        if (d == .bool) ws.setGitDirty(d.bool);
+    }
+}
+
+fn applyLog(ws: *Workspace, obj: std.json.ObjectMap) void {
+    ws.clearLog();
+    const lines = obj.get("log") orelse return;
+    if (lines != .array) return;
+    for (lines.array.items) |line| {
+        if (line != .string) continue;
+        ws.addLogEntry(line.string);
+    }
 }
 
 /// The wire name for a split direction.

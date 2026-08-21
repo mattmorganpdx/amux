@@ -139,7 +139,7 @@ AMUX_SOCKET=/tmp/amuxd.sock amuxd &
 AMUX_SOCKET=/tmp/amuxd.sock amux-cli run "echo hello"
 ```
 
-It answers 39 methods (`system.capabilities` lists them, and reports
+It answers 40 methods (`system.capabilities` lists them, and reports
 `"daemon": true`). The command palette and window actions stay in the GUI — they
 drive its chrome, and nothing else can execute them.
 
@@ -267,9 +267,20 @@ needs libnotify and a session bus, which `amuxd` deliberately does not link. A
 running GUI turns records into desktop notifications; with none running the
 record is still there to read afterwards.
 
-Known gap: the GUI's sidebar still draws from its own workspace objects, so
-daemon-owned status does not appear there yet. The data is on the wire
-(`workspace.list`), the sidebar just does not read it.
+The GUI's sidebar shows all of this. It follows `workspace.metadata`, which
+carries the same workspace objects `workspace.list` returns plus a sequence
+number to wait on:
+
+```bash
+amux-cli workspace metadata                            # current, with its seq
+amux-cli workspace metadata --since 7 --timeout 5000   # wait for a change
+```
+
+Metadata has its own sequence number, separate from `system.layout`'s, and that
+separation is the point: a client following the layout rebuilds its widget tree
+when it changes, so sharing one number would make an agent's progress report as
+expensive as a split. Reporting progress ten times in a row causes zero widget
+rebuilds.
 
 ### Session history
 

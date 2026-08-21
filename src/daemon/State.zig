@@ -57,6 +57,15 @@ layout_seq: u64 = 1,
 /// Recent notification records. See `notifications.zig` for why the daemon
 /// keeps these rather than showing them.
 notifications: Notifications = .{},
+
+/// Bumped by metadata writes: status, progress, logs, git, colour, pinning.
+///
+/// Separate from `layout_seq` on purpose. A client following the layout rebuilds
+/// its widget tree when it changes, and an agent reporting progress once a second
+/// would have it doing that once a second. Metadata is not layout, so it gets its
+/// own number and a client can follow it without touching a single widget.
+meta_seq: u64 = 1,
+meta_changed: std.Thread.Condition = .{},
 layout_changed: std.Thread.Condition = .{},
 
 pub const Error = error{
@@ -301,6 +310,8 @@ fn withWorkspaceLocked(
     defer self.mutex.unlock();
     const ws = try self.resolveWorkspaceLocked(ws_id);
     f(ctx, ws);
+    self.meta_seq += 1;
+    self.meta_changed.broadcast();
     return ws.id;
 }
 
@@ -370,6 +381,27 @@ pub fn setWorkspacePinned(self: *State, ws_id: ?u64, pinned: bool) Error!u64 {
             ws.pinned = p;
         }
     }.apply);
+}
+
+/// Wait until the metadata sequence differs from `since`, and return it.
+///
+/// Null means the wait timed out with nothing to report. Mirrors `layoutJson`,
+/// but returns only the number: the caller reads the workspaces afterwards, so
+/// the wait does not hold the state lock across serialization.
+pub fn waitForMeta(self: *State, since: u64, timeout_ms: u32) ?u64 {
+    const total_ns = @as(u64, timeout_ms) * std.time.ns_per_ms;
+    var timer: ?std.time.Timer = std.time.Timer.start() catch null;
+
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    while (true) {
+        if (self.meta_seq != since) return self.meta_seq;
+        const elapsed = if (timer) |*t| t.read() else total_ns;
+        if (elapsed >= total_ns) return null;
+        const slice = @min(total_ns - elapsed, 250 * std.time.ns_per_ms);
+        self.meta_changed.timedWait(&self.mutex, slice) catch {};
+    }
 }
 
 pub fn resolvePane(self: *State, explicit: ?u64) Error!u64 {
@@ -691,4 +723,59 @@ test "unknown ids are reported, not crashed on" {
     try std.testing.expectError(error.PaneNotFound, state.resolvePane(999));
     // With no workspace at all, resolving the focused pane has nothing to find.
     try std.testing.expectError(error.NoWorkspace, state.resolvePane(null));
+}
+
+test "metadata writes advance the metadata sequence but not the layout" {
+    const alloc = std.testing.allocator;
+    var state = init(alloc);
+    defer state.deinit();
+
+    _ = try state.createWorkspace(null, null);
+
+    const layout_before = state.layout_seq;
+    const meta_before = state.meta_seq;
+
+    _ = try state.setWorkspaceStatus(null, "task", "building");
+    _ = try state.setWorkspaceProgress(null, 0.5, "halfway");
+    _ = try state.addWorkspaceLog(null, "a line");
+    _ = try state.reportWorkspaceGit(null, "main", true);
+
+    // The whole point of two counters: a client following the layout rebuilds
+    // its widget tree when it changes, and an agent reporting progress once a
+    // second must not cost that.
+    try std.testing.expectEqual(layout_before, state.layout_seq);
+    try std.testing.expect(state.meta_seq > meta_before);
+}
+
+test "a structural change advances the layout sequence" {
+    const alloc = std.testing.allocator;
+    var state = init(alloc);
+    defer state.deinit();
+
+    const ws = try state.createWorkspace(null, null);
+    _ = ws;
+    const before = state.layout_seq;
+
+    const pane = try state.resolvePane(null);
+    _ = try state.splitPane(pane, .right);
+
+    try std.testing.expect(state.layout_seq > before);
+}
+
+test "waiting on metadata reports a change, and reports nothing when there is none" {
+    const alloc = std.testing.allocator;
+    var state = init(alloc);
+    defer state.deinit();
+
+    _ = try state.createWorkspace(null, null);
+    const seq = state.meta_seq;
+
+    // Nothing has happened, so a short wait comes back empty rather than
+    // inventing an update.
+    try std.testing.expect(state.waitForMeta(seq, 150) == null);
+
+    _ = try state.setWorkspaceStatus(null, "task", "moved on");
+    const got = state.waitForMeta(seq, 150);
+    try std.testing.expect(got != null);
+    try std.testing.expect(got.? > seq);
 }

@@ -156,6 +156,47 @@ pub fn main() !void {
                 return;
             };
             try sendAndPrint(socket_path, "workspace.close", params, stdout, stderr);
+        } else if (std.mem.eql(u8, sub, "metadata")) {
+            // amux-cli workspace metadata [--since <seq>] [--timeout <ms>]
+            //
+            // What the sidebar follows: status, progress, git and log for every
+            // workspace, with a sequence number to wait on.
+            var since: ?[]const u8 = null;
+            var timeout_ms: ?[]const u8 = null;
+            while (args.next()) |arg| {
+                if (std.mem.eql(u8, arg, "--since")) {
+                    since = args.next() orelse {
+                        try stderr.writeAll("--since requires a value\n");
+                        return;
+                    };
+                } else if (std.mem.eql(u8, arg, "--timeout")) {
+                    timeout_ms = args.next() orelse {
+                        try stderr.writeAll("--timeout requires a value (milliseconds)\n");
+                        return;
+                    };
+                }
+            }
+            var params_buf: [params_small]u8 = undefined;
+            var p = Params.init(&params_buf);
+            if (since) |v| {
+                const n = argInt(v) orelse {
+                    try stderr.writeAll("Invalid --since: must be an integer\n");
+                    return;
+                };
+                p.int("since", n);
+            }
+            if (timeout_ms) |v| {
+                const n = argInt(v) orelse {
+                    try stderr.writeAll("Invalid --timeout: must be an integer\n");
+                    return;
+                };
+                p.int("timeout_ms", n);
+            }
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
+                return;
+            };
+            try sendAndPrint(socket_path, "workspace.metadata", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "rename")) {
             // amux-cliworkspace rename [<id>] <title>
             const rename_arg1 = args.next() orelse {

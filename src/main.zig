@@ -306,6 +306,54 @@ fn layoutWatcher(socket_path: []const u8) void {
     }
 }
 
+/// A metadata payload the watcher fetched, handed to the GTK main thread.
+const MetadataUpdate = struct {
+    json: []const u8,
+    seq: u64,
+};
+
+fn onMetadataUpdate(data: c.gpointer) callconv(.c) c.gboolean {
+    const alloc = std.heap.c_allocator;
+    const upd: *MetadataUpdate = @ptrCast(@alignCast(data));
+    defer {
+        alloc.free(upd.json);
+        alloc.destroy(upd);
+    }
+
+    const window = global_window orelse return 0;
+    if (window.closing) return 0;
+
+    window.meta_seq = upd.seq;
+    window.applyDaemonMetadata(upd.json);
+    return 0; // G_SOURCE_REMOVE
+}
+
+/// Watch the daemon for status, progress, git and log changes.
+///
+/// Separate from the layout watcher because the two have different costs: a
+/// layout change rebuilds the widget tree, while this only refreshes sidebar
+/// rows. Sharing one sequence number would make an agent's progress report as
+/// expensive as a split.
+fn metadataWatcher(socket_path: []const u8) void {
+    const alloc = std.heap.c_allocator;
+    while (layout_watcher_running.load(.acquire)) {
+        const seq = if (global_window) |w| w.meta_seq else 0;
+
+        const res = daemon_client.metadata(alloc, socket_path, seq, 10_000) catch {
+            std.Thread.sleep(2 * std.time.ns_per_s);
+            continue;
+        };
+        const meta = res orelse continue;
+
+        const upd = alloc.create(MetadataUpdate) catch {
+            alloc.free(meta.json);
+            continue;
+        };
+        upd.* = .{ .json = meta.json, .seq = meta.seq };
+        _ = c.g_idle_add(&onMetadataUpdate, @ptrCast(upd));
+    }
+}
+
 fn onActivate(gtk_app: *c.GtkApplication, _: c.gpointer) callconv(.c) void {
     // Initialize libnotify for desktop notifications
     _ = c.notify_init("amux");
@@ -413,6 +461,12 @@ fn onActivate(gtk_app: *c.GtkApplication, _: c.gpointer) callconv(.c) void {
             t.detach();
         } else |err| {
             log.warn("could not start the layout watcher: {}", .{err});
+        }
+        // And its metadata, so the sidebar shows what agents report.
+        if (std.Thread.spawn(.{}, metadataWatcher, .{sock})) |t| {
+            t.detach();
+        } else |err| {
+            log.warn("could not start the metadata watcher: {}", .{err});
         }
     }
 

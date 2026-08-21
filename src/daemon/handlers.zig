@@ -40,6 +40,7 @@ const methods = [_][]const u8{
     "workspace.select",
     "workspace.close",
     "workspace.rename",
+    "workspace.metadata",
     "workspace.set_status",
     "workspace.clear_status",
     "workspace.add_log",
@@ -88,6 +89,7 @@ pub fn dispatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     if (eq(m, "workspace.select")) return workspaceSelect(alloc, state, req);
     if (eq(m, "workspace.close")) return workspaceClose(alloc, state, req);
     if (eq(m, "workspace.rename")) return workspaceRename(alloc, state, req);
+    if (eq(m, "workspace.metadata")) return workspaceMetadata(alloc, state, req);
     if (eq(m, "workspace.set_status")) return workspaceSetStatus(alloc, state, req);
     if (eq(m, "workspace.clear_status")) return workspaceClearStatus(alloc, state, req);
     if (eq(m, "workspace.add_log")) return workspaceAddLog(alloc, state, req);
@@ -415,6 +417,37 @@ fn workspaceRename(alloc: Allocator, state: *State, req: *const protocol.Request
 // while a window happened to be open. They belong to the daemon: it is what
 // outlives the window.
 // ------------------------------------------------------------------
+
+/// Per-workspace metadata, with a sequence number to follow it by.
+///
+/// The same workspace objects `workspace.list` returns -- status, progress, git,
+/// log -- but waitable, so a sidebar can track them without polling and without
+/// being told about layout changes it does not care about.
+fn workspaceMetadata(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const since: u64 = if (req.getIntParam(alloc, "since")) |v| toU64(v) orelse 0 else 0;
+    const timeout: u32 = if (req.getIntParam(alloc, "timeout_ms")) |v|
+        @intCast(@max(0, @min(v, @as(i64, max_screen_timeout_ms))))
+    else
+        0;
+
+    const seq = state.waitForMeta(since, timeout) orelse {
+        const body = try std.fmt.allocPrint(alloc, "{{\"seq\":{d},\"changed\":false}}", .{since});
+        defer alloc.free(body);
+        return protocol.successResponse(alloc, req.id, body);
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(alloc);
+    const head = try std.fmt.allocPrint(alloc, "{{\"seq\":{d},\"workspaces\":[", .{seq});
+    defer alloc.free(head);
+    try out.appendSlice(alloc, head);
+
+    var builder: WorkspaceJson = .{ .alloc = alloc, .out = &out };
+    try state.withWorkspaces(&builder, WorkspaceJson.append);
+    try out.appendSlice(alloc, "]}");
+
+    return protocol.successResponse(alloc, req.id, out.items);
+}
 
 /// A one-field reply naming the workspace that was changed.
 fn okWorkspace(alloc: Allocator, id: i64, ws_id: u64) ![]const u8 {

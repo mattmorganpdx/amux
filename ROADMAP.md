@@ -230,6 +230,22 @@ Identified via full code review (2026-03-19). These are correctness and safety i
 
 ---
 
+## Next major direction: daemon separation
+
+The socket server currently lives inside the GUI process, so the agent-facing
+capability is built on top of the rendering layer — sessions die with the
+window, and an agent cannot start work unless a human has launched a GUI. The
+plan is an always-on `amuxd` that owns terminal state, with the GUI and CLI as
+clients.
+
+- Design and spike findings: [`docs/architecture/daemon-split.md`](docs/architecture/daemon-split.md)
+- Work plan: [`docs/plan/README.md`](docs/plan/README.md)
+
+The spike is complete: Ghostty's renderer reads a bare `*terminal.Terminal`
+rather than anything Surface-owned, and Ghostty already ships `libghostty-vt`
+(verified building) as a headless terminal engine — so the daemon does not need
+its own VT parser and the GUI does not need its own text renderer.
+
 ## Architecture
 
 - **Language:** Zig 0.15.2 (pinned in `build.zig`), `@cImport` for GTK4 and Ghostty C headers

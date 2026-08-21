@@ -139,7 +139,7 @@ AMUX_SOCKET=/tmp/amuxd.sock amuxd &
 AMUX_SOCKET=/tmp/amuxd.sock amux-cli run "echo hello"
 ```
 
-It answers 22 methods (`system.capabilities` lists them, and reports
+It answers 23 methods (`system.capabilities` lists them, and reports
 `"daemon": true`). Notifications, the command palette, the Claude hooks and the
 sidebar metadata methods are GUI chrome and are not served yet.
 
@@ -172,6 +172,33 @@ probes that path before falling back to `/tmp/amux.sock`. Panes get
 owns it.
 
 Uninstall: `systemctl --user disable --now amuxd.socket && rm ~/.config/systemd/user/amuxd.{socket,service} && systemctl --user daemon-reload`
+
+### Screen state (what an attached client draws)
+
+`surface.screen` returns the screen as cells — dimensions, colours, cursor and
+styled runs — rather than as text. It serializes ghostty's own `RenderState`.
+
+```bash
+amux-cli surface screen                      # whole screen (attach)
+amux-cli surface screen 2                    # a specific surface
+amux-cli surface screen --since 41           # only rows changed after seq 41
+amux-cli surface screen --since 41 --timeout 5000   # wait up to 5s for a change
+```
+
+Pass back the `seq` from the previous reply to get a delta; `since` omitted (or
+0) means "send everything", so attaching and updating are the same call. With
+`timeout_ms` the daemon answers as soon as the screen changes, or returns
+`{"changed":false}` at the deadline. A pane closed under a waiting client comes
+back as `no_surface`.
+
+Colours are resolved to RGB by the daemon, and a default colour the terminal has
+no opinion about is **omitted** rather than sent as black — absent means "use
+your own theme". Each run carries its starting column, so a client never infers
+position from character widths.
+
+This is deliberately not `surface.watch`, which the roadmap reserves for Smart
+Wake's semantic events (TUI detected, prompt waiting). Different question, same
+underlying change notification.
 
 ### Session history
 
@@ -222,4 +249,5 @@ If the Ghostty submodule changes, rebuild via the setup script:
 - **Terminal:** Ghostty embedded apprt via `libghostty.so`
 - **Socket:** Unix domain socket, newline-delimited JSON-RPC, thread-per-client
 - **Store:** SQLite + FTS5 (system library) for archived session scrollback
+- **Screen protocol:** ghostty `RenderState` serialized as JSON; per-row sequence numbers give stateless deltas
 - **Source layout:** `src/` (GUI app), `cli/` (CLI tool), `src/socket/` (server + request router), `src/socket/handlers/` (per-domain handlers: system, workspace, surface, pane, window_api, notification, palette, claude, history, plus `common` for shared main-thread dispatch), `src/daemon/` (the daemon: pty, pane, registry, state, handlers, server, history)

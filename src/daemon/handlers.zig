@@ -43,6 +43,7 @@ const methods = [_][]const u8{
     "surface.current",
     "surface.send_text",
     "surface.read_text",
+    "surface.screen",
     "surface.send_key",
     "surface.split",
     "surface.close",
@@ -75,6 +76,7 @@ pub fn dispatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     if (eq(m, "surface.current")) return surfaceCurrent(alloc, state, req);
     if (eq(m, "surface.send_text")) return sendText(alloc, state, req);
     if (eq(m, "surface.read_text")) return readText(alloc, state, req);
+    if (eq(m, "surface.screen")) return surfaceScreen(alloc, state, req);
     if (eq(m, "surface.send_key")) return sendKey(alloc, state, req);
     if (eq(m, "surface.split")) return split(alloc, state, req);
     if (eq(m, "surface.close")) return closePane(alloc, state, req);
@@ -320,6 +322,56 @@ fn readText(alloc: Allocator, state: *State, req: *const protocol.Request) ![]co
     const body = try std.fmt.allocPrint(alloc, "{{\"text\":\"{s}\",\"surface_id\":{d}}}", .{ escaped, id });
     defer alloc.free(body);
     return protocol.successResponse(alloc, req.id, body);
+}
+
+/// Longest a client may ask the daemon to hold a connection open waiting for the
+/// screen to change. A watcher that wants to wait longer re-asks, which also
+/// makes it prove it is still there.
+const max_screen_timeout_ms: u32 = 30_000;
+
+/// The screen as cells, for a client that draws it.
+///
+/// One method covers attach and update both: pass no `since` and get the whole
+/// screen, pass the `seq` from last time and get only the rows that changed.
+/// Attaching is just `since = 0`, so there is no separate attach handshake that
+/// could disagree with the update path.
+///
+/// `timeout_ms` turns it into a wait: the daemon answers as soon as the screen
+/// changes, or reports no change when the time is up. That is deliberately not
+/// named `surface.watch` -- the roadmap keeps that name for semantic wake events
+/// (a TUI appeared, a prompt is waiting), which is a different question asked by
+/// a different kind of client. Both sit on the same change notification.
+fn surfaceScreen(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const explicit = optionalIdParam(alloc, req, "surface_id");
+    const since: u64 = if (req.getIntParam(alloc, "since")) |v| toU64(v) orelse 0 else 0;
+    const requested: u32 = if (req.getIntParam(alloc, "timeout_ms")) |v|
+        @intCast(@max(0, @min(v, @as(i64, max_screen_timeout_ms))))
+    else
+        0;
+
+    const pane_id = state.resolvePane(explicit) catch |err| return stateError(alloc, req.id, err);
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(alloc);
+
+    const seq = state.paneScreen(pane_id, alloc, &out, .{
+        .since = since,
+        .timeout_ms = requested,
+    }) catch |err| return stateError(alloc, req.id, err);
+
+    if (seq == null) {
+        // Nothing changed in the time allowed. Echoing the sequence number back
+        // means the client can loop on the reply without tracking it separately.
+        const body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"pane_id\":{d},\"seq\":{d},\"changed\":false}}",
+            .{ pane_id, since },
+        );
+        defer alloc.free(body);
+        return protocol.successResponse(alloc, req.id, body);
+    }
+
+    return protocol.successResponse(alloc, req.id, out.items);
 }
 
 fn sendKey(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {

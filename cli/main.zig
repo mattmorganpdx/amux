@@ -45,7 +45,7 @@ const usage_text =
     \\  tree          Show workspace/pane hierarchy
     \\  workspace     Workspace management (list, create, current, select, close, rename,
     \\                  report-git, set-status, clear-status, add-log, clear-log, set-progress, set-pinned, set-color)
-    \\  surface       Surface management (list, current, search, read-text, send-key, split, close)
+    \\  surface       Surface management (list, current, search, read-text, screen, send-key, split, close)
     \\  pane          Pane management (list, break, join, resize, swap)
     \\  window        Window management (list, current)
     \\  run           Run a command and return output (--surface <id>, --timeout <s>, --prompt-pattern <pat>)
@@ -456,6 +456,59 @@ pub fn main() !void {
                 return;
             };
             try sendAndPrint(socket_path, "surface.read_text", params, stdout, stderr);
+        } else if (std.mem.eql(u8, sub, "screen")) {
+            // amux-cli surface screen [surface_id] [--since <seq>] [--timeout <ms>]
+            //
+            // Cells rather than text: styles, colours and cursor, which is what
+            // something drawing the terminal needs. `--since` asks for only the
+            // rows that changed, and `--timeout` waits for a change instead of
+            // reporting there is none.
+            var surface_id: ?[]const u8 = null;
+            var since: ?[]const u8 = null;
+            var timeout_ms: ?[]const u8 = null;
+            while (args.next()) |arg| {
+                if (std.mem.eql(u8, arg, "--since")) {
+                    since = args.next() orelse {
+                        try stderr.writeAll("--since requires a value\n");
+                        return;
+                    };
+                } else if (std.mem.eql(u8, arg, "--timeout")) {
+                    timeout_ms = args.next() orelse {
+                        try stderr.writeAll("--timeout requires a value (milliseconds)\n");
+                        return;
+                    };
+                } else {
+                    surface_id = arg;
+                }
+            }
+            var params_buf: [params_small]u8 = undefined;
+            var p = Params.init(&params_buf);
+            if (surface_id) |sid| {
+                const sid_val = argInt(sid) orelse {
+                    try stderr.writeAll("Invalid surface id: must be an integer\n");
+                    return;
+                };
+                p.int("surface_id", sid_val);
+            }
+            if (since) |v| {
+                const n = argInt(v) orelse {
+                    try stderr.writeAll("Invalid --since: must be an integer\n");
+                    return;
+                };
+                p.int("since", n);
+            }
+            if (timeout_ms) |v| {
+                const n = argInt(v) orelse {
+                    try stderr.writeAll("Invalid --timeout: must be an integer\n");
+                    return;
+                };
+                p.int("timeout_ms", n);
+            }
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
+                return;
+            };
+            try sendAndPrint(socket_path, "surface.screen", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "send-key")) {
             // amux-clisurface send-key [--surface <id>] <key>
             var surface_id: ?[]const u8 = null;
@@ -512,7 +565,7 @@ pub fn main() !void {
             // amux-clisurface close
             try sendAndPrint(socket_path, "surface.close", "{}", stdout, stderr);
         } else {
-            try stderr.writeAll("Unknown surface subcommand. Use: list, current, search, read-text, send-key, split, close\n");
+            try stderr.writeAll("Unknown surface subcommand. Use: list, current, search, read-text, screen, send-key, split, close\n");
         }
     } else if (std.mem.eql(u8, subcommand, "pane")) {
         const sub = args.next() orelse "list";

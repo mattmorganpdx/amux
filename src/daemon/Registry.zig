@@ -21,6 +21,14 @@ alloc: std.mem.Allocator,
 mutex: std.Thread.Mutex = .{},
 panes: std.AutoHashMapUnmanaged(u64, *Pane) = .{},
 
+/// Signalled when any pane's output changes, so a client waiting on a screen
+/// update is woken instead of polling. One condition for all panes: a change to
+/// a pane nobody is watching wakes the wrong waiter, who re-checks and goes back
+/// to sleep. At this scale that costs less than per-pane condition variables
+/// would, and it keeps the waiting rule the same as every other rule here --
+/// hold an id, never a pointer.
+change: std.Thread.Condition = .{},
+
 pub const Error = error{PaneNotFound};
 
 pub fn init(alloc: std.mem.Allocator) Registry {
@@ -45,11 +53,28 @@ pub fn open(self: *Registry, id: u64, opts: Pane.Options) !void {
 
     if (self.panes.contains(id)) return error.PaneExists;
 
-    const pane = try Pane.create(self.alloc, id, opts);
+    var with_notify = opts;
+    with_notify.notify = .{ .ctx = self, .func = notifyChanged };
+
+    const pane = try Pane.create(self.alloc, id, with_notify);
     errdefer pane.destroy();
 
     try self.panes.put(self.alloc, id, pane);
     log.info("opened pane {d}", .{id});
+}
+
+/// Wake anything waiting for a screen update. Runs on a pane's reader thread.
+///
+/// `tryLock`, not `lock`: this thread is the one `Pane.destroy` joins, and
+/// callers run `destroy` while holding this lock -- so blocking here would
+/// deadlock the two against each other. Skipping a broadcast costs only latency,
+/// because a waiter re-checks on its own timer regardless. That backstop is what
+/// makes the non-blocking notify safe rather than merely convenient.
+fn notifyChanged(ctx: *anyopaque) void {
+    const self: *Registry = @ptrCast(@alignCast(ctx));
+    if (!self.mutex.tryLock()) return;
+    self.change.broadcast();
+    self.mutex.unlock();
 }
 
 pub fn close(self: *Registry, id: u64) Error!void {
@@ -89,6 +114,65 @@ pub fn resize(self: *Registry, id: u64, cols: u16, rows: u16) !void {
     defer self.mutex.unlock();
     const pane = self.panes.get(id) orelse return error.PaneNotFound;
     try pane.resize(cols, rows);
+}
+
+/// How long a blocked waiter sleeps before re-checking on its own.
+///
+/// A notify can be skipped (see `notifyChanged`) so this is what bounds the
+/// resulting latency, not just a safety net. Small enough that a dropped
+/// broadcast is not visible to someone typing; large enough that an idle
+/// watcher costs a handful of atomic loads a second.
+const wait_slice_ns: u64 = 25 * std.time.ns_per_ms;
+
+pub const ScreenOptions = struct {
+    /// The sequence number the client last saw. 0 asks for the whole screen,
+    /// which is what attaching does.
+    since: u64 = 0,
+    /// How long to wait for a change before answering "nothing new". 0 answers
+    /// immediately.
+    timeout_ms: u32 = 0,
+};
+
+/// Serialize a pane's screen into `out`, optionally waiting for it to change.
+///
+/// Returns the pane's new sequence number, or null if the timeout passed with
+/// nothing to report.
+///
+/// The wait holds the registry lock, which `timedWait` releases while sleeping,
+/// so panes can still be opened, closed and written to meanwhile. The pane is
+/// looked up again by id after every wake, so a pane closed under a waiting
+/// client comes back as `PaneNotFound` rather than a use-after-free.
+pub fn screen(
+    self: *Registry,
+    id: u64,
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    opts: ScreenOptions,
+) !?u64 {
+    const total_ns = @as(u64, opts.timeout_ms) * std.time.ns_per_ms;
+    var timer: ?std.time.Timer = std.time.Timer.start() catch null;
+
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    var last_gen: ?u64 = null;
+    while (true) {
+        const pane = self.panes.get(id) orelse return Error.PaneNotFound;
+
+        // Only rebuild the render state when the cheap hint says something may
+        // have happened. The first pass always checks, because the client can
+        // be behind for reasons older than this call.
+        const gen = pane.generation();
+        if (last_gen == null or gen != last_gen.?) {
+            last_gen = gen;
+            if (try pane.screenSince(alloc, opts.since, out)) |seq| return seq;
+        }
+
+        const elapsed = if (timer) |*t| t.read() else total_ns;
+        if (elapsed >= total_ns) return null;
+        const slice = @min(total_ns - elapsed, wait_slice_ns);
+        self.change.timedWait(&self.mutex, slice) catch {};
+    }
 }
 
 pub fn hasExited(self: *Registry, id: u64) Error!bool {
@@ -164,8 +248,11 @@ test "routes writes and snapshots to the right pane" {
     try reg.open(a, .{ .argv = &.{ "/bin/sh", "-i" }, .env = &.{"PS1=$ "} });
     try reg.open(b, .{ .argv = &.{ "/bin/sh", "-i" }, .env = &.{"PS1=$ "} });
 
-    try reg.write(a, "echo only_in_pane_a\n");
-    try reg.write(b, "echo only_in_pane_b\n");
+    // Markers assembled by the command, so a copy on screen is output rather
+    // than the shell's echo of what it was asked to run. Depending on the echo
+    // made this race: it is only on once the shell has set the terminal up.
+    try reg.write(a, "printf 'ONLY_IN_%s\\n' 'PANE_A'\n");
+    try reg.write(b, "printf 'ONLY_IN_%s\\n' 'PANE_B'\n");
 
     // Poll pane a for its own marker, then assert b's never leaked into it.
     var waited: usize = 0;
@@ -173,11 +260,11 @@ test "routes writes and snapshots to the right pane" {
     while (waited < 20000) {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         waited += 50;
-        const screen = try reg.snapshot(a, alloc);
-        defer alloc.free(screen);
-        if (std.mem.count(u8, screen, "only_in_pane_a") >= 2) {
+        const text = try reg.snapshot(a, alloc);
+        defer alloc.free(text);
+        if (std.mem.indexOf(u8, text, "ONLY_IN_PANE_A") != null) {
             ok = true;
-            try std.testing.expect(std.mem.indexOf(u8, screen, "only_in_pane_b") == null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "ONLY_IN_PANE_B") == null);
             break;
         }
     }
@@ -194,4 +281,139 @@ test "deinit closes every pane still open" {
     // The allocator checks for leaks when the test ends, so a pane left behind
     // here would fail the test.
     reg.deinit();
+}
+
+test "a waiting client is woken by output instead of polling for it" {
+    const alloc = std.testing.allocator;
+
+    var reg = init(alloc);
+    defer reg.deinit();
+
+    const id: u64 = 1;
+    try reg.open(id, .{ .argv = &.{ "/bin/sh", "-i" } });
+
+    // Attach first, so the wait below starts from a known sequence number.
+    var attach: std.ArrayListUnmanaged(u8) = .{};
+    defer attach.deinit(alloc);
+    const seq = (try reg.screen(id, alloc, &attach, .{})).?;
+    try std.testing.expect(attach.items.len > 0);
+
+    // Nothing has happened since, so a zero timeout reports no change.
+    var empty: std.ArrayListUnmanaged(u8) = .{};
+    defer empty.deinit(alloc);
+    try std.testing.expect((try reg.screen(id, alloc, &empty, .{ .since = seq })) == null);
+
+    try reg.write(id, "echo woken_by_output\n");
+
+    // Generous timeout: the assertion is that it returns *because output
+    // arrived*, which the elapsed time below distinguishes from timing out.
+    var timer = try std.time.Timer.start();
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(alloc);
+    const new_seq = try reg.screen(id, alloc, &out, .{ .since = seq, .timeout_ms = 20_000 });
+
+    try std.testing.expect(new_seq != null);
+    try std.testing.expect(new_seq.? > seq);
+    try std.testing.expect(timer.read() < 19 * std.time.ns_per_s);
+    try std.testing.expect(out.items.len > 0);
+}
+
+/// Drain updates until the pane goes quiet, returning the settled sequence
+/// number. A freshly spawned shell prints a prompt whenever it gets around to
+/// it, and a test that waits on "nothing happening" has to start from actual
+/// silence or it is really just waiting on that prompt.
+fn settle(reg: *Registry, id: u64, alloc: std.mem.Allocator, from: u64) !u64 {
+    var seq = from;
+    var tries: usize = 0;
+    while (tries < 60) : (tries += 1) {
+        var probe: std.ArrayListUnmanaged(u8) = .{};
+        defer probe.deinit(alloc);
+        if (try reg.screen(id, alloc, &probe, .{ .since = seq, .timeout_ms = 150 })) |s| {
+            seq = s;
+        } else return seq;
+    }
+    return error.PaneNeverWentQuiet;
+}
+
+test "closing a pane releases a client waiting on it" {
+    const alloc = std.testing.allocator;
+
+    var reg = init(alloc);
+    defer reg.deinit();
+
+    const id: u64 = 1;
+    try reg.open(id, .{ .argv = &.{ "/bin/sh", "-i" } });
+
+    var attach: std.ArrayListUnmanaged(u8) = .{};
+    defer attach.deinit(alloc);
+    const attached = (try reg.screen(id, alloc, &attach, .{})).?;
+
+    // The pane has to be quiet before the waiter starts, or it returns on the
+    // shell's prompt and never reaches the close this test is about.
+    const seq = try settle(&reg, id, alloc, attached);
+
+    // Wait on a pane that is about to be destroyed under us. Holding an id
+    // rather than a pointer is what makes this answerable at all: the waiter
+    // looks the pane up again after every wake, so a closed pane is an error
+    // rather than a use-after-free.
+    const Waiter = struct {
+        reg: *Registry,
+        alloc: std.mem.Allocator,
+        id: u64,
+        since: u64,
+        err: ?anyerror = null,
+        returned_normally: bool = false,
+
+        fn run(self: *@This()) void {
+            var out: std.ArrayListUnmanaged(u8) = .{};
+            defer out.deinit(self.alloc);
+            _ = self.reg.screen(self.id, self.alloc, &out, .{
+                .since = self.since,
+                .timeout_ms = 20_000,
+            }) catch |e| {
+                self.err = e;
+                return;
+            };
+            self.returned_normally = true;
+        }
+    };
+    var waiter: Waiter = .{ .reg = &reg, .alloc = alloc, .id = id, .since = seq };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+
+    // Give the waiter time to get into the wait, then pull the pane out.
+    std.Thread.sleep(300 * std.time.ns_per_ms);
+    try reg.close(id);
+    thread.join();
+
+    // The point: it came back, and it came back as an error rather than as a
+    // crash or a hang.
+    try std.testing.expect(!waiter.returned_normally);
+    try std.testing.expectEqual(Error.PaneNotFound, waiter.err.?);
+}
+
+test "a wait with nothing to report ends at its deadline" {
+    const alloc = std.testing.allocator;
+
+    var reg = init(alloc);
+    defer reg.deinit();
+
+    const id: u64 = 1;
+    try reg.open(id, .{ .argv = &.{ "/bin/sh", "-i" } });
+
+    var attach: std.ArrayListUnmanaged(u8) = .{};
+    defer attach.deinit(alloc);
+    const attached = (try reg.screen(id, alloc, &attach, .{})).?;
+
+    // Genuinely waiting on silence, not on output still in flight.
+    const seq = try settle(&reg, id, alloc, attached);
+
+    var timer = try std.time.Timer.start();
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(alloc);
+    const res = try reg.screen(id, alloc, &out, .{ .since = seq, .timeout_ms = 400 });
+
+    try std.testing.expect(res == null);
+    // It waited rather than returning immediately, and did not overshoot.
+    try std.testing.expect(timer.read() >= 350 * std.time.ns_per_ms);
+    try std.testing.expect(timer.read() < 3 * std.time.ns_per_s);
 }

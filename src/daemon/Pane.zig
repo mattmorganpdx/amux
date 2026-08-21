@@ -7,6 +7,7 @@
 const std = @import("std");
 const vt = @import("../vt.zig");
 const Pty = @import("Pty.zig");
+const screen_json = @import("screen_json.zig");
 
 const Pane = @This();
 
@@ -38,11 +39,44 @@ terminal: vt.Terminal,
 stream: Stream,
 mutex: std.Thread.Mutex = .{},
 
+/// Ghostty's render-facing view of `terminal`, and the sequence bookkeeping
+/// that turns it into something several clients can follow independently.
+///
+/// `RenderState.update` consumes the terminal's dirty flags, so exactly one of
+/// these may exist per terminal -- the pane owns it and nothing else may build
+/// one. Its per-row dirty flags are likewise meant for a single renderer that
+/// clears them after drawing, so they are folded here into monotonic per-row
+/// sequence numbers: a number can be compared by any number of clients at
+/// different positions, where a consume-once flag cannot.
+render: vt.RenderState = .empty,
+row_seq: []u64 = &.{},
+seq: u64 = 0,
+/// The sequence number of the last change that invalidated the whole screen.
+/// A client that last saw something older has to discard what it holds.
+full_seq: u64 = 0,
+
+/// Called after pty output has been folded into the terminal, so a waiting
+/// client can be woken instead of polling. Invoked with no pane lock held --
+/// the registry takes its own lock in here, and holding both would invert the
+/// order every request takes.
+notify: ?Notify = null,
+
 reader: ?std.Thread = null,
 running: std.atomic.Value(bool) = .init(false),
 
 /// True once the child has exited and the pty reached EOF.
 exited: std.atomic.Value(bool) = .init(false),
+
+/// Bumped whenever something may have changed the terminal. Only a hint, and
+/// deliberately not the sequence number: a waiting client can read this without
+/// taking the pane lock or rebuilding the render state, so an idle wake-up costs
+/// an atomic load instead of a walk over the viewport.
+gen: std.atomic.Value(u64) = .init(0),
+
+pub const Notify = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque) void,
+};
 
 pub const Options = struct {
     argv: []const []const u8,
@@ -51,6 +85,7 @@ pub const Options = struct {
     cols: u16 = 80,
     rows: u16 = 24,
     scrollback: usize = default_scrollback_lines,
+    notify: ?Notify = null,
 };
 
 /// Heap-allocated because the stream handler holds a pointer to `terminal`,
@@ -79,6 +114,7 @@ pub fn create(alloc: std.mem.Allocator, id: u64, opts: Options) !*Pane {
         .terminal = term,
         // Patched below: the handler needs the final address of `terminal`.
         .stream = undefined,
+        .notify = opts.notify,
     };
     self.stream = .{
         .handler = self.terminal.vtHandler(),
@@ -102,6 +138,8 @@ pub fn destroy(self: *Pane) void {
         self.reader = null;
     }
 
+    self.render.deinit(self.alloc);
+    self.alloc.free(self.row_seq);
     self.terminal.deinit(self.alloc);
     const alloc = self.alloc;
     alloc.destroy(self);
@@ -127,14 +165,102 @@ pub fn snapshotScrollback(self: *Pane, alloc: std.mem.Allocator) ![]const u8 {
 }
 
 pub fn resize(self: *Pane, cols: u16, rows: u16) !void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    try self.terminal.resize(self.alloc, cols, rows);
-    try self.pty.resize(.{ .cols = cols, .rows = rows });
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.terminal.resize(self.alloc, cols, rows);
+        try self.pty.resize(.{ .cols = cols, .rows = rows });
+    }
+    // The one change that does not arrive as pty output, so it has to be
+    // announced here or a waiting client would not see the new geometry.
+    _ = self.gen.fetchAdd(1, .release);
+    if (self.notify) |n_| n_.func(n_.ctx);
 }
 
 pub fn hasExited(self: *const Pane) bool {
     return self.exited.load(.acquire);
+}
+
+/// Refresh the render state and fold its dirty flags into sequence numbers.
+/// Caller holds `mutex`. Returns the pane's current sequence number.
+fn refreshLocked(self: *Pane) !u64 {
+    try self.render.update(self.alloc, &self.terminal);
+
+    const rows: usize = self.render.rows;
+    if (self.row_seq.len != rows) {
+        // A resize moves every cell a client is holding, so the only honest
+        // answer is that all of it is stale.
+        self.row_seq = try self.alloc.realloc(self.row_seq, rows);
+        self.seq += 1;
+        @memset(self.row_seq, self.seq);
+        self.full_seq = self.seq;
+        clearRowDirty(&self.render);
+        self.render.dirty = .false;
+        return self.seq;
+    }
+
+    if (self.render.dirty == .false) return self.seq;
+
+    self.seq += 1;
+    const full = self.render.dirty == .full;
+    const slice = self.render.row_data.slice();
+    const dirties = slice.items(.dirty);
+    var y: usize = 0;
+    while (y < rows) : (y += 1) {
+        if (full or dirties[y]) self.row_seq[y] = self.seq;
+        // We are the only consumer of these flags, so clearing them here is
+        // what makes the next refresh able to tell new changes from old.
+        dirties[y] = false;
+    }
+    if (full) self.full_seq = self.seq;
+    self.render.dirty = .false;
+    return self.seq;
+}
+
+fn clearRowDirty(state: *vt.RenderState) void {
+    const slice = state.row_data.slice();
+    for (slice.items(.dirty)) |*d| d.* = false;
+}
+
+/// Serialize the screen for a client that last saw `since`, or return null if
+/// nothing has changed since then.
+///
+/// One call does the refresh and the serialization together: splitting them
+/// would mean releasing the lock in between, and the state could move.
+pub fn screenSince(
+    self: *Pane,
+    alloc: std.mem.Allocator,
+    since: u64,
+    out: *std.ArrayListUnmanaged(u8),
+) !?u64 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    const seq = try self.refreshLocked();
+    if (since >= seq and since != 0) return null;
+
+    // Read the defaults off the terminal rather than the render state: the
+    // render state collapses "unset" to black, and unset is what a terminal
+    // with no configured theme actually reports.
+    const fg = self.terminal.colors.foreground.get();
+    const bg = self.terminal.colors.background.get();
+
+    try screen_json.write(alloc, out, &self.render, self.row_seq, .{
+        .since = since,
+        .pane_id = self.id,
+        .full = since < self.full_seq,
+        .seq = seq,
+        .exited = self.exited.load(.acquire),
+        .fg = fg,
+        .bg = bg,
+        .reverse = self.terminal.modes.get(.reverse_colors),
+    });
+    return seq;
+}
+
+/// The change hint. See `gen`.
+pub fn generation(self: *const Pane) u64 {
+    return self.gen.load(.acquire);
 }
 
 /// Pumps pty output into the terminal until EOF or shutdown.
@@ -148,13 +274,21 @@ fn readLoop(self: *Pane) void {
         if (n == 0) break; // child exited
 
         self.mutex.lock();
-        defer self.mutex.unlock();
         self.stream.nextSlice(buf[0..n]) catch |err| {
             // A malformed sequence should cost us that sequence, not the pane.
             log.warn("pane {d}: stream error: {}", .{ self.id, err });
         };
+        self.mutex.unlock();
+
+        _ = self.gen.fetchAdd(1, .release);
+        // Outside the lock on purpose: see `notify`.
+        if (self.notify) |n_| n_.func(n_.ctx);
     }
     self.exited.store(true, .release);
+    _ = self.gen.fetchAdd(1, .release);
+    // A client blocked waiting for output needs to learn the pane is finished,
+    // which is a change like any other.
+    if (self.notify) |n_| n_.func(n_.ctx);
     log.debug("pane {d}: reader finished", .{self.id});
 }
 

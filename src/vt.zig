@@ -34,6 +34,31 @@ pub const point = vt.point;
 /// scrollback, which is a different thing from querying closed sessions.
 pub const search = vt.search;
 
+/// Ghostty's own render-facing snapshot of a terminal: dimensions, colors,
+/// cursor, and per-row cells with dirty tracking. This is what a renderer
+/// consumes upstream, so it is what the screen wire protocol serializes --
+/// building a parallel representation would mean maintaining a second idea of
+/// what a terminal looks like.
+///
+/// One caveat shapes the whole design: `update` *consumes* the terminal's dirty
+/// flags, so at most one RenderState may exist per Terminal. The pane owns it.
+pub const RenderState = vt.RenderState;
+
+/// Cell styling. `flags.underline` is an enum, so `@tagName` names it.
+pub const Style = vt.Style;
+
+/// `Style.Flags` is not `pub` upstream, so it cannot be named directly even
+/// though the field is public. Deriving it from the field is the seam's job:
+/// one place to fix if upstream exports it later.
+pub const StyleFlags = @FieldType(Style, "flags");
+
+/// A cell as stored in a page: content tag, codepoint, style id, wide flag.
+pub const Cell = vt.Cell;
+
+/// Colors and the 256-entry palette. Palette indices are resolved to RGB
+/// before anything goes on the wire, so a client never needs the palette.
+pub const color = vt.color;
+
 test "terminal engine is usable from amux" {
     const alloc = std.testing.allocator;
 

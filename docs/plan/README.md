@@ -14,7 +14,7 @@ Roughly dependency-ordered. **D** = de-risking, do early.
 | 2 | ~~Wire `ghostty-vt` into amux's build as a Zig module~~ **done** | — |
 | 3 | ~~`amuxd`: own PTYs and terminal state~~ **done** | 2 |
 | 4 | ~~Move socket handlers behind the daemon, and the pane tree / workspaces with them~~ **done** | 3 |
-| 5 | Screen-state wire protocol (snapshot + delta) | 3 |
+| 5 | ~~Screen-state wire protocol (snapshot + delta)~~ **done** | 3 |
 | 6 | GUI becomes an attach client | 1, 5 |
 | 7 | ~~systemd socket activation~~ **done** | 4 |
 | 8 | ~~Scrollback + history into the daemon; pick a store~~ **done** | 3 |
@@ -183,14 +183,121 @@ The GUI still runs its own socket server until item 6, and both default to
 `/tmp/amux.sock`. They cannot both use the default path; give one an
 `AMUX_SOCKET` override while both exist.
 
-## 5. Screen-state wire protocol
+## 5. Screen-state wire protocol — **DONE**
 
-How an attached client learns what to draw. Snapshot on attach, deltas after.
+`surface.screen` returns the screen as cells: dimensions, colours, cursor and
+styled text. `src/daemon/screen_json.zig` is the format, and it serializes
+ghostty's own `RenderState` rather than a representation of amux's own devising
+-- upstream already maintains a render-facing view of a terminal, and keeping a
+second idea of what a terminal looks like is how the two drift apart.
 
-Start with the cheapest correct thing — whole viewport on change — then measure
-before optimising to dirty rows or damage rects. Getting attach correct matters
-more than getting it cheap, and this is the piece that made the "output tee"
-alternative unworkable.
+### One constraint drove the whole design
+
+`RenderState.update` **consumes** the terminal's dirty flags, and its per-row
+`dirty` booleans are meant for a single renderer that clears them once it has
+drawn. So at most one render state can exist per terminal, and its dirty flags
+cannot be read twice.
+
+That is fine for one renderer and useless for a daemon, which may have several
+clients at different positions. So the pane owns the one render state and folds
+those consume-once flags into **monotonic per-row sequence numbers**: on every
+refresh the pane bumps a counter and stamps it onto the rows that changed. A
+number can be compared by any number of readers; a flag that clears itself
+cannot.
+
+Everything else falls out of that:
+
+- **Deltas are stateless on the server.** A client sends the seq it last saw and
+  gets back the rows stamped later than that. The daemon keeps nothing per
+  client, so a client can reconnect, skip updates or run behind without the
+  daemon tracking it.
+- **Attach is just `since = 0`.** A snapshot and a delta are the same code path,
+  so there is no separate attach handshake that can disagree with the update
+  path -- which is the part the plan said mattered most.
+- **Several clients can watch one pane.** Verified with two following the same
+  pane: both received identical, complete update streams.
+
+### Deviation: per-row deltas immediately, not whole-viewport-then-measure
+
+The plan said to send the whole viewport on every change and measure before
+optimising. The measurement turned out to be the cheap part and the
+"optimisation" was already computed upstream -- ghostty tracks which rows
+changed whether or not anyone asks. Reading a flag it already sets is not a
+premature optimisation, so the first version does per-row deltas.
+
+Measured with two clients following a pane printing a line every 300ms for six
+seconds: **28 rows sent where full screens would have been 336, or 8%.** A full
+80x24 attach is about 3KB.
+
+### Waiting, and why it is not called `surface.watch`
+
+`timeout_ms` turns the call into a wait: the daemon answers the moment the
+screen changes, or reports `changed: false` at the deadline. Measured wake
+latency is ~10ms against output arriving a second into a five-second wait.
+
+It is a long poll rather than server-pushed updates. A push model needs a queue
+per client, a policy for a client that reads slower than the terminal produces,
+and a way to drop or coalesce when that queue fills. A client that asks again
+has none of those: nothing accumulates, a client that stops asking simply stops
+being served, and the reply is always the current state rather than a backlog to
+replay.
+
+The name is deliberate. The roadmap keeps `surface.watch` for Smart Wake --
+semantic events for an *agent* ("a TUI appeared", "a prompt is waiting"), which
+is a different question than "what should I draw". Both sit on the same change
+notification inside the registry.
+
+### Two smaller decisions
+
+**Colours are resolved to RGB in the daemon.** Cells can name a palette index
+and the program can redefine the palette, so resolving here means a client can
+never render against a stale one.
+
+**An unset default colour is omitted, not sent as black.** A terminal with no
+configured theme reports its default foreground and background as unset, and
+`RenderState` collapses that to `#000000` -- which would have a client draw
+black text on a black background. Absent means "use your own theme", which is
+the honest answer from a daemon that has no theme. Reverse video ships as a flag
+for the same reason: with the defaults unset, only the client knows which two
+colours to swap.
+
+Cells are emitted as runs of equal style, each carrying its **starting column**,
+so a client never infers position from character widths. That matters because a
+wide character occupies two columns and its trailing spacer cell is skipped
+entirely.
+
+### Things found on the way
+
+**A delta includes the row the cursor left.** Moving the cursor off a row marks
+that row changed, because a renderer has to repaint the cell it vacated. A test
+asserting "one row changed" was wrong, not the code.
+
+**`Style.Flags` is not `pub` upstream** even though the field is, so the type
+cannot be named. `src/vt.zig` derives it with `@FieldType` -- one place to fix
+if upstream exports it.
+
+**Restarting a daemon on the same socket path can unlink the new socket.** A
+stopping daemon ends by deleting its socket file; start a replacement before the
+old one finishes and the old one deletes the new one's path. The new daemon goes
+on listening on an unlinked inode, so it logs "listening" while every client
+gets "no such file". Not introduced here and not fixed here -- socket activation
+avoids it, since systemd owns the path -- but it is worth knowing before
+debugging a daemon that is demonstrably running and demonstrably unreachable.
+
+### Known gaps
+
+- **No `surface.resize` on the wire.** Terminal size is a fixed condition for
+  now, by decision. The *protocol* handles a size change correctly -- a resize
+  stamps every row and sets `full`, so a client throws its grid away -- there is
+  just no method to ask for one.
+- **The viewport only.** `RenderState` is viewport-specific, so this sends what
+  is on screen, not scrollback. Scrolling an attached client means moving the
+  daemon's viewport, which needs a method that does not exist yet. Item 6.
+
+52 tests, 10 of them new. Verified by mutation: disabling the delta filter fails
+the delta test, and looking the pane up once instead of on every wake turns the
+close-under-a-waiting-client test into the use-after-free it was written to
+catch.
 
 ## 6. GUI becomes an attach client
 

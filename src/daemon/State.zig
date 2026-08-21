@@ -181,6 +181,23 @@ pub fn readPane(self: *State, pane_id: ?u64, alloc: Allocator, scrollback: bool)
 }
 
 /// The focused pane of the selected workspace, or `explicit` if given.
+/// Serialize a pane's screen, optionally waiting for it to change.
+///
+/// Deliberately does *not* take the state lock. This blocks for as long as the
+/// caller's timeout, and holding the state lock that long would stall every
+/// other request in the daemon. Nothing here reads what that lock protects --
+/// the pane tree and workspace list are untouched, and the registry has its own
+/// lock. Resolve the id with `resolvePane` first, which does take it.
+pub fn paneScreen(
+    self: *State,
+    pane_id: u64,
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    opts: Registry.ScreenOptions,
+) !?u64 {
+    return self.registry.screen(pane_id, alloc, out, opts);
+}
+
 pub fn resolvePane(self: *State, explicit: ?u64) Error!u64 {
     self.mutex.lock();
     defer self.mutex.unlock();
@@ -470,7 +487,12 @@ test "writes and reads reach the addressed pane" {
 
     _ = try state.createWorkspace(null, null);
     const pane = try state.resolvePane(null);
-    try state.writePane(pane, "echo state_round_trip\n");
+    // The marker is assembled by the command rather than written in it, so it
+    // can only appear as *output*. Waiting for two copies -- the shell's echo
+    // and the result -- looked equivalent but raced: a write that lands before
+    // the shell turns echo on produces one copy and never a second, so the test
+    // failed intermittently no matter how long it waited.
+    try state.writePane(pane, "printf 'STATE_%s\\n' 'ROUND_TRIP'\n");
 
     var waited: usize = 0;
     while (waited < 20000) {
@@ -478,7 +500,7 @@ test "writes and reads reach the addressed pane" {
         waited += 50;
         const text = try state.readPane(pane, alloc, false);
         defer alloc.free(text);
-        if (std.mem.count(u8, text, "state_round_trip") >= 2) return;
+        if (std.mem.indexOf(u8, text, "STATE_ROUND_TRIP") != null) return;
     }
     return error.NeverSawOutput;
 }

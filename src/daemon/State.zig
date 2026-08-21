@@ -33,6 +33,11 @@ mutex: std.Thread.Mutex = .{},
 tab_manager: TabManager,
 registry: Registry,
 
+/// Injected into every pane as AMUX_SOCKET_PATH, so `amux-cli` run from inside
+/// a pane reaches the daemon that owns it without any configuration. Set by
+/// amuxd before serving; tests leave it null.
+socket_path: ?[]const u8 = null,
+
 pub const Error = error{
     WorkspaceNotFound,
     PaneNotFound,
@@ -303,9 +308,20 @@ fn spawnPaneLocked(self: *State, pane_id: u64, ws: *Workspace) !void {
     const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
     const cwd: ?[]const u8 = if (ws.cwd_len > 0) ws.cwd_buf[0..ws.cwd_len] else null;
 
+    var sock_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    var env_buf: [4][]const u8 = undefined;
+    var env_len: usize = 3;
+    env_buf[0] = "TERM=xterm-256color";
+    env_buf[1] = ws_env;
+    env_buf[2] = pane_env;
+    if (self.socket_path) |sp| {
+        env_buf[3] = try std.fmt.bufPrint(&sock_buf, "AMUX_SOCKET_PATH={s}", .{sp});
+        env_len = 4;
+    }
+
     try self.registry.open(pane_id, .{
         .argv = &.{shell},
-        .env = &.{ "TERM=xterm-256color", ws_env, pane_env },
+        .env = env_buf[0..env_len],
         .cwd = cwd,
         .cols = default_cols,
         .rows = default_rows,

@@ -45,6 +45,11 @@ client_drained: std.Thread.Condition = .{},
 clients: std.AutoHashMapUnmanaged(posix.socket_t, void) = .{},
 active_clients: usize = 0,
 
+/// True when systemd handed us the listening socket. Changes two things: we
+/// must not bind (it is already listening), and we must not delete the socket
+/// file, because systemd owns its lifetime.
+socket_activated: bool = false,
+
 pub fn init(alloc: Allocator, state: *State, socket_path: []const u8) !*Server {
     const self = try alloc.create(Server);
     self.* = .{
@@ -67,19 +72,16 @@ pub fn deinit(self: *Server) void {
 }
 
 pub fn start(self: *Server) !void {
-    std.fs.deleteFileAbsolute(self.socket_path) catch {};
+    const fd = if (inheritedSocket()) |inherited| blk: {
+        self.socket_activated = true;
+        log.info("using socket-activated listener from systemd", .{});
+        break :blk inherited;
+    } else try self.bindOwnSocket();
 
-    const addr = try std.net.Address.initUnix(self.socket_path);
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    errdefer posix.close(fd);
-
-    // 0600, applied atomically by bind() rather than chmod()ed afterwards.
-    {
-        const prev = std.c.umask(0o177);
-        defer _ = std.c.umask(prev);
-        try posix.bind(fd, &addr.any, addr.getOsSockLen());
-    }
-    try posix.listen(fd, 16);
+    // Keep the listener out of the shells we spawn. Without this every pane's
+    // child inherits it, which both leaks a descriptor per pane and keeps the
+    // socket alive if the daemon dies.
+    setCloexec(fd);
 
     self.listen_fd = fd;
     self.running.store(true, .release);
@@ -88,12 +90,69 @@ pub fn start(self: *Server) !void {
     log.info("listening on {s}", .{self.socket_path});
 }
 
+/// The sd_listen_fds handshake, without linking libsystemd.
+///
+/// systemd sets LISTEN_PID to the pid it activated and LISTEN_FDS to the count,
+/// with the descriptors starting at 3. The variables are cleared afterwards so
+/// the shells we spawn do not inherit them and mistake themselves for
+/// socket-activated services.
+fn inheritedSocket() ?posix.socket_t {
+    const listen_pid = posix.getenv("LISTEN_PID") orelse return null;
+    const listen_fds = posix.getenv("LISTEN_FDS") orelse return null;
+
+    const pid = std.fmt.parseInt(std.posix.pid_t, listen_pid, 10) catch return null;
+    const count = std.fmt.parseInt(u32, listen_fds, 10) catch return null;
+
+    // Not meant for us: an ancestor was activated and we merely inherited the
+    // environment.
+    if (pid != std.os.linux.getpid()) return null;
+    if (count < 1) return null;
+    if (count > 1) log.warn("systemd passed {d} sockets; using the first", .{count});
+
+    _ = unsetenv("LISTEN_PID");
+    _ = unsetenv("LISTEN_FDS");
+    _ = unsetenv("LISTEN_FDNAMES");
+
+    // SD_LISTEN_FDS_START
+    return 3;
+}
+
+fn bindOwnSocket(self: *Server) !posix.socket_t {
+    std.fs.deleteFileAbsolute(self.socket_path) catch {};
+
+    const addr = try std.net.Address.initUnix(self.socket_path);
+    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    errdefer posix.close(fd);
+
+    // 0600, applied atomically by bind() rather than chmod()ed afterwards.
+    // Under socket activation this is systemd's job instead: SocketMode=0600.
+    {
+        const prev = std.c.umask(0o177);
+        defer _ = std.c.umask(prev);
+        try posix.bind(fd, &addr.any, addr.getOsSockLen());
+    }
+    try posix.listen(fd, 16);
+    return fd;
+}
+
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn setCloexec(fd: posix.fd_t) void {
+    const flags = posix.fcntl(fd, posix.F.GETFD, 0) catch return;
+    _ = posix.fcntl(fd, posix.F.SETFD, flags | @as(usize, std.posix.FD_CLOEXEC)) catch {};
+}
+
 /// Returns false if the drain timed out with handlers still running.
 pub fn stop(self: *Server) bool {
     if (!self.running.swap(false, .acq_rel)) return true;
 
     if (self.listen_fd) |fd| {
-        posix.shutdown(fd, .both) catch {};
+        // Only shut down a socket we created. Under socket activation systemd
+        // owns this socket and hands the *same* one to the next start, so
+        // shutdown() breaks it permanently -- every later accept() then fails
+        // with SocketNotListening. Closing our descriptor is enough; the accept
+        // loop notices `running` going false on its own.
+        if (!self.socket_activated) posix.shutdown(fd, .both) catch {};
         posix.close(fd);
         self.listen_fd = null;
     }
@@ -103,7 +162,8 @@ pub fn stop(self: *Server) bool {
     }
 
     const drained = self.drainClients();
-    std.fs.deleteFileAbsolute(self.socket_path) catch {};
+    // Only ours to remove if we created it; systemd cleans up its own.
+    if (!self.socket_activated) std.fs.deleteFileAbsolute(self.socket_path) catch {};
     return drained;
 }
 
@@ -126,15 +186,46 @@ fn drainClients(self: *Server) bool {
     return true;
 }
 
+/// Give up after this many consecutive accept failures. A listener that keeps
+/// erroring will not fix itself, and retrying in a tight loop burns a core and
+/// floods the journal -- which is exactly what a permanently shut-down socket
+/// did before the fix above.
+const max_consecutive_accept_errors = 16;
+
 fn acceptLoop(self: *Server) void {
     const listen_fd = self.listen_fd orelse return;
+    var consecutive_errors: usize = 0;
 
     while (self.running.load(.acquire)) {
-        const client = posix.accept(listen_fd, null, null, 0) catch |err| {
+        // Wait for a connection with a timeout rather than blocking forever, so
+        // shutdown is noticed without having to break the listening socket.
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = listen_fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = posix.poll(&poll_fds, 200) catch |err| {
             if (!self.running.load(.acquire)) break;
+            log.warn("poll error: {}", .{err});
+            consecutive_errors += 1;
+            if (consecutive_errors >= max_consecutive_accept_errors) break;
+            continue;
+        };
+        if (ready == 0) continue;
+
+        const client = posix.accept(listen_fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
+            if (!self.running.load(.acquire)) break;
+            consecutive_errors += 1;
+            if (consecutive_errors >= max_consecutive_accept_errors) {
+                log.err("giving up after {d} consecutive accept errors, last: {}", .{
+                    consecutive_errors, err,
+                });
+                break;
+            }
             log.warn("accept error: {}", .{err});
             continue;
         };
+        consecutive_errors = 0;
         if (!self.running.load(.acquire)) {
             posix.close(client);
             break;
@@ -239,4 +330,56 @@ fn reply(self: *Server, stream: std.net.Stream, maybe: anytype) void {
     defer self.alloc.free(body);
     stream.writeAll(body) catch {};
     stream.writeAll("\n") catch {};
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+test "socket activation is ignored unless LISTEN_PID names this process" {
+    // A process whose ancestor was socket-activated inherits these variables.
+    // Adopting fd 3 in that case would take whatever descriptor happens to be
+    // there, which is not a listening socket.
+    _ = setenv("LISTEN_PID", "1", 1);
+    _ = setenv("LISTEN_FDS", "1", 1);
+    defer {
+        _ = unsetenv("LISTEN_PID");
+        _ = unsetenv("LISTEN_FDS");
+    }
+    try std.testing.expect(inheritedSocket() == null);
+}
+
+test "socket activation is ignored when no descriptors were passed" {
+    var pid_buf: [24]u8 = undefined;
+    const pid_str = try std.fmt.bufPrintZ(&pid_buf, "{d}", .{std.os.linux.getpid()});
+    _ = setenv("LISTEN_PID", pid_str, 1);
+    _ = setenv("LISTEN_FDS", "0", 1);
+    defer {
+        _ = unsetenv("LISTEN_PID");
+        _ = unsetenv("LISTEN_FDS");
+    }
+    try std.testing.expect(inheritedSocket() == null);
+}
+
+test "a bound socket is 0600 and is removed on stop" {
+    const alloc = std.testing.allocator;
+
+    var state = State.init(alloc);
+    defer state.deinit();
+
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/amux-servertest-{d}.sock", .{
+        std.os.linux.getpid(),
+    });
+    std.fs.deleteFileAbsolute(path) catch {};
+
+    const server = try init(alloc, &state, path);
+    try server.start();
+
+    const st = try std.fs.cwd().statFile(path);
+    // Anyone who can connect can drive every terminal the daemon owns.
+    try std.testing.expectEqual(@as(u16, 0o600), @as(u16, @intCast(st.mode & 0o777)));
+    try std.testing.expect(!server.socket_activated);
+
+    server.deinit();
+    // We created it, so we clean it up.
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(path));
 }

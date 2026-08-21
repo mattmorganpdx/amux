@@ -517,14 +517,27 @@ fn commonPrefixLen(a: []const u8, b: []const u8) usize {
     return i;
 }
 
-/// Consume `command` from the front of `text`, ignoring CR/LF in `text` so a
-/// wrapped echo still matches. Returns what follows, or null if `text` does not
-/// begin with the echo.
+/// Find the echoed command in `text` and return what follows it.
+///
+/// Searches rather than matching a prefix: the new region routinely starts with
+/// the prompt the shell printed before echoing, and prompts are arbitrary. CR
+/// and LF in `text` are skipped while comparing, so an echo the terminal wrapped
+/// at the column limit still matches.
 fn skipEcho(text: []const u8, command: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    // The echo may be preceded by leftover prompt characters on the same line.
-    while (i < text.len and (text[i] == '\n' or text[i] == '\r' or text[i] == ' ')) i += 1;
+    if (command.len == 0) return null;
+    var start: usize = 0;
+    while (start < text.len) : (start += 1) {
+        // Cheap rejection before walking the whole candidate.
+        if (text[start] != command[0]) continue;
+        if (matchIgnoringBreaks(text, start, command)) |end| return text[end..];
+    }
+    return null;
+}
 
+/// If `command` matches `text` from `start` (ignoring CR/LF in `text`), return
+/// the index just past the match.
+fn matchIgnoringBreaks(text: []const u8, start: usize, command: []const u8) ?usize {
+    var i = start;
     var ci: usize = 0;
     while (i < text.len and ci < command.len) : (i += 1) {
         const ch = text[i];
@@ -532,8 +545,7 @@ fn skipEcho(text: []const u8, command: []const u8) ?[]const u8 {
         if (ch != command[ci]) return null;
         ci += 1;
     }
-    if (ci < command.len) return null;
-    return text[i..];
+    return if (ci == command.len) i else null;
 }
 
 fn trimBlank(s: []const u8) []const u8 {

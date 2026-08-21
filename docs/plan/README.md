@@ -16,7 +16,7 @@ Roughly dependency-ordered. **D** = de-risking, do early.
 | 4 | ~~Move socket handlers behind the daemon, and the pane tree / workspaces with them~~ **done** | 3 |
 | 5 | Screen-state wire protocol (snapshot + delta) | 3 |
 | 6 | GUI becomes an attach client | 1, 5 |
-| 7 | systemd socket activation | 4 |
+| 7 | ~~systemd socket activation~~ **done** | 4 |
 | 8 | Scrollback + history into the daemon; pick a store | 3 |
 
 ---
@@ -206,16 +206,57 @@ These are the two most recently hardened files in the codebase, so expect to
 retire fixes along with the code — including the `onRealize` surface-leak fix,
 which only exists because the GUI owns surfaces.
 
-## 7. systemd socket activation
+## 7. systemd socket activation — **DONE**
 
-`amux.socket` + `amux.service` user units, so the first `amux-cli` call starts
-the daemon. This is what actually delivers "just ready to go" — without it an
-agent still has to care whether a process is running.
+`dist/systemd/` holds `amuxd.socket`, `amuxd.service` and an `install.sh` that
+resolves the binary path and enables the socket. After that the first
+`amux-cli` call starts the daemon: nothing is running beforehand and nothing has
+to be launched by hand. Measured at 230ms for the activating call.
 
-Include: socket path resolution consistent with the existing
-`AMUX_SOCKET` → `AMUX_SOCKET_PATH` → `/tmp/amux.sock` order, and the `0600`
-permission behaviour (systemd creates the socket, so the umask trick in
-`server.zig` stops applying — the unit needs `SocketMode=0600`).
+- The socket lives at `%t/amux.sock` (`/run/user/<uid>/amux.sock`): per-user,
+  cleaned up on logout, and not in world-writable `/tmp`.
+- `SocketMode=0600`, which is systemd's equivalent of the umask `server.zig`
+  applies when it binds the socket itself.
+- `Accept=no` (the default), so systemd hands over the listening socket and one
+  daemon serves every client.
+- The daemon implements the `sd_listen_fds` handshake directly rather than
+  linking libsystemd: check `LISTEN_PID` against our own pid, take fd 3, then
+  clear the variables so spawned shells do not inherit them.
+
+Two discovery fixes went with it:
+
+- **The daemon injects `AMUX_SOCKET_PATH` into every pane**, which the GUI did
+  but the daemon had been missing. `amux-cli` run inside a pane therefore
+  reaches the daemon that owns it with no configuration.
+- **The CLI probes `$XDG_RUNTIME_DIR/amux.sock`** between the environment
+  variables and the `/tmp` default. A probe rather than an unconditional
+  preference, so a GUI still serving `/tmp/amux.sock` keeps working.
+
+### Two bugs that only a real restart could find
+
+**`stop()` was breaking systemd's socket permanently.** It called
+`shutdown()` on the listener to wake a blocked `accept()`. That is right for a
+socket we created and wrong for an inherited one: systemd hands the *same*
+socket to the next start, so after the first stop every `accept()` failed with
+`SocketNotListening` forever. Activation worked once and never again. `shutdown()`
+is now only used on a socket we own, and the accept loop `poll()`s with a
+timeout so it notices shutdown without needing the socket broken.
+
+**The accept loop could spin.** With the listener permanently broken it retried
+in a tight loop: 64,946 failures in two minutes, one core saturated, journal
+flooded. It now gives up after 16 consecutive failures, because a listener that
+keeps erroring will not fix itself.
+
+Descriptors are also `CLOEXEC` now -- the listener and every accepted
+connection. Without that each spawned shell inherited the listening socket,
+leaking a descriptor per pane and keeping the socket alive if the daemon died.
+
+Verified against real systemd user units: socket listening at 0600 with the
+service inactive, activation on first connect, three stop/restart cycles each
+re-activating cleanly, 0 accept errors and 7.6% CPU on the current instance,
+`AMUX_SOCKET_PATH` present in panes, and `amux-cli` working from inside a pane
+with the daemon's own environment stripped. The units were uninstalled and the
+session file restored afterwards, so nothing was left behind.
 
 ## 8. Scrollback and history into the daemon; pick a store
 

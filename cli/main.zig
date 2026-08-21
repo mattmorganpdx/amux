@@ -87,11 +87,9 @@ pub fn main() !void {
     }
     const subcommand = first_arg;
 
-    // Determine socket path: --socket flag > env vars > default
-    const socket_path = socket_override orelse
-        posix.getenv("AMUX_SOCKET") orelse
-        posix.getenv("AMUX_SOCKET_PATH") orelse
-        "/tmp/amux.sock";
+    // Determine socket path: --socket flag > env vars > runtime dir > default
+    var socket_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const socket_path = resolveSocketPath(socket_override, &socket_path_buf);
 
     // args iterator now points to the first argument after the subcommand.
     if (std.mem.eql(u8, subcommand, "ping")) {
@@ -1124,6 +1122,25 @@ const Params = struct {
         return self.buf[0..self.len];
     }
 };
+
+/// Where to find the server.
+///
+/// The runtime-directory probe is what lets a systemd-activated daemon be found
+/// with no configuration: the unit listens on `$XDG_RUNTIME_DIR/amux.sock`. It
+/// is a probe rather than an unconditional preference so that a GUI still
+/// serving `/tmp/amux.sock` keeps working.
+fn resolveSocketPath(override: ?[]const u8, buf: []u8) []const u8 {
+    const default = "/tmp/amux.sock";
+    if (override) |o| return o;
+    if (posix.getenv("AMUX_SOCKET")) |v| return v;
+    if (posix.getenv("AMUX_SOCKET_PATH")) |v| return v;
+    if (posix.getenv("XDG_RUNTIME_DIR")) |dir| {
+        const candidate = std.fmt.bufPrint(buf, "{s}/amux.sock", .{dir}) catch return default;
+        std.fs.accessAbsolute(candidate, .{}) catch return default;
+        return candidate;
+    }
+    return default;
+}
 
 /// Parse a CLI argument that must reach the server as a JSON number.
 fn argInt(text: []const u8) ?i64 {

@@ -150,6 +150,20 @@ GUI becomes a client of the daemon in work-plan item 6.
 `amuxd --self-check` spawns a shell, runs a command and reads it back off the
 parsed screen.
 
+### Socket activation
+
+```bash
+./dist/systemd/install.sh        # enables amuxd.socket as a user unit
+amux-cli ping                    # first call starts the daemon
+```
+
+The socket lands at `$XDG_RUNTIME_DIR/amux.sock` with mode 0600, and `amux-cli`
+probes that path before falling back to `/tmp/amux.sock`. Panes get
+`AMUX_SOCKET_PATH`, so `amux-cli` inside a pane always reaches the daemon that
+owns it.
+
+Uninstall: `systemctl --user disable --now amuxd.socket && rm ~/.config/systemd/user/amuxd.{socket,service} && systemctl --user daemon-reload`
+
 Tests:
 
 ```bash

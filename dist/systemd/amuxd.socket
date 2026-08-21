@@ -1,0 +1,21 @@
+[Unit]
+Description=amux terminal daemon socket
+Documentation=https://github.com/mattmorganpdx/amux
+
+[Socket]
+# %t is the per-user runtime directory, so the socket lives at
+# /run/user/<uid>/amux.sock: cleaned up on logout, and not in world-writable
+# /tmp. amux-cli finds it here without configuration.
+ListenStream=%t/amux.sock
+
+# Anyone who can connect can drive every terminal the daemon owns. systemd
+# creates the socket here, so this is the equivalent of the umask that
+# server.zig applies when it binds the socket itself.
+SocketMode=0600
+
+# Accept=no is the default and is what we want: systemd hands amuxd the
+# listening socket and amuxd accepts connections itself, so one daemon serves
+# every client. Accept=yes would spawn a process per connection.
+
+[Install]
+WantedBy=sockets.target

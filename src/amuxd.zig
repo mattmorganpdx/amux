@@ -65,6 +65,11 @@ fn serve(alloc: std.mem.Allocator) !u8 {
     var state = State.init(alloc);
     defer state.deinit();
 
+    // Before any pane is spawned: restore and the initial-workspace path both
+    // create panes, and they need AMUX_SOCKET_PATH in their environment.
+    const sock = socketPath();
+    state.socket_path = sock;
+
     const restored = state.restoreSession() catch |err| blk: {
         log.warn("could not restore session: {}", .{err});
         break :blk 0;
@@ -77,7 +82,7 @@ fn serve(alloc: std.mem.Allocator) !u8 {
         };
     }
 
-    const server = try Server.init(alloc, &state, socketPath());
+    const server = try Server.init(alloc, &state, sock);
     defer server.deinit();
     try server.start();
 

@@ -10,7 +10,7 @@ Roughly dependency-ordered. **D** = de-risking, do early.
 
 | # | Item | Depends on |
 |---|------|-----------|
-| 1 | **D** Prototype: Ghostty OpenGL renderer drawing an amux-owned `Terminal` | — |
+| 1 | ~~**D** Prototype: Ghostty OpenGL renderer drawing an amux-owned `Terminal`~~ **done** | — |
 | 2 | Wire `ghostty-vt` into amux's build as a Zig module | — |
 | 3 | `amuxd`: own PTYs and terminal state | 2 |
 | 4 | Move socket handlers behind the daemon | 3 |
@@ -21,22 +21,22 @@ Roughly dependency-ordered. **D** = de-risking, do early.
 
 ---
 
-## 1. Prototype the renderer against an amux-owned Terminal — **D**
+## 1. Prototype the renderer against an amux-owned Terminal — **DONE**
 
-The spike established this is feasible by reading the code: `renderer.State`
-takes a bare `*terminal.Terminal`, `rt_surface` is dereferenced only by the
-Metal backend, and `surface_mailbox` carries two stubbable notifications. Not
-yet proven by building.
+Result and full findings: [`../spikes/renderer-foreign-terminal/`](../spikes/renderer-foreign-terminal/).
 
-Build the smallest thing that draws: a GTK window with one `GtkGLArea`, a
-`terminal.Terminal` that amux constructs and fills with static text, and
-Ghostty's OpenGL renderer pointed at it via a hand-built `renderer.State`.
-Requires satisfying `renderer.Options` — `DerivedConfig`, `*font.SharedGrid`,
-`Size`, `*renderer.Thread`, and stubs for `rt_surface` / `surface_mailbox`.
+The renderer constructs against a `Terminal` amux allocated, with placeholder
+`Surface`/`Thread` pointers, and `updateFrame` snapshots it at runtime against a
+real OpenGL 4.5 context. The same source also compiles as a shared library,
+which is the apprt configuration amux actually links.
 
-Done when glyphs from an amux-owned `Terminal` appear on screen. If this turns
-out to need real fork surgery, the GUI needs its own text renderer and the whole
-estimate changes — which is why it goes first.
+Not proven: pixels. `drawFrame` needs the frame/swap-chain lifecycle that
+`renderer.Thread` normally drives, which the prototype stubs. That is ordinary
+integration work for item 6, not Surface coupling — reaching `updateFrame`
+already required the renderer to read our terminal.
+
+**The expensive risk in this plan is retired: the GUI does not need its own text
+renderer.**
 
 ## 2. Wire `ghostty-vt` into the build
 

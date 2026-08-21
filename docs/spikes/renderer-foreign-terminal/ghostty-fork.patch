@@ -1,0 +1,55 @@
+diff --git a/src/apprt/none.zig b/src/apprt/none.zig
+index 0483d824c..d9c3b4353 100644
+--- a/src/apprt/none.zig
++++ b/src/apprt/none.zig
+@@ -6,6 +6,15 @@ const apprt = @import("../apprt.zig");
+ pub const resourcesDir = internal_os.resourcesDir;
+ 
+ pub const App = struct {
++    /// No-op. The core expects every apprt App to be wakeable (App.Mailbox.push
++    /// calls it), but the "none" runtime has no event loop to wake. Without
++    /// this, anything that references the surface mailbox -- the renderer, for
++    /// instance -- cannot be compiled into an exe built with
++    /// -Dapp-runtime=none.
++    pub fn wakeup(self: App) void {
++        _ = self;
++    }
++
+     /// Always return false as there is no apprt to communicate with.
+     pub fn performIpc(
+         _: Allocator,
+diff --git a/src/build/GhosttyBench.zig b/src/build/GhosttyBench.zig
+index 27dda8809..924b92e88 100644
+--- a/src/build/GhosttyBench.zig
++++ b/src/build/GhosttyBench.zig
+@@ -46,6 +46,30 @@ pub fn init(
+         try steps.append(b.allocator, exe);
+     }
+ 
++    // amux daemon-split spike: drive the renderer from an embedder-owned
++    // Terminal. Built here because this is the cheapest target with access to
++    // the internal renderer/font/terminal modules.
++    {
++        // A library, not an exe: apprt.runtime resolves through
++        // build_config.artifact, and only .lib selects the embedded apprt that
++        // amux actually uses.
++        const lib = b.addExecutable(.{
++            .name = "amux-proto",
++            .root_module = b.createModule(.{
++                .root_source_file = b.path("src/main_amux_proto.zig"),
++                .target = deps.config.target,
++                // ReleaseFast, like Ghostty's own renderer builds. In Debug the
++                // first cells.resize frees Contents.bg_cells while it is still
++                // `undefined` (0xAA-filled), which panics in sliceAsBytes.
++                .optimize = .ReleaseFast,
++            }),
++        });
++        lib.linkLibC();
++        lib.linkSystemLibrary("EGL");
++        _ = try deps.add(lib);
++        try steps.append(b.allocator, lib);
++    }
++
+     return .{ .steps = steps.items };
+ }
+ 

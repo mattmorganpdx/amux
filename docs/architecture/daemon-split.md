@@ -1,6 +1,8 @@
 # Daemon / GUI / CLI separation
 
-Status: **design, spike complete**. Nothing implemented yet.
+Status: **design agreed, gating spike passed**. Nothing implemented yet.
+
+Spike result: [`../spikes/renderer-foreign-terminal/`](../spikes/renderer-foreign-terminal/).
 
 ## The problem
 

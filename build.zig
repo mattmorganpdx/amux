@@ -104,6 +104,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // System SQLite for the session archive. Linking it beats vendoring the
+    // amalgamation: it is present on any Linux desktop, and 3.45 ships FTS5.
+    amuxd.linkSystemLibrary("sqlite3");
     b.installArtifact(amuxd);
 
     // --- CLI executable ---
@@ -146,6 +149,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    daemon_tests.linkSystemLibrary("sqlite3");
     const run_daemon_tests = b.addRunArtifact(daemon_tests);
 
     const test_step = b.step("test", "Run tests");

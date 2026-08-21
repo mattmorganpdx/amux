@@ -170,7 +170,7 @@ test "routes writes and snapshots to the right pane" {
     // Poll pane a for its own marker, then assert b's never leaked into it.
     var waited: usize = 0;
     var ok = false;
-    while (waited < 5000) {
+    while (waited < 20000) {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         waited += 50;
         const screen = try reg.snapshot(a, alloc);

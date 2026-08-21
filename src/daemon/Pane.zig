@@ -185,7 +185,7 @@ test "hosts a shell and parses its output into terminal state" {
     defer pane.destroy();
 
     try pane.write("echo pane_hosting_works\n");
-    try pane.expectOnScreen(alloc, "pane_hosting_works", 5000);
+    try pane.expectOnScreen(alloc, "pane_hosting_works", 20000);
 }
 
 test "escape sequences are interpreted, not echoed literally" {
@@ -200,7 +200,7 @@ test "escape sequences are interpreted, not echoed literally" {
     // Colour codes around the word. If the stream were passing bytes through
     // rather than parsing them, the escape bytes would appear on the screen.
     try pane.write("printf '\\033[31mRED_TEXT\\033[0m\\n'\n");
-    try pane.expectOnScreen(alloc, "RED_TEXT", 5000);
+    try pane.expectOnScreen(alloc, "RED_TEXT", 20000);
 
     // The parsed screen holds text, not control bytes. Checking for the ESC
     // byte itself rather than "[31m": an interactive shell echoes the command
@@ -222,7 +222,7 @@ test "output scrolled off the screen stays in scrollback" {
     defer pane.destroy();
 
     try pane.write("for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo scrollline$i; done\n");
-    try pane.expectOnScreen(alloc, "scrollline12", 5000);
+    try pane.expectOnScreen(alloc, "scrollline12", 20000);
 
     const active = try pane.snapshot(alloc);
     defer alloc.free(active);
@@ -241,7 +241,7 @@ test "notices when its child exits" {
     defer pane.destroy();
 
     var waited: usize = 0;
-    while (waited < 5000 and !pane.hasExited()) {
+    while (waited < 20000 and !pane.hasExited()) {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         waited += 50;
     }

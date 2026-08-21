@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 
 const protocol = @import("../socket/protocol.zig");
 const PaneTree = @import("../pane_tree.zig");
+const History = @import("History.zig");
 const State = @import("State.zig");
 const Workspace = @import("../workspace.zig");
 
@@ -47,7 +48,15 @@ const methods = [_][]const u8{
     "surface.close",
     "surface.run",
     "pane.list",
+    "history.list",
+    "history.show",
+    "history.search",
+    "history.delete",
 };
+
+/// Default and maximum rows returned by a history query.
+const default_history_limit: usize = 50;
+const max_history_limit: usize = 500;
 
 pub fn dispatch(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
     const m = req.method;
@@ -70,6 +79,11 @@ pub fn dispatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     if (eq(m, "surface.split")) return split(alloc, state, req);
     if (eq(m, "surface.close")) return closePane(alloc, state, req);
     if (eq(m, "surface.run")) return run(alloc, state, req);
+
+    if (eq(m, "history.list")) return historyList(alloc, state, req);
+    if (eq(m, "history.show")) return historyShow(alloc, state, req);
+    if (eq(m, "history.search")) return historySearch(alloc, state, req);
+    if (eq(m, "history.delete")) return historyDelete(alloc, state, req);
 
     return protocol.errorResponse(alloc, req.id, "method_not_found", req.method);
 }
@@ -550,4 +564,101 @@ fn matchIgnoringBreaks(text: []const u8, start: usize, command: []const u8) ?usi
 
 fn trimBlank(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \r\n\t");
+}
+
+// --- history -----------------------------------------------------------
+//
+// This queries the archive of *closed* sessions. Searching a pane that is still
+// open is a different operation against a different data structure -- the VT
+// engine's own scrollback search -- and belongs on surface.*, not here.
+
+fn historyLimit(alloc: Allocator, req: *const protocol.Request) usize {
+    const raw = req.getIntParam(alloc, "limit") orelse return default_history_limit;
+    const v = toU64(raw) orelse return default_history_limit;
+    return @min(@max(v, 1), max_history_limit);
+}
+
+fn entriesResponse(alloc: Allocator, id: i64, entries: []const History.Entry) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"entries\":[");
+    for (entries, 0..) |e, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const title = try jsonEscape(alloc, e.workspace_title);
+        defer alloc.free(title);
+        const cwd = try jsonEscape(alloc, e.cwd);
+        defer alloc.free(cwd);
+        const reason = try jsonEscape(alloc, e.reason);
+        defer alloc.free(reason);
+        const json = try std.fmt.allocPrint(alloc,
+            \\{{"id":{d},"workspace_id":{d},"workspace_title":"{s}","pane_id":{d},"closed_at":{d},"cwd":"{s}","reason":"{s}","lines":{d},"bytes":{d}}}
+        , .{ e.id, e.workspace_id, title, e.pane_id, e.closed_at, cwd, reason, e.lines, e.bytes });
+        defer alloc.free(json);
+        try out.appendSlice(alloc, json);
+    }
+    try out.appendSlice(alloc, "]}");
+    return protocol.successResponse(alloc, id, out.items);
+}
+
+fn noArchive(alloc: Allocator, id: i64) ![]const u8 {
+    return protocol.errorResponse(alloc, id, "no_archive", "Session archive unavailable");
+}
+
+/// History ids here are integers, but amux-cli sends them as strings because the
+/// GUI's file-based store used `{timestamp}_ws{n}_p{n}` names. Accept either
+/// while both stores exist; the string form goes away with item 6.
+fn historyIdParam(alloc: Allocator, req: *const protocol.Request) ?i64 {
+    if (req.getIntParam(alloc, "id")) |v| return v;
+    const text = req.getStringParam(alloc, "id") orelse return null;
+    defer alloc.free(text);
+    return std.fmt.parseInt(i64, text, 10) catch null;
+}
+
+fn historyList(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const hist = state.history orelse return noArchive(alloc, req.id);
+    const workspace_id = optionalIdParam(alloc, req, "workspace_id");
+
+    const entries = hist.list(alloc, workspace_id, historyLimit(alloc, req)) catch |err|
+        return stateError(alloc, req.id, err);
+    defer History.freeEntries(alloc, entries);
+    return entriesResponse(alloc, req.id, entries);
+}
+
+fn historySearch(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const hist = state.history orelse return noArchive(alloc, req.id);
+    const query = req.getStringParam(alloc, "query") orelse
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires 'query'");
+    defer alloc.free(query);
+
+    const entries = hist.search(alloc, query, historyLimit(alloc, req)) catch |err|
+        return stateError(alloc, req.id, err);
+    defer History.freeEntries(alloc, entries);
+    return entriesResponse(alloc, req.id, entries);
+}
+
+fn historyShow(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const hist = state.history orelse return noArchive(alloc, req.id);
+    const raw = historyIdParam(alloc, req) orelse
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires a numeric 'id'");
+
+    const found = hist.get(alloc, raw) catch |err| return stateError(alloc, req.id, err);
+    const content = found orelse
+        return protocol.errorResponse(alloc, req.id, "not_found", "No such session");
+    defer alloc.free(content);
+
+    const escaped = try jsonEscape(alloc, content);
+    defer alloc.free(escaped);
+    const body = try std.fmt.allocPrint(alloc, "{{\"id\":{d},\"text\":\"{s}\"}}", .{ raw, escaped });
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, req.id, body);
+}
+
+fn historyDelete(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const hist = state.history orelse return noArchive(alloc, req.id);
+    const raw = historyIdParam(alloc, req) orelse
+        return protocol.errorResponse(alloc, req.id, "missing_param", "Requires a numeric 'id'");
+
+    const removed = hist.delete(raw) catch |err| return stateError(alloc, req.id, err);
+    if (!removed) return protocol.errorResponse(alloc, req.id, "not_found", "No such session");
+    return protocol.successResponse(alloc, req.id, "{\"deleted\":true}");
 }

@@ -146,19 +146,22 @@ fn setCloexec(fd: posix.fd_t) void {
 pub fn stop(self: *Server) bool {
     if (!self.running.swap(false, .acq_rel)) return true;
 
+    // Join before closing the listener. The accept loop polls with a timeout so
+    // it returns on its own once `running` is false; closing the descriptor
+    // first leaves it able to call accept() on a closed fd, and std maps that
+    // EBADF to `unreachable` -- which panicked the daemon on shutdown.
+    if (self.accept_thread) |t| {
+        t.join();
+        self.accept_thread = null;
+    }
     if (self.listen_fd) |fd| {
         // Only shut down a socket we created. Under socket activation systemd
         // owns this socket and hands the *same* one to the next start, so
         // shutdown() breaks it permanently -- every later accept() then fails
-        // with SocketNotListening. Closing our descriptor is enough; the accept
-        // loop notices `running` going false on its own.
+        // with SocketNotListening.
         if (!self.socket_activated) posix.shutdown(fd, .both) catch {};
         posix.close(fd);
         self.listen_fd = null;
-    }
-    if (self.accept_thread) |t| {
-        t.join();
-        self.accept_thread = null;
     }
 
     const drained = self.drainClients();
@@ -382,4 +385,36 @@ test "a bound socket is 0600 and is removed on stop" {
     server.deinit();
     // We created it, so we clean it up.
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().statFile(path));
+}
+
+test "stopping while a client is connecting does not abort the daemon" {
+    // Regression: stop() used to close the listening descriptor before joining
+    // the accept thread. A client arriving in that window left accept() running
+    // on a closed fd, and std maps EBADF to `unreachable` -- so shutdown
+    // panicked the whole daemon instead of exiting. Connect right as we stop,
+    // repeatedly, to land inside the window.
+    const alloc = std.testing.allocator;
+
+    var round: usize = 0;
+    while (round < 12) : (round += 1) {
+        var state = State.init(alloc);
+        defer state.deinit();
+
+        var path_buf: [80]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/tmp/amux-racetest-{d}-{d}.sock", .{
+            std.os.linux.getpid(), round,
+        });
+        std.fs.deleteFileAbsolute(path) catch {};
+
+        const server = try init(alloc, &state, path);
+        defer server.deinit();
+        try server.start();
+
+        // Fire a connection and tear down without waiting for it to be served.
+        const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+        var addr = std.net.Address.initUnix(path) catch unreachable;
+        posix.connect(sock, &addr.any, addr.getOsSockLen()) catch {};
+        _ = server.stop();
+        posix.close(sock);
+    }
 }

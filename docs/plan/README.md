@@ -17,7 +17,7 @@ Roughly dependency-ordered. **D** = de-risking, do early.
 | 5 | Screen-state wire protocol (snapshot + delta) | 3 |
 | 6 | GUI becomes an attach client | 1, 5 |
 | 7 | ~~systemd socket activation~~ **done** | 4 |
-| 8 | Scrollback + history into the daemon; pick a store | 3 |
+| 8 | ~~Scrollback + history into the daemon; pick a store~~ **done** | 3 |
 
 ---
 
@@ -258,13 +258,78 @@ re-activating cleanly, 0 accept errors and 7.6% CPU on the current instance,
 with the daemon's own environment stripped. The units were uninstalled and the
 session file restored afterwards, so nothing was left behind.
 
-## 8. Scrollback and history into the daemon; pick a store
+## 8. Scrollback and history into the daemon — **DONE**
 
-Scrollback lives with the terminal, so it moves to the daemon. That makes
-history coherent — today it is saved by whichever widget owns the pane at close
-time.
+The store is **SQLite with FTS5**, linked from the system library (3.45.1 here,
+FTS5 compiled in). Not vendored: it is already a dependency of everything else
+on the machine, `amuxd` still links only libc plus sqlite3, and vendoring
+370k lines to gain nothing was not worth the build time.
 
-Decide the storage engine. SQLite is the leading candidate for search,
-retention and audit. Note `ghostty-vt` exports `search` over its own
-`PageList`, so decide deliberately where live-scrollback search ends and
-database search over closed sessions begins, rather than duplicating both.
+`src/daemon/History.zig` owns it:
+
+- A `sessions` table plus an **external-content FTS5 index** over the content
+  column, kept in sync by `sessions_ai`/`sessions_ad` triggers. External-content
+  means the text is stored once, not once per index.
+- WAL journal, `synchronous=NORMAL`. WAL is checkpointed on close, so a stopped
+  daemon leaves a single self-contained `history.db`.
+- Retention: 5000 entries or 10 MB, whichever binds first, pruned oldest-first
+  on write. Both are overridable (`AMUX_HISTORY_MAX_ENTRIES`,
+  `AMUX_HISTORY_MAX_BYTES`), and `AMUX_HISTORY=0` disables archiving entirely.
+- `record` skips blank scrollback, truncates from the *tail* on a UTF-8
+  boundary (so a split codepoint never reaches the database), and dedups
+  against the previous entry for the same workspace+pane -- otherwise closing a
+  pane that had already been archived stored the same screen twice.
+
+`State` archives on all three paths that end a terminal: pane close, workspace
+close, and daemon exit, each recorded with its `reason`. Scrollback only exists
+while the terminal does, so `archiveAll` runs before teardown.
+
+Handlers: `history.list` (optionally scoped to a workspace), `history.show`,
+`history.search`, `history.delete`.
+
+**Known gap: `cwd` is recorded but nothing in the daemon sets it yet.** The
+column is wired end to end and asserted by test, but a workspace only gets a cwd
+from the GUI or the Claude hooks, and neither is served by the daemon before
+item 6. So it reads back empty today. Worth a `workspace create --cwd` flag
+whenever a caller needs it -- knowing *where* an archived session ran is most of
+what makes it findable later.
+
+### Where live search ends and database search begins
+
+The plan asked this to be decided deliberately. It is: **`ghostty-vt`'s
+`PageList` search is for live panes, and SQL/FTS5 is for closed sessions.** They
+do not overlap, because they cannot answer each other's question -- FTS5 has no
+row for a pane that is still open, and the `PageList` is gone once the pty
+closes. The seam is the archive write. A future "search everything" call is a
+union of the two, not a third mechanism.
+
+### Query strings are untrusted input
+
+FTS5's `MATCH` grammar makes ordinary text a syntax error: `a-b`, `"unclosed`,
+`NEAR(`, a bare `OR`. A search box that reports "malformed MATCH expression" is
+useless, so `search` **falls back to `LIKE`** when the FTS query does not parse.
+Verified against each of those inputs plus `deploy*`; all return results or an
+empty set, never an error.
+
+### The bug this turn actually found
+
+**Shutdown aborted the daemon.** Wiring archive-on-exit meant stopping the
+daemon for real, repeatedly, and that exposed a race left by item 7. `stop()`
+closed the listening descriptor *before* joining the accept thread. A client
+arriving in that window left `accept()` running on a closed fd, and Zig's std
+maps `EBADF` to `unreachable` -- so a clean SIGTERM became SIGABRT and a core
+dump, taking the archive-on-exit write with it.
+
+The fix is ordering: join first, then close. The accept loop already polls with
+a timeout, so it notices `running` going false on its own and needs no wake-up.
+This is the third bug in this exact teardown path, and the pattern in all three
+is the same -- a resource freed while another thread could still touch it. The
+regression test connects a client and stops in the same breath, twelve rounds;
+reverting the ordering reproduces the abort, so the test bites.
+
+9 store tests, 37 total. Verified live end to end: archive on pane close, on
+workspace close and on daemon exit; entries queryable after a full daemon
+restart; FTS finding a marker in the right pane; workspace-scoped listing;
+delete removing the row *and* its index entry; and two consecutive clean
+shutdowns at exit 0 with the WAL checkpointed.
+

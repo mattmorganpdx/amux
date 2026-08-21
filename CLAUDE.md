@@ -139,7 +139,7 @@ AMUX_SOCKET=/tmp/amuxd.sock amuxd &
 AMUX_SOCKET=/tmp/amuxd.sock amux-cli run "echo hello"
 ```
 
-It answers 18 methods (`system.capabilities` lists them, and reports
+It answers 22 methods (`system.capabilities` lists them, and reports
 `"daemon": true`). Notifications, the command palette, the Claude hooks and the
 sidebar metadata methods are GUI chrome and are not served yet.
 
@@ -164,14 +164,38 @@ owns it.
 
 Uninstall: `systemctl --user disable --now amuxd.socket && rm ~/.config/systemd/user/amuxd.{socket,service} && systemctl --user daemon-reload`
 
+### Session history
+
+The daemon archives a pane's scrollback to SQLite when the terminal ends — pane
+close, workspace close, or daemon exit — at
+`${XDG_CONFIG_HOME:-~/.config}/amux/history.db`. Scrollback only exists while
+the terminal does, so this is the only chance to keep it.
+
+```bash
+amux-cli history list                 # recent sessions, newest first
+amux-cli history list --workspace 2   # scoped to one workspace
+amux-cli history show 7               # full scrollback of one session
+amux-cli history search migration_42  # full-text search (FTS5)
+amux-cli history delete 7
+```
+
+Retention is 5000 entries or 10 MB, pruned oldest-first. Set
+`AMUX_HISTORY_MAX_ENTRIES` / `AMUX_HISTORY_MAX_BYTES` to change it, or
+`AMUX_HISTORY=0` to archive nothing.
+
+Search over **closed** sessions is SQL/FTS5; search over a **live** pane is
+`ghostty-vt`'s `PageList` search. Different mechanisms by design — neither can
+answer the other's question.
+
 Tests:
 
 ```bash
 zig build test
 ```
 
-Covers what can be tested without GTK or libghostty — currently `src/vt.zig`,
-the seam onto the `ghostty-vt` headless terminal engine. The GUI still has to be
+37 tests covering what needs no GTK or libghostty: `src/vt.zig` (the seam onto
+the `ghostty-vt` headless engine) and the daemon — ptys, panes, the registry,
+state, the socket front door and the history store. The GUI still has to be
 exercised by running it.
 
 ### Rebuilding libghostty
@@ -188,4 +212,5 @@ If the Ghostty submodule changes, rebuild via the setup script:
 - **UI:** GTK4 (GtkApplication, GtkGLArea, GtkPaned, GtkListBox)
 - **Terminal:** Ghostty embedded apprt via `libghostty.so`
 - **Socket:** Unix domain socket, newline-delimited JSON-RPC, thread-per-client
-- **Source layout:** `src/` (GUI app), `cli/` (CLI tool), `src/socket/` (server + request router), `src/socket/handlers/` (per-domain handlers: system, workspace, surface, pane, window_api, notification, palette, claude, history, plus `common` for shared main-thread dispatch)
+- **Store:** SQLite + FTS5 (system library) for archived session scrollback
+- **Source layout:** `src/` (GUI app), `cli/` (CLI tool), `src/socket/` (server + request router), `src/socket/handlers/` (per-domain handlers: system, workspace, surface, pane, window_api, notification, palette, claude, history, plus `common` for shared main-thread dispatch), `src/daemon/` (the daemon: pty, pane, registry, state, handlers, server, history)

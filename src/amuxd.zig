@@ -11,6 +11,7 @@
 const std = @import("std");
 const posix = std.posix;
 const Registry = @import("daemon/Registry.zig");
+const History = @import("daemon/History.zig");
 const Server = @import("daemon/server.zig");
 const State = @import("daemon/State.zig");
 
@@ -70,6 +71,21 @@ fn serve(alloc: std.mem.Allocator) !u8 {
     const sock = socketPath();
     state.socket_path = sock;
 
+    var hist_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var history: ?History = null;
+    if (historyPath(&hist_path_buf)) |hp| {
+        // sqlite will create the file but not the directory holding it.
+        if (std.fs.path.dirname(hp)) |dir| std.fs.cwd().makePath(dir) catch {};
+        if (History.open(alloc, hp)) |h| {
+            history = h;
+            state.history = &history.?;
+            log.info("session archive at {s}", .{hp});
+        } else |err| {
+            log.warn("could not open session archive: {}", .{err});
+        }
+    }
+    defer if (history) |*h| h.close();
+
     const restored = state.restoreSession() catch |err| blk: {
         log.warn("could not restore session: {}", .{err});
         break :blk 0;
@@ -97,8 +113,22 @@ fn serve(alloc: std.mem.Allocator) !u8 {
     }
 
     log.info("shutting down", .{});
+    // Scrollback only exists while the terminal does, so capture it before the
+    // panes go away with the process.
+    state.archiveAll("daemon_exit");
     state.saveSession() catch |err| log.warn("could not save session: {}", .{err});
     return 0;
+}
+
+/// Where the session archive lives, alongside the session file.
+fn historyPath(buf: []u8) ?[]const u8 {
+    if (posix.getenv("XDG_CONFIG_HOME")) |xdg| {
+        return std.fmt.bufPrint(buf, "{s}/amux/history.db", .{xdg}) catch null;
+    }
+    if (posix.getenv("HOME")) |home| {
+        return std.fmt.bufPrint(buf, "{s}/.config/amux/history.db", .{home}) catch null;
+    }
+    return null;
 }
 
 /// Same resolution order the CLI uses.
@@ -177,4 +207,5 @@ test {
     _ = @import("daemon/Pane.zig");
     _ = @import("daemon/Pty.zig");
     _ = @import("daemon/State.zig");
+    _ = @import("daemon/History.zig");
 }

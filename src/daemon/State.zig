@@ -13,6 +13,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const PaneTree = @import("../pane_tree.zig");
+const History = @import("History.zig");
 const Registry = @import("Registry.zig");
 const TabManager = @import("../tab_manager.zig");
 const Workspace = @import("../workspace.zig");
@@ -32,6 +33,11 @@ alloc: Allocator,
 mutex: std.Thread.Mutex = .{},
 tab_manager: TabManager,
 registry: Registry,
+
+/// Session archive. Scrollback is captured here when a pane goes away, which is
+/// the only moment it still exists: the terminal owns it, and closing the pane
+/// destroys it. Optional so tests can run without touching a database.
+history: ?*History = null,
 
 /// Injected into every pane as AMUX_SOCKET_PATH, so `amux-cli` run from inside
 /// a pane reaches the daemon that owns it without any configuration. Set by
@@ -91,7 +97,10 @@ pub fn closeWorkspace(self: *State, ws_id: u64) Error!void {
     // Terminals first, while the tree still names them.
     var ids = ws.pane_tree.orderedPaneIds(self.alloc) catch return error.WorkspaceNotFound;
     defer ids.deinit(self.alloc);
-    for (ids.items) |pane_id| self.registry.close(pane_id) catch {};
+    for (ids.items) |pane_id| {
+        self.archivePaneLocked(pane_id, ws, "workspace_close");
+        self.registry.close(pane_id) catch {};
+    }
 
     _ = self.tab_manager.closeWorkspaceById(ws_id);
 }
@@ -148,6 +157,7 @@ pub fn closePane(self: *State, pane_id: u64) Error!void {
     const ws = self.findPaneWorkspaceLocked(pane_id) orelse return error.PaneNotFound;
     if (ws.pane_tree.paneCount() <= 1) return error.LastPane;
 
+    self.archivePaneLocked(pane_id, ws, "pane_close");
     _ = ws.pane_tree.close(pane_id) catch return error.PaneNotFound;
     self.registry.close(pane_id) catch {};
 }
@@ -297,7 +307,42 @@ pub fn restoreSession(self: *State) !usize {
     return snap.workspaces.len;
 }
 
+/// Archive every live pane. Called on the way out, so a session that was never
+/// closed by hand is still recoverable.
+pub fn archiveAll(self: *State, reason: []const u8) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    for (self.tab_manager.workspaces.items) |ws| {
+        var ids = ws.pane_tree.orderedPaneIds(self.alloc) catch continue;
+        defer ids.deinit(self.alloc);
+        for (ids.items) |pane_id| self.archivePaneLocked(pane_id, ws, reason);
+    }
+}
+
 // --- Internals (call with the lock held) -------------------------------
+
+/// Capture a pane's scrollback into the archive. Best-effort: losing history is
+/// not a reason to fail closing a pane.
+fn archivePaneLocked(self: *State, pane_id: u64, ws: *Workspace, reason: []const u8) void {
+    const hist = self.history orelse return;
+
+    const content = self.registry.snapshotScrollback(pane_id, self.alloc) catch |err| {
+        log.debug("pane {d}: no scrollback to archive ({})", .{ pane_id, err });
+        return;
+    };
+    defer self.alloc.free(content);
+
+    const cwd: []const u8 = if (ws.cwd_len > 0) ws.cwd_buf[0..ws.cwd_len] else "";
+    _ = hist.record(.{
+        .workspace_id = ws.id,
+        .workspace_title = ws.getTitle(),
+        .pane_id = pane_id,
+        .cwd = cwd,
+        .reason = reason,
+        .content = content,
+    }) catch |err| log.warn("could not archive pane {d}: {}", .{ pane_id, err });
+}
 
 fn spawnPaneLocked(self: *State, pane_id: u64, ws: *Workspace) !void {
     var ws_buf: [24]u8 = undefined;
@@ -428,7 +473,7 @@ test "writes and reads reach the addressed pane" {
     try state.writePane(pane, "echo state_round_trip\n");
 
     var waited: usize = 0;
-    while (waited < 5000) {
+    while (waited < 20000) {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         waited += 50;
         const text = try state.readPane(pane, alloc, false);

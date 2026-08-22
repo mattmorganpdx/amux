@@ -61,7 +61,8 @@ amux-cli pane swap <pane_a> <pane_b>
 ### Workspace management
 
 ```bash
-amux-cli workspace create "build"     # create a named workspace
+amux-cli workspace create "build"     # create a named workspace, panes start in $PWD
+amux-cli workspace create "x" --cwd /srv/app   # or somewhere else
 amux-cli workspace list               # list all workspaces
 amux-cli workspace select <id>        # switch workspace
 amux-cli workspace next               # cycle workspaces
@@ -187,8 +188,16 @@ parsed screen.
 
 ```bash
 ./dist/systemd/install.sh        # enables amuxd.socket as a user unit
-amux-cli ping                    # first call starts the daemon
+amux-cli ping                    # first call starts the daemon (~40ms)
 ```
+
+`ExecStart` points at this checkout's `zig-out/bin/amuxd`, so a rebuild is picked
+up on the next start — and moving the repo or cleaning `zig-out` breaks the unit.
+
+The service raises `LimitNOFILE` to match a login shell. Panes inherit the
+daemon's limits, and systemd's default soft limit of 1024 is far below what a
+terminal normally has: with it, this project's own test suite went from 9 seconds
+to over five minutes in a pane and then failed.
 
 The socket lands at `$XDG_RUNTIME_DIR/amux.sock` with mode 0600, and `amux-cli`
 probes that path before falling back to `/tmp/amux.sock`. Panes get

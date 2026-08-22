@@ -687,8 +687,25 @@ test "closing a workspace takes its terminals with it" {
     try std.testing.expectEqual(@as(usize, 1), state.registry.count());
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 test "writes and reads reach the addressed pane" {
     const alloc = std.testing.allocator;
+
+    // Panes spawn `$SHELL`, which is right for the product and wrong for this
+    // test: it made the round trip depend on whichever shell the developer uses
+    // and whatever their rc does, and a slow rc under load pushed a printf past
+    // the poll window. `sh` reads no rc, so what is being tested here -- that a
+    // write and a read reach the pane they name -- is what decides the result.
+    const saved_shell = std.posix.getenv("SHELL");
+    _ = setenv("SHELL", "/bin/sh", 1);
+    defer if (saved_shell) |sh| {
+        var buf: [512]u8 = undefined;
+        if (std.fmt.bufPrintZ(&buf, "{s}", .{sh})) |z| {
+            _ = setenv("SHELL", z, 1);
+        } else |_| {}
+    };
+
     var state = init(alloc);
     defer state.deinit();
 
@@ -709,6 +726,16 @@ test "writes and reads reach the addressed pane" {
         defer alloc.free(text);
         if (std.mem.indexOf(u8, text, "STATE_ROUND_TRIP") != null) return;
     }
+
+    // Say what the shell actually did. Reporting only "never saw it" makes this
+    // failure unactionable, which cost real time when it turned up on one
+    // machine and not another.
+    const text = try state.readPane(pane, alloc, false);
+    defer alloc.free(text);
+    std.debug.print(
+        "\nnever saw STATE_ROUND_TRIP; SHELL={s}; screen was:\n{s}\n",
+        .{ std.posix.getenv("SHELL") orelse "(unset)", text },
+    );
     return error.NeverSawOutput;
 }
 

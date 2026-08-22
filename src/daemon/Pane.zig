@@ -27,6 +27,15 @@ const Stream = vt.Stream(Handler);
 /// How much pty output to take per read.
 const read_chunk_bytes = 4096;
 
+/// How long to hold the first writes while a freshly spawned shell starts up.
+///
+/// A shell sets up job control before it is ready to read, and bash flushes
+/// pending terminal input while doing so -- so bytes written in that window are
+/// thrown away with no error anywhere. Anything that creates a pane and
+/// immediately sends a command hits this, which is the normal thing for an agent
+/// to do, and the symptom is a command that silently never runs.
+const spawn_grace_ms = 750;
+
 /// Raw pty output retained per pane, so a client that looked away can replay
 /// what it missed rather than being repainted from scratch every time.
 ///
@@ -87,6 +96,19 @@ out_end: u64 = 0,
 /// much history is available.
 out_start: u64 = 0,
 
+/// Writes held until the child has spoken or the grace period has passed. See
+/// `spawn_grace_ms`. Guarded by `mutex`.
+pending: std.ArrayListUnmanaged(u8) = .{},
+/// True once the child has produced output, or once we gave up waiting for it.
+started: bool = false,
+/// Measures the grace period from spawn.
+since_spawn: ?std.time.Timer = null,
+/// Releases held input when the deadline passes rather than when the child
+/// speaks. Needed because a program can read without ever writing -- `cat` being
+/// the obvious one -- so waiting on output alone turns holding into dropping.
+/// Spawned at most once, and only if there is something to release.
+flusher: ?std.Thread = null,
+
 /// Bumped whenever something may have changed the terminal. Only a hint, and
 /// deliberately not the sequence number: a waiting client can read this without
 /// taking the pane lock or rebuilding the render state, so an idle wake-up costs
@@ -139,6 +161,7 @@ pub fn create(alloc: std.mem.Allocator, id: u64, opts: Options) !*Pane {
         // Patched below: the handler needs the final address of `terminal`.
         .stream = undefined,
         .out_ring = ring,
+        .since_spawn = std.time.Timer.start() catch null,
         .notify = opts.notify,
     };
     self.stream = .{
@@ -162,18 +185,84 @@ pub fn destroy(self: *Pane) void {
         thread.join();
         self.reader = null;
     }
+    // Joined, not detached: it holds a pointer to this pane and is about to be
+    // freed out from under it otherwise.
+    if (self.flusher) |thread| {
+        thread.join();
+        self.flusher = null;
+    }
 
     self.render.deinit(self.alloc);
     self.alloc.free(self.row_seq);
     self.alloc.free(self.out_ring);
+    self.pending.deinit(self.alloc);
     self.terminal.deinit(self.alloc);
     const alloc = self.alloc;
     alloc.destroy(self);
 }
 
 /// Send bytes to the child's stdin.
+///
+/// Held back until the child has produced output, or until the grace period
+/// expires -- see `spawn_grace_ms`. A caller cannot tell the difference except
+/// that its input is not lost.
 pub fn write(self: *Pane, bytes: []const u8) !void {
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!self.started) {
+            const waited_ms: u64 = if (self.since_spawn) |*t|
+                t.read() / std.time.ns_per_ms
+            else
+                spawn_grace_ms;
+
+            if (waited_ms < spawn_grace_ms) {
+                try self.pending.appendSlice(self.alloc, bytes);
+                if (self.flusher == null) {
+                    const remaining = spawn_grace_ms - waited_ms;
+                    self.flusher = std.Thread.spawn(.{}, releaseHeldInput, .{ self, remaining }) catch null;
+                    // If the thread could not be spawned, send it now rather
+                    // than hold something nothing will release.
+                    if (self.flusher == null) self.started = true;
+                }
+                if (!self.started) return;
+            }
+            self.started = true;
+        }
+    }
+
+    try self.flushPending();
     try self.pty.writeAll(bytes);
+}
+
+/// Wait out the remaining grace period, then send whatever is still held.
+fn releaseHeldInput(self: *Pane, remaining_ms: u64) void {
+    std.Thread.sleep(remaining_ms * std.time.ns_per_ms);
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.started) return; // the child spoke first and the reader flushed
+        self.started = true;
+    }
+    self.flushPending() catch |err| {
+        log.warn("pane {d}: could not send held input: {}", .{ self.id, err });
+    };
+}
+
+/// Send anything that was held during startup, in the order it was given.
+fn flushPending(self: *Pane) !void {
+    var held: []u8 = &.{};
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.pending.items.len == 0) return;
+        held = try self.pending.toOwnedSlice(self.alloc);
+    }
+    defer self.alloc.free(held);
+    // Outside the lock: a pty write can block, and the reader thread needs the
+    // lock to keep draining output.
+    try self.pty.writeAll(held);
 }
 
 /// The visible screen as text.
@@ -403,7 +492,15 @@ fn readLoop(self: *Pane) void {
             log.warn("pane {d}: stream error: {}", .{ self.id, err });
         };
         self.appendOutputLocked(buf[0..n]);
+        const was_starting = !self.started;
+        self.started = true;
         self.mutex.unlock();
+
+        // The child has spoken, so it is reading: anything held during startup
+        // can go now.
+        if (was_starting) self.flushPending() catch |err| {
+            log.warn("pane {d}: could not send held input: {}", .{ self.id, err });
+        };
 
         _ = self.gen.fetchAdd(1, .release);
         // Outside the lock on purpose: see `notify`.
@@ -598,4 +695,30 @@ test "a write larger than the ring keeps its tail" {
     try std.testing.expectEqualStrings("ghij", got.data);
     // The offset still counts every byte that went past, not just the kept ones.
     try std.testing.expectEqual(@as(u64, 10), got.offset);
+}
+
+test "input sent before the shell is ready is not lost" {
+    const alloc = std.testing.allocator;
+    var pane = try create(alloc, 1, .{ .argv = &.{"/bin/sh"} });
+    defer pane.destroy();
+
+    // Written with no pause at all, which is what an agent creating a pane and
+    // immediately running a command does. A shell flushes pending terminal input
+    // while setting up job control, so this used to be discarded outright and the
+    // command simply never ran.
+    try pane.write("printf 'EARLY_%s\\n' 'WRITE'\n");
+
+    try pane.expectOnScreen(alloc, "EARLY_WRITE", 20000);
+}
+
+test "input still reaches a program that never writes anything first" {
+    const alloc = std.testing.allocator;
+    // `cat` echoes what it is given but says nothing on its own, so waiting for
+    // the child to speak first would wait forever. The grace period is what
+    // stops holding from becoming dropping.
+    var pane = try create(alloc, 1, .{ .argv = &.{"/bin/cat"} });
+    defer pane.destroy();
+
+    try pane.write("HELD_THEN_SENT\n");
+    try pane.expectOnScreen(alloc, "HELD_THEN_SENT", 20000);
 }

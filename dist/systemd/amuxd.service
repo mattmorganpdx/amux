@@ -13,6 +13,14 @@ ExecStart=@AMUXD@
 # that owns it.
 Environment=AMUX_SOCKET=%t/amux.sock
 
+# Panes inherit the daemon's limits, so this is what every terminal in amux
+# gets. systemd's default soft limit is 1024 -- kept low for programs that still
+# use select() -- while a login shell here gets 1048576. Anything ordinary run in
+# a pane then hit a ceiling that does not exist in a normal terminal: this
+# project's own test suite, which spawns a pty per test, went from 9 seconds to
+# over five minutes and then failed. A terminal should behave like a terminal.
+LimitNOFILE=1048576
+
 # The daemon owns live terminals and drains in-flight socket handlers on the
 # way out; give it room to do that rather than being killed mid-request.
 TimeoutStopSec=20

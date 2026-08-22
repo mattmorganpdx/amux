@@ -106,20 +106,40 @@ pub fn main() !void {
         if (std.mem.eql(u8, sub, "list")) {
             try sendAndPrint(socket_path, "workspace.list", "{}", stdout, stderr);
         } else if (std.mem.eql(u8, sub, "create")) {
-            // Optional: amux-cli workspace create "My Title"
-            const title = args.next();
-            if (title) |t| {
-                var params_buf: [params_medium]u8 = undefined;
-                var p = Params.init(&params_buf);
-                p.str("title", t);
-                const params = p.finish() orelse {
-                    try stderr.writeAll("Title too long\n");
-                    return;
-                };
-                try sendAndPrint(socket_path, "workspace.create", params, stdout, stderr);
-            } else {
-                try sendAndPrint(socket_path, "workspace.create", "{}", stdout, stderr);
+            // amux-cli workspace create ["My Title"] [--cwd <path>]
+            //
+            // The caller's directory is sent as the workspace cwd unless told
+            // otherwise, because panes spawn there. Without it the daemon's own
+            // directory is inherited -- under systemd that is $HOME, so every
+            // pane came up somewhere the caller was not, and a build in a fresh
+            // workspace failed with "no build.zig file found". `tmux
+            // new-session` takes the client's directory for the same reason.
+            var title: ?[]const u8 = null;
+            var cwd_override: ?[]const u8 = null;
+            while (args.next()) |arg| {
+                if (std.mem.eql(u8, arg, "--cwd")) {
+                    cwd_override = args.next() orelse {
+                        try stderr.writeAll("--cwd requires a path\n");
+                        return;
+                    };
+                } else if (title == null) {
+                    title = arg;
+                }
             }
+
+            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const cwd: ?[]const u8 = cwd_override orelse
+                (std.process.getCwd(&cwd_buf) catch null);
+
+            var params_buf: [params_large]u8 = undefined;
+            var p = Params.init(&params_buf);
+            if (title) |t| p.str("title", t);
+            if (cwd) |d| p.str("cwd", d);
+            const params = p.finish() orelse {
+                try stderr.writeAll("Params too long\n");
+                return;
+            };
+            try sendAndPrint(socket_path, "workspace.create", params, stdout, stderr);
         } else if (std.mem.eql(u8, sub, "current")) {
             try sendAndPrint(socket_path, "workspace.current", "{}", stdout, stderr);
         } else if (std.mem.eql(u8, sub, "select")) {

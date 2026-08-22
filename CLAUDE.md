@@ -140,7 +140,7 @@ AMUX_SOCKET=/tmp/amuxd.sock amuxd &
 AMUX_SOCKET=/tmp/amuxd.sock amux-cli run "echo hello"
 ```
 
-It answers 40 methods (`system.capabilities` lists them, and reports
+It answers 41 methods (`system.capabilities` lists them, and reports
 `"daemon": true`). The command palette and window actions stay in the GUI — they
 drive its chrome, and nothing else can execute them.
 
@@ -290,6 +290,32 @@ separation is the point: a client following the layout rebuilds its widget tree
 when it changes, so sharing one number would make an agent's progress report as
 expensive as a split. Reporting progress ten times in a row causes zero widget
 rebuilds.
+
+### Waiting for a pane instead of polling it
+
+`surface.watch` blocks until a pane does something worth a turn, and says why.
+The alternative is sleeping and re-reading, which spends a turn on every dead
+poll and still misses the moment a command stops to ask a question.
+
+```bash
+GEN=$(amux-cli send --enter "make -j8" | jq -r .result.gen)
+amux-cli watch --since $GEN --timeout 600000
+```
+
+`send` reports the pane's generation; passing it back as `--since` means "tell me
+about anything after that write". Without it the baseline is whenever the watch
+started, which loses a command that finished in the gap — and reports a
+*previous* prompt as this command completing.
+
+Reasons: `command_complete` (output stopped, prompt returned), `prompt_waiting`
+(the screen is asking something — wakes immediately, without waiting out the
+stall timer), `tui_detected` (entered the alternate screen), `output_stalled`
+(output stopped with no prompt), `exited`, and `timeout` for the safety net.
+`--stall-ms` sets how long output must be stopped to count (default 2000).
+
+Only `tui_detected` and `exited` are exact; the rest are heuristics, and
+`prompt_waiting` only inspects the **last** line — a question answered a moment
+ago is still on screen, and matching it again woke agents with the wrong reason.
 
 ### Session history
 

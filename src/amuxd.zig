@@ -22,6 +22,7 @@ const session = @import("session.zig");
 test {
     _ = session;
     _ = @import("daemon/notifications.zig");
+    _ = @import("daemon/wake.zig");
 }
 
 const log = std.log.scoped(.amuxd);

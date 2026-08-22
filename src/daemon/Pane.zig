@@ -103,6 +103,19 @@ pending: std.ArrayListUnmanaged(u8) = .{},
 started: bool = false,
 /// Measures the grace period from spawn.
 since_spawn: ?std.time.Timer = null,
+/// Reset on every read, so a watcher can ask how long output has been stopped.
+/// Null until the child has written anything at all.
+since_output: ?std.time.Timer = null,
+
+/// The screen type as of the last refresh, and the generation at which it last
+/// changed.
+///
+/// Recorded when it happens rather than compared against a baseline taken when
+/// someone starts watching: a program that switches to the alternate screen
+/// before the watch begins is already there by the time a baseline could be
+/// taken, so the switch would never be seen. Which is exactly what happened.
+last_alt_screen: bool = false,
+alt_change_gen: u64 = 0,
 /// Releases held input when the deadline passes rather than when the child
 /// speaks. Needed because a program can read without ever writing -- `cat` being
 /// the obvious one -- so waiting on output alone turns holding into dropping.
@@ -314,6 +327,12 @@ fn refreshLocked(self: *Pane) !u64 {
         return self.seq;
     }
 
+    const alt_now = self.render.screen == .alternate;
+    if (alt_now != self.last_alt_screen) {
+        self.last_alt_screen = alt_now;
+        self.alt_change_gen = self.gen.load(.acquire);
+    }
+
     if (self.render.dirty == .false) return self.seq;
 
     self.seq += 1;
@@ -371,6 +390,40 @@ pub fn screenSince(
         .reverse = self.terminal.modes.get(.reverse_colors),
     });
     return seq;
+}
+
+/// Everything a watcher needs to judge whether to wake, taken under one lock so
+/// the screen, the screen type and the idle time all describe the same instant.
+pub const Observation = struct {
+    /// The visible screen. Caller frees.
+    text: []const u8,
+    alt_screen: bool,
+    /// The generation at which the screen type last changed, so a caller can
+    /// tell "switched just now" from "was already full-screen".
+    alt_change_gen: u64,
+    exited: bool,
+    /// Milliseconds since the last output. Large when nothing has ever been
+    /// written, so a silent child reads as idle rather than as busy.
+    idle_ms: u64,
+    gen: u64,
+};
+
+pub fn observe(self: *Pane, alloc: std.mem.Allocator) !Observation {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    _ = try self.refreshLocked();
+    const text = try self.terminal.screens.active.dumpStringAlloc(alloc, .{ .active = .{} });
+    errdefer alloc.free(text);
+
+    return .{
+        .text = text,
+        .alt_screen = self.render.screen == .alternate,
+        .alt_change_gen = self.alt_change_gen,
+        .exited = self.exited.load(.acquire),
+        .idle_ms = if (self.since_output) |*t| t.read() / std.time.ns_per_ms else std.math.maxInt(u64),
+        .gen = self.gen.load(.acquire),
+    };
 }
 
 /// The change hint. See `gen`.
@@ -492,6 +545,7 @@ fn readLoop(self: *Pane) void {
             log.warn("pane {d}: stream error: {}", .{ self.id, err });
         };
         self.appendOutputLocked(buf[0..n]);
+        if (self.since_output) |*t| t.reset() else self.since_output = std.time.Timer.start() catch null;
         const was_starting = !self.started;
         self.started = true;
         self.mutex.unlock();

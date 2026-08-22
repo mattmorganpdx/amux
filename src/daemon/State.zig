@@ -404,6 +404,22 @@ pub fn waitForMeta(self: *State, since: u64, timeout_ms: u32) ?u64 {
     }
 }
 
+/// Block until a pane does something worth waking an agent for. Like
+/// `paneScreen`, deliberately without the state lock: it blocks.
+pub fn paneWatch(
+    self: *State,
+    pane_id: u64,
+    alloc: Allocator,
+    opts: Registry.WatchOptions,
+) !?Registry.WatchEvent {
+    return self.registry.watch(pane_id, alloc, opts);
+}
+
+/// The pane's change counter, for a caller that wants to watch from here.
+pub fn paneGeneration(self: *State, pane_id: u64) !u64 {
+    return self.registry.generation(pane_id);
+}
+
 pub fn resolvePane(self: *State, explicit: ?u64) Error!u64 {
     self.mutex.lock();
     defer self.mutex.unlock();

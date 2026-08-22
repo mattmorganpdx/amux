@@ -61,6 +61,7 @@ const methods = [_][]const u8{
     "surface.output",
     "surface.input",
     "surface.resize",
+    "surface.watch",
     "surface.send_key",
     "surface.split",
     "surface.close",
@@ -111,6 +112,7 @@ pub fn dispatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     if (eq(m, "surface.output")) return surfaceOutput(alloc, state, req);
     if (eq(m, "surface.input")) return surfaceInput(alloc, state, req);
     if (eq(m, "surface.resize")) return surfaceResize(alloc, state, req);
+    if (eq(m, "surface.watch")) return surfaceWatch(alloc, state, req);
     if (eq(m, "surface.send_key")) return sendKey(alloc, state, req);
     if (eq(m, "surface.split")) return split(alloc, state, req);
     if (eq(m, "surface.close")) return closePane(alloc, state, req);
@@ -694,7 +696,14 @@ fn sendText(alloc: Allocator, state: *State, req: *const protocol.Request) ![]co
     state.writePane(explicit, text) catch |err| return stateError(alloc, req.id, err);
 
     const id = state.resolvePane(explicit) catch 0;
-    const body = try std.fmt.allocPrint(alloc, "{{\"queued\":true,\"surface_id\":{d}}}", .{id});
+    // The pane's generation after the write, so a following `surface.watch` can
+    // say "tell me about anything after this" instead of guessing a baseline.
+    const gen = state.paneGeneration(id) catch 0;
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"queued\":true,\"surface_id\":{d},\"gen\":{d}}}",
+        .{ id, gen },
+    );
     defer alloc.free(body);
     return protocol.successResponse(alloc, req.id, body);
 }
@@ -874,6 +883,78 @@ fn surfaceResize(alloc: Allocator, state: *State, req: *const protocol.Request) 
         alloc,
         "{{\"surface_id\":{d},\"cols\":{d},\"rows\":{d}}}",
         .{ pane_id, cols_i, rows_i },
+    );
+    defer alloc.free(body);
+    return protocol.successResponse(alloc, req.id, body);
+}
+
+/// Longest a watch may block. Longer than the screen protocol's ceiling because
+/// waiting is the whole point here: an agent watching a build wants one call,
+/// not a loop of reconnects.
+const max_watch_timeout_ms: u32 = 600_000;
+
+/// Block until this pane does something worth an agent's turn.
+///
+/// The alternative an agent has is sleeping and re-reading, which spends a turn
+/// on every dead poll and still misses the moment a command stops to ask a
+/// question. This answers as soon as there is something to see, and says why --
+/// `command_complete`, `prompt_waiting`, `tui_detected`, `output_stalled` or
+/// `exited` -- so the agent can decide what to do without re-reading everything
+/// first.
+fn surfaceWatch(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u8 {
+    const explicit = optionalIdParam(alloc, req, "surface_id");
+    const timeout: u32 = if (req.getIntParam(alloc, "timeout_ms")) |v|
+        @intCast(@max(0, @min(v, @as(i64, max_watch_timeout_ms))))
+    else
+        60_000;
+    const since_gen: ?u64 = if (req.getIntParam(alloc, "since_gen")) |v| toU64(v) else null;
+    const stall: u64 = if (req.getIntParam(alloc, "stall_ms")) |v|
+        @intCast(@max(0, v))
+    else
+        2000;
+    const prompt = req.getStringParam(alloc, "prompt_pattern");
+    defer if (prompt) |p| alloc.free(p);
+
+    const pane_id = state.resolvePane(explicit) catch |err| return stateError(alloc, req.id, err);
+
+    const res = state.paneWatch(pane_id, alloc, .{
+        .since_gen = since_gen,
+        .stall_ms = stall,
+        .timeout_ms = timeout,
+        .prompt = prompt,
+    }) catch |err| return stateError(alloc, req.id, err);
+
+    if (res == null) {
+        // The safety net fired. Reported as an event of its own rather than an
+        // error, because "nothing happened for a minute" is a fact the agent
+        // may well want to act on.
+        const body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"surface_id\":{d},\"reason\":\"timeout\",\"woke\":false}}",
+            .{pane_id},
+        );
+        defer alloc.free(body);
+        return protocol.successResponse(alloc, req.id, body);
+    }
+
+    const ev = res.?;
+    defer alloc.free(ev.text);
+
+    const escaped = try jsonEscape(alloc, ev.text);
+    defer alloc.free(escaped);
+
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"surface_id\":{d},\"reason\":\"{s}\",\"woke\":true," ++
+            "\"idle_ms\":{d},\"alt_screen\":{s},\"exited\":{s},\"text\":\"{s}\"}}",
+        .{
+            pane_id,
+            ev.reason.name(),
+            ev.idle_ms,
+            if (ev.alt_screen) "true" else "false",
+            if (ev.exited) "true" else "false",
+            escaped,
+        },
     );
     defer alloc.free(body);
     return protocol.successResponse(alloc, req.id, body);

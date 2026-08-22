@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const Pane = @import("Pane.zig");
+const wake = @import("wake.zig");
 
 const Registry = @This();
 
@@ -294,6 +295,111 @@ pub fn output(
     }
 }
 
+pub const WatchOptions = struct {
+    /// The pane generation the caller last saw, from `surface.send_text`.
+    ///
+    /// Without it the baseline is whenever the watch started, which loses a
+    /// command that finished in the gap between sending it and watching for it.
+    since_gen: ?u64 = null,
+    /// How long output must be stopped before it counts as stopped.
+    stall_ms: u64 = 2000,
+    /// Give up and report nothing after this long. The safety net that keeps an
+    /// agent from waiting forever on a pane that never does anything again.
+    timeout_ms: u32 = 60_000,
+    /// Overrides the built-in shell prompt suffixes.
+    prompt: ?[]const u8 = null,
+};
+
+pub const WatchEvent = struct {
+    reason: wake.Reason,
+    /// The screen at the moment of the decision, so the agent can orient
+    /// without a second round trip that might see something different. Caller
+    /// frees.
+    text: []const u8,
+    idle_ms: u64,
+    alt_screen: bool,
+    exited: bool,
+};
+
+/// Block until something happens on this pane worth an agent's attention.
+///
+/// Null means the timeout passed with nothing to report. The waiting rules are
+/// the same as `screen` and `output`: the registry lock is held, `timedWait`
+/// releases it, and the pane is looked up again after every wake so a pane
+/// closed underneath a watcher is an error rather than a use-after-free.
+pub fn watch(
+    self: *Registry,
+    id: u64,
+    alloc: std.mem.Allocator,
+    opts: WatchOptions,
+) !?WatchEvent {
+    const total_ns = @as(u64, opts.timeout_ms) * std.time.ns_per_ms;
+    var timer: ?std.time.Timer = std.time.Timer.start() catch null;
+
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    // The baseline: what was already true when the watch began is not news.
+    var start_gen: u64 = 0;
+    {
+        const pane = self.panes.get(id) orelse return Error.PaneNotFound;
+        const first = try pane.observe(alloc);
+        defer alloc.free(first.text);
+        start_gen = opts.since_gen orelse first.gen;
+    }
+
+    while (true) {
+        if (self.stopping) return null;
+        const pane = self.panes.get(id) orelse return Error.PaneNotFound;
+
+        const o = try pane.observe(alloc);
+        var keep_text = false;
+        defer if (!keep_text) alloc.free(o.text);
+
+        const reason = wake.classify(.{
+            .text = o.text,
+            .alt_screen = o.alt_screen,
+            // "Was it already full-screen?" is answered by when it changed, not
+            // by what it looked like when this call happened to start.
+            .was_alt_screen = o.alt_change_gen <= start_gen,
+            .exited = o.exited,
+            .saw_output = o.gen > start_gen,
+            .idle_ms = o.idle_ms,
+            .stall_ms = opts.stall_ms,
+            .prompt = opts.prompt,
+        });
+
+        if (reason) |r| {
+            keep_text = true;
+            return .{
+                .reason = r,
+                .text = o.text,
+                .idle_ms = o.idle_ms,
+                .alt_screen = o.alt_screen,
+                .exited = o.exited,
+            };
+        }
+
+        const elapsed = if (timer) |*t| t.read() else total_ns;
+        if (elapsed >= total_ns) return null;
+
+        // Bounded by the stall threshold as well as the slice: with nothing
+        // arriving, the only thing that can change the answer is time passing,
+        // and the stall deadline is when it next matters.
+        const remaining = total_ns - elapsed;
+        const slice = @min(remaining, @min(wait_slice_ns * 4, opts.stall_ms * std.time.ns_per_ms));
+        self.change.timedWait(&self.mutex, @max(slice, wait_slice_ns)) catch {};
+    }
+}
+
+/// A pane's change counter. See `Pane.gen`.
+pub fn generation(self: *Registry, id: u64) Error!u64 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const pane = self.panes.get(id) orelse return Error.PaneNotFound;
+    return pane.generation();
+}
+
 pub fn hasExited(self: *Registry, id: u64) Error!bool {
     self.mutex.lock();
     defer self.mutex.unlock();
@@ -535,4 +641,105 @@ test "a wait with nothing to report ends at its deadline" {
     // It waited rather than returning immediately, and did not overshoot.
     try std.testing.expect(timer.read() >= 350 * std.time.ns_per_ms);
     try std.testing.expect(timer.read() < 3 * std.time.ns_per_s);
+}
+
+test "a command that finished before the watch began is still reported" {
+    const alloc = std.testing.allocator;
+    var reg = init(alloc);
+    defer reg.deinit();
+
+    const id: u64 = 1;
+    try reg.open(id, .{ .argv = &.{"/bin/sh"} });
+
+    var attach: std.ArrayListUnmanaged(u8) = .{};
+    defer attach.deinit(alloc);
+    _ = try reg.screen(id, alloc, &attach, .{});
+    _ = try settle(&reg, id, alloc, 0);
+
+    // The generation the caller last saw, as `surface.send_text` reports it.
+    const sent_at = try reg.generation(id);
+    try reg.write(id, "echo WATCH_LATE\n");
+
+    // Let it finish *before* watching, which is the ordinary case when a
+    // command is quick: the agent sends, does something else, then asks. A
+    // baseline taken when the watch starts sees nothing new and waits out the
+    // whole timeout, which is the bug this covers.
+    var waited: usize = 0;
+    while (waited < 20000) : (waited += 100) {
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        const text = try reg.snapshot(id, alloc);
+        defer alloc.free(text);
+        if (std.mem.indexOf(u8, text, "WATCH_LATE") != null) break;
+    }
+    std.Thread.sleep(600 * std.time.ns_per_ms);
+
+    const ev = try reg.watch(id, alloc, .{
+        .since_gen = sent_at,
+        .stall_ms = 300,
+        .timeout_ms = 10_000,
+    });
+    try std.testing.expect(ev != null);
+    defer alloc.free(ev.?.text);
+    try std.testing.expectEqual(wake.Reason.command_complete, ev.?.reason);
+}
+
+test "a full-screen program entered before the watch began is still reported" {
+    const alloc = std.testing.allocator;
+    var reg = init(alloc);
+    defer reg.deinit();
+
+    const id: u64 = 1;
+    try reg.open(id, .{ .argv = &.{"/bin/sh"} });
+
+    var attach: std.ArrayListUnmanaged(u8) = .{};
+    defer attach.deinit(alloc);
+    _ = try reg.screen(id, alloc, &attach, .{});
+    _ = try settle(&reg, id, alloc, 0);
+
+    const sent_at = try reg.generation(id);
+    // The escape a TUI sends on startup, without depending on any program's
+    // configuration to send it.
+    try reg.write(id, "printf '\\033[?1049h'\n");
+
+    // Already on the alternate screen by the time the watch starts. Comparing
+    // against "what the screen was when watching began" would see no change and
+    // miss it entirely.
+    std.Thread.sleep(1500 * std.time.ns_per_ms);
+
+    const ev = try reg.watch(id, alloc, .{
+        .since_gen = sent_at,
+        .stall_ms = 8000,
+        .timeout_ms = 10_000,
+    });
+    try std.testing.expect(ev != null);
+    defer alloc.free(ev.?.text);
+    try std.testing.expectEqual(wake.Reason.tui_detected, ev.?.reason);
+    try std.testing.expect(ev.?.alt_screen);
+}
+
+test "a quiet pane reports nothing rather than inventing a reason" {
+    const alloc = std.testing.allocator;
+    var reg = init(alloc);
+    defer reg.deinit();
+
+    const id: u64 = 1;
+    try reg.open(id, .{ .argv = &.{"/bin/sh"} });
+
+    var attach: std.ArrayListUnmanaged(u8) = .{};
+    defer attach.deinit(alloc);
+    _ = try reg.screen(id, alloc, &attach, .{});
+    const quiet = try settle(&reg, id, alloc, 0);
+    _ = quiet;
+
+    // Nothing sent, so there is nothing to say. Reporting `command_complete`
+    // here -- the prompt is right there on screen -- would tell an agent its
+    // command had finished before it ran one.
+    var timer = try std.time.Timer.start();
+    const ev = try reg.watch(id, alloc, .{
+        .stall_ms = 200,
+        .timeout_ms = 700,
+    });
+    if (ev) |e| alloc.free(e.text);
+    try std.testing.expect(ev == null);
+    try std.testing.expect(timer.read() >= 600 * std.time.ns_per_ms);
 }

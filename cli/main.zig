@@ -45,6 +45,7 @@ const usage_text =
     \\  tree          Show workspace/pane hierarchy
     \\  workspace     Workspace management (list, create, current, select, close, rename,
     \\                  report-git, set-status, clear-status, add-log, clear-log, set-progress, set-pinned, set-color)
+    \\  watch         Block until a pane needs attention (--since, --timeout, --stall-ms, --prompt)
     \\  attach        Relay a daemon-owned pane through this terminal
     \\  surface       Surface management (list, current, search, read-text, screen, send-key, split, close)
     \\  pane          Pane management (list, break, join, resize, swap)
@@ -473,6 +474,79 @@ pub fn main() !void {
         } else {
             try stderr.writeAll("Unknown workspace subcommand. Use: list, create, current, select, close, rename,\n  report-git, set-status, clear-status, add-log, clear-log, set-progress, set-pinned, set-color, next, previous, last\n");
         }
+    } else if (std.mem.eql(u8, subcommand, "watch")) {
+        // amux-cli watch [surface_id] [--timeout <ms>] [--stall-ms <n>] [--prompt <pat>]
+        //
+        // Blocks until the pane does something worth a turn, then prints why
+        // along with the screen. The alternative is sleeping and re-reading,
+        // which spends a turn on every dead poll and still misses the moment a
+        // command stops to ask something.
+        var surface_id: ?[]const u8 = null;
+        var timeout_ms: ?[]const u8 = null;
+        var stall_ms: ?[]const u8 = null;
+        var prompt_pat: ?[]const u8 = null;
+        var since_gen: ?[]const u8 = null;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--timeout")) {
+                timeout_ms = args.next() orelse {
+                    try stderr.writeAll("--timeout requires a value (milliseconds)\n");
+                    return;
+                };
+            } else if (std.mem.eql(u8, arg, "--stall-ms")) {
+                stall_ms = args.next() orelse {
+                    try stderr.writeAll("--stall-ms requires a value\n");
+                    return;
+                };
+            } else if (std.mem.eql(u8, arg, "--prompt")) {
+                prompt_pat = args.next() orelse {
+                    try stderr.writeAll("--prompt requires a pattern\n");
+                    return;
+                };
+            } else if (std.mem.eql(u8, arg, "--since")) {
+                since_gen = args.next() orelse {
+                    try stderr.writeAll("--since requires the gen from a previous send\n");
+                    return;
+                };
+            } else {
+                surface_id = arg;
+            }
+        }
+        var params_buf: [params_medium]u8 = undefined;
+        var p = Params.init(&params_buf);
+        if (since_gen) |g| {
+            const v = argInt(g) orelse {
+                try stderr.writeAll("Invalid --since: must be an integer\n");
+                return;
+            };
+            p.int("since_gen", v);
+        }
+        if (surface_id) |sid| {
+            const v = argInt(sid) orelse {
+                try stderr.writeAll("Invalid surface id: must be an integer\n");
+                return;
+            };
+            p.int("surface_id", v);
+        }
+        if (timeout_ms) |t| {
+            const v = argInt(t) orelse {
+                try stderr.writeAll("Invalid --timeout: must be an integer\n");
+                return;
+            };
+            p.int("timeout_ms", v);
+        }
+        if (stall_ms) |t| {
+            const v = argInt(t) orelse {
+                try stderr.writeAll("Invalid --stall-ms: must be an integer\n");
+                return;
+            };
+            p.int("stall_ms", v);
+        }
+        if (prompt_pat) |pat| p.str("prompt_pattern", pat);
+        const params = p.finish() orelse {
+            try stderr.writeAll("Params too long\n");
+            return;
+        };
+        try sendAndPrint(socket_path, "surface.watch", params, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "attach")) {
         // amux-cli attach [surface_id]
         //

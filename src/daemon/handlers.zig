@@ -1003,13 +1003,18 @@ fn surfaceWatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     const body = try std.fmt.allocPrint(
         alloc,
         "{{\"surface_id\":{d},\"reason\":\"{s}\",\"woke\":true," ++
-            "\"idle_ms\":{d},\"alt_screen\":{s},\"exited\":{s},\"text\":\"{s}\"}}",
+            "\"idle_ms\":{d},\"alt_screen\":{s},\"exited\":{s}," ++
+            "\"shell_integration\":{s},\"text\":\"{s}\"}}",
         .{
             ev.surface_id,
             ev.reason.name(),
             ev.idle_ms,
             if (ev.alt_screen) "true" else "false",
             if (ev.exited) "true" else "false",
+            // Says whether the answer rests on the shell's own marks or on
+            // recognising a prompt by sight, so a caller knows how much to
+            // trust it.
+            if (ev.shell_integration) "true" else "false",
             escaped,
         },
     );
@@ -1144,8 +1149,21 @@ fn run(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u
     var after: ?[]const u8 = null;
     defer if (after) |a| alloc.free(a);
 
+    // When the shell marks its own boundaries, "is it finished?" is a fact
+    // rather than a resemblance. Checked once per poll alongside the snapshot.
+    var marked = false;
+
     while (timer.read() < deadline_ns) {
         std.Thread.sleep(run_poll_interval_ms * std.time.ns_per_ms);
+
+        if (state.paneAtPrompt(pane_id) catch null) |at_prompt| {
+            marked = true;
+            if (at_prompt) {
+                timed_out = false;
+                break;
+            }
+            continue;
+        }
 
         const snapshot = state.readPane(pane_id, alloc, false) catch break;
         if (snapshot.len > before.len and endsWithPrompt(snapshot, prompt)) {
@@ -1158,13 +1176,28 @@ fn run(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u
         after = snapshot;
     }
 
-    const output = if (after) |a| extractOutput(a, before, command) else "";
+    // Read the output from the marks when there are any; otherwise fall back to
+    // matching the echoed command against the screen, which is what every
+    // unintegrated shell still gets.
+    var marked_output: ?[]const u8 = null;
+    defer if (marked_output) |m| alloc.free(m);
+    if (marked) {
+        marked_output = state.paneCommandOutput(pane_id, alloc) catch null;
+    }
+
+    const output = if (marked_output) |m|
+        m
+    else if (after) |a|
+        extractOutput(a, before, command)
+    else
+        "";
+
     const escaped = try jsonEscape(alloc, output);
     defer alloc.free(escaped);
 
     const body = try std.fmt.allocPrint(alloc,
-        \\{{"output":"{s}","timed_out":{s},"surface_id":{d}}}
-    , .{ escaped, if (timed_out) "true" else "false", pane_id });
+        \\{{"output":"{s}","timed_out":{s},"shell_integration":{s},"surface_id":{d}}}
+    , .{ escaped, if (timed_out) "true" else "false", if (marked) "true" else "false", pane_id });
     defer alloc.free(body);
     return protocol.successResponse(alloc, req.id, body);
 }

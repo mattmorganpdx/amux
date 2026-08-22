@@ -67,6 +67,15 @@ pub const Observation = struct {
     stall_ms: u64,
     /// Overrides the built-in shell prompt suffixes.
     prompt: ?[]const u8 = null,
+
+    /// Whether the shell is at a prompt, when the shell says so via OSC 133.
+    ///
+    /// Null means no shell integration on this pane, and the prompt has to be
+    /// recognised by how it looks. That guess is wrong for any prompt not ending
+    /// in one of a handful of characters, and wrong again for output that
+    /// happens to end in one; when the shell marks its own boundaries there is
+    /// nothing left to get wrong.
+    at_prompt: ?bool = null,
 };
 
 /// Why this observation deserves a turn, or null to keep waiting.
@@ -84,7 +93,9 @@ pub fn classify(o: Observation) ?Reason {
     if (!o.saw_output) return null;
     if (o.idle_ms < o.stall_ms) return null;
 
-    if (endsWithPrompt(o.text, o.prompt)) return .command_complete;
+    // The shell's own answer when it gives one, the guess otherwise.
+    const at_prompt = o.at_prompt orelse endsWithPrompt(o.text, o.prompt);
+    if (at_prompt) return .command_complete;
     return .output_stalled;
 }
 
@@ -188,6 +199,8 @@ const testing = std.testing;
 /// An observation with the boring fields filled in, so each test states only
 /// what it is about.
 fn obs(text: []const u8) Observation {
+    // at_prompt defaults to null, so these exercise the guessing path unless a
+    // test says otherwise.
     return .{
         .text = text,
         .alt_screen = false,
@@ -276,4 +289,22 @@ test "prompt detection accepts the usual shells and a custom pattern" {
     try testing.expect(!endsWithPrompt("compiling foo.c", null));
     try testing.expect(endsWithPrompt("READY!", "!"));
     try testing.expect(!endsWithPrompt("READY!", "?"));
+}
+
+test "the shell's own answer beats the guess, in both directions" {
+    // A prompt that ends in nothing familiar. Guessing calls this stalled; the
+    // shell says it is a prompt, and the shell is right.
+    var unusual = obs("$ deploy\ndone\n\u{2192} ");
+    unusual.at_prompt = true;
+    try testing.expectEqual(Reason.command_complete, classify(unusual).?);
+    unusual.at_prompt = null;
+    try testing.expectEqual(Reason.output_stalled, classify(unusual).?);
+
+    // Output that happens to end in "$ " while a command is still waiting for
+    // input. Guessing calls it finished; the shell says otherwise.
+    var trap = obs("$ cat prices.txt\nitem  $ ");
+    trap.at_prompt = false;
+    try testing.expectEqual(Reason.output_stalled, classify(trap).?);
+    trap.at_prompt = null;
+    try testing.expectEqual(Reason.command_complete, classify(trap).?);
 }

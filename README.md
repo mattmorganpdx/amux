@@ -83,6 +83,15 @@ After this the first `amux-cli` call starts `amuxd` on demand. Terminals live in
 the daemon, so they keep running whether or not the GUI is open, and `amux-cli`
 works with no display and no window.
 
+### Shell integration (optional, recommended)
+
+```bash
+eval "$(amux-cli shell-init bash)"    # in ~/.bashrc  (also: zsh)
+```
+
+Teaches the shell to mark where prompts end and output begins (OSC 133), so amux
+knows exactly what a command printed instead of inferring it from the screen.
+
 ### Run
 
 ```bash

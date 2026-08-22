@@ -9,6 +9,7 @@ const vt = @import("../vt.zig");
 const Pty = @import("Pty.zig");
 const screen_json = @import("screen_json.zig");
 const vt_paint = @import("vt_paint.zig");
+const semantic = @import("semantic.zig");
 
 const Pane = @This();
 
@@ -116,6 +117,15 @@ since_output: ?std.time.Timer = null,
 /// taken, so the switch would never be seen. Which is exactly what happened.
 last_alt_screen: bool = false,
 alt_change_gen: u64 = 0,
+
+/// True once this pane has ever shown an OSC 133 mark.
+///
+/// Shell integration is per-shell and opt-in, so the daemon cannot assume it.
+/// Once a mark has been seen the boundaries are known exactly and the guessing
+/// stops; until then the heuristics are all there is. Sticky, because a shell
+/// that marked its last prompt has not stopped being integrated just because
+/// the current screen has no mark on it.
+saw_semantic_marks: bool = false,
 /// Releases held input when the deadline passes rather than when the child
 /// speaks. Needed because a program can read without ever writing -- `cat` being
 /// the obvious one -- so waiting on output alone turns holding into dropping.
@@ -314,6 +324,19 @@ pub fn hasExited(self: *const Pane) bool {
 fn refreshLocked(self: *Pane) !u64 {
     try self.render.update(self.alloc, &self.terminal);
 
+    if (!self.saw_semantic_marks) {
+        // Before the resize branch below, which returns early: on a pane's very
+        // first refresh that branch is always taken, so detecting integration
+        // after it meant the first command on a pane never saw the marks -- and
+        // a quick command is finished before there is a second refresh.
+        //
+        // The cursor alone is not enough either: during a command it sits on
+        // output, so an integrated shell would look unintegrated for exactly as
+        // long as the command ran. The marked prompt above it is still there.
+        self.saw_semantic_marks = self.terminal.screens.active.cursor.semantic_content != .output or
+            semantic.hasMarks(&self.render);
+    }
+
     const rows: usize = self.render.rows;
     if (self.row_seq.len != rows) {
         // A resize moves every cell a client is holding, so the only honest
@@ -401,12 +424,35 @@ pub const Observation = struct {
     /// The generation at which the screen type last changed, so a caller can
     /// tell "switched just now" from "was already full-screen".
     alt_change_gen: u64,
+    /// Whether the shell is sitting at a prompt, or null when this pane has no
+    /// shell integration and the question can only be guessed at.
+    at_prompt: ?bool,
     exited: bool,
     /// Milliseconds since the last output. Large when nothing has ever been
     /// written, so a silent child reads as idle rather than as busy.
     idle_ms: u64,
     gen: u64,
 };
+
+/// The last command's output, read from the shell's OSC 133 marks.
+///
+/// Null when this pane has no shell integration, so the caller knows to fall
+/// back rather than being handed an empty string that looks like an answer.
+pub fn commandOutput(self: *Pane, alloc: std.mem.Allocator) !?[]const u8 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    _ = try self.refreshLocked();
+    return semantic.lastCommandOutput(alloc, &self.render);
+}
+
+/// Whether the shell is at a prompt, or null without shell integration.
+pub fn atPrompt(self: *Pane) !?bool {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    _ = try self.refreshLocked();
+    if (!self.saw_semantic_marks) return null;
+    return self.terminal.screens.active.cursor.semantic_content != .output;
+}
 
 /// The cheap half of `observe`: no allocation and no render rebuild.
 ///
@@ -441,6 +487,12 @@ pub fn observe(self: *Pane, alloc: std.mem.Allocator) !Observation {
         .text = text,
         .alt_screen = self.render.screen == .alternate,
         .alt_change_gen = self.alt_change_gen,
+        // Upstream reads it the same way: anything other than command output
+        // under the cursor means the shell is at a prompt or reading input.
+        .at_prompt = if (self.saw_semantic_marks)
+            self.terminal.screens.active.cursor.semantic_content != .output
+        else
+            null,
         .exited = self.exited.load(.acquire),
         .idle_ms = if (self.since_output) |*t| t.read() / std.time.ns_per_ms else std.math.maxInt(u64),
         .gen = self.gen.load(.acquire),
@@ -796,4 +848,29 @@ test "input still reaches a program that never writes anything first" {
 
     try pane.write("HELD_THEN_SENT\n");
     try pane.expectOnScreen(alloc, "HELD_THEN_SENT", 20000);
+}
+
+test "shell integration is noticed on a pane's very first refresh" {
+    const alloc = std.testing.allocator;
+
+    // A child that marks a prompt straight away, then waits. The first refresh
+    // of a pane also allocates its row bookkeeping and used to return early
+    // before looking for marks -- so the first command run on a pane fell back
+    // to guessing, and a quick command was over before a second refresh
+    // happened. Only ever visible against a live shell.
+    var pane = try create(alloc, 1, .{
+        .argv = &.{ "/bin/sh", "-c", "printf '\\033]133;A\\007$ \\033]133;B\\007'; sleep 30" },
+    });
+    defer pane.destroy();
+
+    // Wait for the marks to arrive, then ask exactly once.
+    var waited: usize = 0;
+    while (waited < 20000) : (waited += 100) {
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        if (pane.generation() > 0) break;
+    }
+
+    const at_prompt = try pane.atPrompt();
+    try std.testing.expect(at_prompt != null);
+    try std.testing.expect(at_prompt.?);
 }

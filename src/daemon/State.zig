@@ -425,6 +425,17 @@ pub fn paneWatchAny(
     return self.registry.watchAny(targets, alloc, opts);
 }
 
+/// The last command's output from the shell's own marks, or null when the pane
+/// has no shell integration and it has to be inferred instead.
+pub fn paneCommandOutput(self: *State, pane_id: u64, alloc: Allocator) !?[]const u8 {
+    return self.registry.commandOutput(pane_id, alloc);
+}
+
+/// Whether the shell is at a prompt, or null without shell integration.
+pub fn paneAtPrompt(self: *State, pane_id: u64) !?bool {
+    return self.registry.atPrompt(pane_id);
+}
+
 /// The pane's change counter, for a caller that wants to watch from here.
 pub fn paneGeneration(self: *State, pane_id: u64) !u64 {
     return self.registry.generation(pane_id);

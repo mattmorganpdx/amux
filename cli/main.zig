@@ -45,6 +45,7 @@ const usage_text =
     \\  tree          Show workspace/pane hierarchy
     \\  workspace     Workspace management (list, create, current, select, close, rename,
     \\                  report-git, set-status, clear-status, add-log, clear-log, set-progress, set-pinned, set-color)
+    \\  shell-init    Print shell integration to eval from your rc file (bash, zsh)
     \\  watch         Block until a pane needs attention: watch [<id>[:<gen>] ...]
     \\  attach        Relay a daemon-owned pane through this terminal
     \\  surface       Surface management (list, current, search, read-text, screen, send-key, split, close)
@@ -473,6 +474,33 @@ pub fn main() !void {
             try sendAndPrint(socket_path, "workspace.last", "{}", stdout, stderr);
         } else {
             try stderr.writeAll("Unknown workspace subcommand. Use: list, create, current, select, close, rename,\n  report-git, set-status, clear-status, add-log, clear-log, set-progress, set-pinned, set-color, next, previous, last\n");
+        }
+    } else if (std.mem.eql(u8, subcommand, "shell-init")) {
+        // amux-cli shell-init <bash|zsh>
+        //
+        // Prints the shell integration to be eval'd from an rc file. Embedded in
+        // the binary rather than read from a path, so it cannot go stale
+        // against the build or break when the checkout moves.
+        const which = args.next() orelse {
+            try stderr.writeAll(
+                \\Usage: amux-cli shell-init <bash|zsh>
+                \\
+                \\Add to your shell's rc file:
+                \\    eval "$(amux-cli shell-init bash)"
+                \\
+                \\Teaches the shell to mark where prompts end and output begins
+                \\(OSC 133), so amux knows exactly what a command printed
+                \\instead of inferring it from the screen.
+                \\
+            );
+            return;
+        };
+        if (std.mem.eql(u8, which, "bash")) {
+            try stdout.writeAll(@embedFile("shell_integration_bash"));
+        } else if (std.mem.eql(u8, which, "zsh")) {
+            try stdout.writeAll(@embedFile("shell_integration_zsh"));
+        } else {
+            try stderr.writeAll("Unsupported shell. Supported: bash, zsh\n");
         }
     } else if (std.mem.eql(u8, subcommand, "watch")) {
         // amux-cli watch [surface_id] [--timeout <ms>] [--stall-ms <n>] [--prompt <pat>]

@@ -291,6 +291,30 @@ when it changes, so sharing one number would make an agent's progress report as
 expensive as a split. Reporting progress ten times in a row causes zero widget
 rebuilds.
 
+### Shell integration (OSC 133)
+
+Without it, amux works out where a command's output starts and stops by matching
+the echoed command against the screen and looking for something that resembles a
+prompt. With it, the shell says so directly.
+
+```bash
+eval "$(amux-cli shell-init bash)"    # in ~/.bashrc  (also: zsh)
+```
+
+`surface.run` and `surface.watch` both report `shell_integration` so a caller
+knows which it got. What changes when it is on:
+
+- a prompt that does not end in `$ #  % >` is still recognised as a prompt
+- output that happens to contain `$ ` is no longer cut short at it
+- a command whose typed line wraps is no longer partly reported as its own output
+- "has the command finished?" stops being a resemblance and becomes a fact
+
+The daemon reads the marks the VT engine already applies — cells are tagged
+prompt, input or output — so nothing has to be re-parsed. What it does not get is
+the **exit status**: `OSC 133;D;<code>` carries it, but the engine discards the
+code, so `run` still cannot tell you whether the command succeeded. Recovering it
+means patching the fork to record it.
+
 ### Waiting for a pane instead of polling it
 
 `surface.watch` blocks until a pane does something worth a turn, and says why.

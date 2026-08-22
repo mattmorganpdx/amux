@@ -319,6 +319,9 @@ pub const WatchOptions = struct {
 pub const WatchEvent = struct {
     /// Which pane fired. Needed once more than one is being watched.
     surface_id: u64,
+    /// True when the reason rests on the shell's own OSC 133 marks rather than
+    /// on recognising a prompt by sight.
+    shell_integration: bool = false,
     reason: wake.Reason,
     /// The screen at the moment of the decision, so the agent can orient
     /// without a second round trip that might see something different. Caller
@@ -425,12 +428,14 @@ pub fn watchAny(
                 .idle_ms = o.idle_ms,
                 .stall_ms = opts.stall_ms,
                 .prompt = opts.prompt,
+                .at_prompt = o.at_prompt,
             });
 
             if (reason) |r| {
                 keep_text = true;
                 return .{
                     .surface_id = t.id,
+                    .shell_integration = o.at_prompt != null,
                     .reason = r,
                     .text = o.text,
                     .idle_ms = o.idle_ms,
@@ -462,6 +467,22 @@ pub fn watch(
 ) !?WatchEvent {
     const targets = [_]WatchTarget{.{ .id = id, .since_gen = opts.since_gen }};
     return self.watchAny(&targets, alloc, opts);
+}
+
+/// The last command's output from OSC 133 marks, or null without integration.
+pub fn commandOutput(self: *Registry, id: u64, alloc: std.mem.Allocator) !?[]const u8 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const pane = self.panes.get(id) orelse return Error.PaneNotFound;
+    return pane.commandOutput(alloc);
+}
+
+/// Whether the shell is at a prompt, or null without integration.
+pub fn atPrompt(self: *Registry, id: u64) !?bool {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const pane = self.panes.get(id) orelse return Error.PaneNotFound;
+    return pane.atPrompt();
 }
 
 /// A pane's change counter. See `Pane.gen`.

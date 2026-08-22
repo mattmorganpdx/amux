@@ -121,3 +121,40 @@ test "scrollback retains lines scrolled off the screen" {
     try std.testing.expect(std.mem.indexOf(u8, all, "line0") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "line9") != null);
 }
+
+test "OSC 133 marks reach the terminal through the stream amux uses" {
+    const alloc = std.testing.allocator;
+
+    var term = try Terminal.init(alloc, .{ .cols = 40, .rows = 5, .max_scrollback = 100 });
+    defer term.deinit(alloc);
+
+    const Handler = @typeInfo(@TypeOf(Terminal.vtHandler)).@"fn".return_type.?;
+    var stream: Stream(Handler) = .{
+        .handler = term.vtHandler(),
+        .parser = .init(),
+        .utf8decoder = .{},
+    };
+
+    // Nothing marked yet: everything written is command output as far as the
+    // terminal knows.
+    try std.testing.expectEqual(
+        @as(@TypeOf(term.screens.active.cursor.semantic_content), .output),
+        term.screens.active.cursor.semantic_content,
+    );
+
+    // A prompt, then the boundary where the user's typing begins.
+    try stream.nextSlice("\x1b]133;A\x07$ ");
+    try std.testing.expect(term.screens.active.cursor.semantic_content == .prompt);
+
+    try stream.nextSlice("\x1b]133;B\x07");
+    try std.testing.expect(term.screens.active.cursor.semantic_content == .input);
+
+    // The command runs: what follows is output, which is what "the shell is
+    // busy" looks like from here.
+    try stream.nextSlice("make\x1b]133;C\x07\r\nbuilding\r\n");
+    try std.testing.expect(term.screens.active.cursor.semantic_content == .output);
+
+    // And back to a prompt.
+    try stream.nextSlice("\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+    try std.testing.expect(term.screens.active.cursor.semantic_content == .input);
+}

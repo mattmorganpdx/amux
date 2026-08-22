@@ -120,6 +120,17 @@ pub fn build(b: *std.Build) void {
     });
     cli.linkLibC();
 
+    // The shell integration lives once, in dist/, and is embedded from there.
+    // Keeping a second copy next to the CLI source so `@embedFile` could find it
+    // would be two files to edit and one to forget -- the same trap a stale
+    // copied binary already set once.
+    cli.root_module.addAnonymousImport("shell_integration_bash", .{
+        .root_source_file = b.path("dist/shell-integration/amux.bash"),
+    });
+    cli.root_module.addAnonymousImport("shell_integration_zsh", .{
+        .root_source_file = b.path("dist/shell-integration/amux.zsh"),
+    });
+
     b.installArtifact(cli);
 
     // --- Tests ---

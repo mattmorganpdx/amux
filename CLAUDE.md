@@ -310,10 +310,14 @@ knows which it got. What changes when it is on:
 - "has the command finished?" stops being a resemblance and becomes a fact
 
 The daemon reads the marks the VT engine already applies — cells are tagged
-prompt, input or output — so nothing has to be re-parsed. What it does not get is
-the **exit status**: `OSC 133;D;<code>` carries it, but the engine discards the
-code, so `run` still cannot tell you whether the command succeeded. Recovering it
-means patching the fork to record it.
+prompt, input or output — so nothing has to be re-parsed.
+
+`surface.run` also reports **`exit_code`** for an integrated shell, which is the
+difference between "here is some output" and "this command failed". It is absent
+rather than zero when the shell did not report one, since an unintegrated shell
+tells us nothing about whether its command worked and a guessed 0 is a lie a
+caller could act on. This needed a one-field patch to the ghostty fork: the
+parser already read the status but `end_command` discarded it.
 
 ### Waiting for a pane instead of polling it
 

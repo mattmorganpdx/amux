@@ -1195,9 +1195,21 @@ fn run(alloc: Allocator, state: *State, req: *const protocol.Request) ![]const u
     const escaped = try jsonEscape(alloc, output);
     defer alloc.free(escaped);
 
+    // The exit status, when the shell reported one. Absent rather than guessed:
+    // an unintegrated shell tells us nothing about whether its command worked,
+    // and reporting 0 there would be a lie a caller could act on.
+    var exit_buf: [32]u8 = undefined;
+    const exit_field: []const u8 = if (marked) blk: {
+        const code = state.paneExitCode(pane_id) catch null;
+        if (code) |c| {
+            break :blk std.fmt.bufPrint(&exit_buf, ",\"exit_code\":{d}", .{c}) catch "";
+        }
+        break :blk "";
+    } else "";
+
     const body = try std.fmt.allocPrint(alloc,
-        \\{{"output":"{s}","timed_out":{s},"shell_integration":{s},"surface_id":{d}}}
-    , .{ escaped, if (timed_out) "true" else "false", if (marked) "true" else "false", pane_id });
+        \\{{"output":"{s}","timed_out":{s},"shell_integration":{s}{s},"surface_id":{d}}}
+    , .{ escaped, if (timed_out) "true" else "false", if (marked) "true" else "false", exit_field, pane_id });
     defer alloc.free(body);
     return protocol.successResponse(alloc, req.id, body);
 }

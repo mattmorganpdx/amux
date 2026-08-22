@@ -477,6 +477,14 @@ pub fn commandOutput(self: *Registry, id: u64, alloc: std.mem.Allocator) !?[]con
     return pane.commandOutput(alloc);
 }
 
+/// The last command's exit status, when the shell reported one.
+pub fn lastExitCode(self: *Registry, id: u64) Error!?i32 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const pane = self.panes.get(id) orelse return Error.PaneNotFound;
+    return pane.lastExitCode();
+}
+
 /// Whether the shell is at a prompt, or null without integration.
 pub fn atPrompt(self: *Registry, id: u64) !?bool {
     self.mutex.lock();

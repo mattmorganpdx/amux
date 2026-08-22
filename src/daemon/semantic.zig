@@ -113,38 +113,43 @@ pub fn hasMarks(state: *const vt.RenderState) bool {
 /// The output of the most recent command, or null if this screen carries no
 /// marks and there is nothing to read them from.
 ///
-/// Walks up from the bottom: past the prompt that is waiting now, collecting
-/// output, stopping at the line the command was typed on. Caller frees.
+/// Walks up from the prompt the cursor is sitting on, collecting output and
+/// stopping at the line the command was typed on. Caller frees.
 pub fn lastCommandOutput(alloc: Allocator, state: *const vt.RenderState) !?[]const u8 {
+    if (!hasMarks(state)) return null;
+
     const rows = state.row_data.slice();
     const all_cells = rows.items(.cells);
 
-    if (!hasMarks(state)) return null;
+    // Anchor on the cursor rather than on the bottom of the screen. The prompt
+    // waiting now is the row the cursor is on, and everything below it is
+    // padding. Walking up from the bottom instead meant guessing where that
+    // prompt started, and the guess had no way to stop at the command's own line
+    // when the command printed nothing -- it walked straight past it into
+    // whatever happened to be on screen from before.
+    const anchor: usize = if (state.cursor.viewport) |vp| vp.y else state.rows;
+    if (anchor == 0) return try alloc.dupe(u8, "");
 
-    // Bottom-up: skip the prompt now waiting, take the output above it, stop at
-    // the input line that produced it.
     var first_output: ?usize = null;
     var last_output: ?usize = null;
-    var seen_output = false;
 
-    var i: usize = state.rows;
+    var i: usize = anchor;
     while (i > 0) {
         i -= 1;
         switch (classifyRow(all_cells[i])) {
-            .prompt_or_input => {
-                // The command's own line, once output has been collected above
-                // it. Before that, it is the prompt still on screen.
-                if (seen_output) break;
-            },
+            // The line the command was typed on. Anything above it belongs to
+            // an earlier command, including anything written before this shell
+            // was integrated, which carries no marks and would otherwise read
+            // as output.
+            .prompt_or_input => break,
             .output => {
-                seen_output = true;
                 first_output = i;
                 if (last_output == null) last_output = i;
             },
             .blank => {
-                // Blank lines inside output are part of it; blank lines below
-                // it are not, which is why this only counts once output starts.
-                if (seen_output) first_output = i;
+                // Blank lines within the output are part of it; blank lines
+                // below it are trailing padding.
+                if (last_output != null) first_output = i;
             },
         }
     }
@@ -324,4 +329,49 @@ test "a command long enough to wrap is still not mistaken for output" {
     const flat = try std.mem.replaceOwned(u8, alloc, got, "\n", "");
     defer alloc.free(flat);
     try testing.expectEqualStrings("one two three four five", flat);
+}
+
+test "output stops at the command's line, not at whatever came before it" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc, 40, 10);
+    defer f.deinit();
+
+    // Unmarked history, as every pane has before its shell is integrated. Those
+    // cells are indistinguishable from output, so the walk has to stop at the
+    // command's own marked line rather than run past it.
+    try f.feed("$ source integration.sh\r\n");
+
+    // A command that prints nothing at all: the case where there is no output
+    // row to stop the walk.
+    try f.feed("\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n");
+    try f.feed("\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+
+    const got = (try f.output()).?;
+    defer alloc.free(got);
+    try testing.expectEqualStrings("", got);
+}
+
+test "marks survive the incremental refreshes a live pane does" {
+    const alloc = testing.allocator;
+    var f = try Fixture.init(alloc, 80, 6);
+    defer f.deinit();
+
+    // A live pane refreshes its render state constantly -- every poll, every
+    // watch tick -- so rows are rebuilt incrementally rather than all at once.
+    // Tests that fed everything and updated once did not exercise that.
+    try f.feed("$ source integration.sh\r\n");
+    try f.render.update(f.alloc, &f.term);
+
+    try f.feed("\x1b]133;A\x07user@host $ \x1b]133;B\x07");
+    try f.render.update(f.alloc, &f.term);
+
+    try f.feed("true\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07user@host $ \x1b]133;B\x07");
+    try f.render.update(f.alloc, &f.term);
+
+    try testing.expect(hasMarks(&f.render));
+
+    const got = try lastCommandOutput(alloc, &f.render);
+    try testing.expect(got != null);
+    defer alloc.free(got.?);
+    try testing.expectEqualStrings("", got.?);
 }

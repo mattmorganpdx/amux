@@ -445,6 +445,17 @@ pub fn commandOutput(self: *Pane, alloc: std.mem.Allocator) !?[]const u8 {
     return semantic.lastCommandOutput(alloc, &self.render);
 }
 
+/// The exit status of the last command, when the shell reported one.
+///
+/// Only integrated shells report it, so null means either no integration or a
+/// command that ended without a status -- both cases where the honest answer is
+/// that we do not know.
+pub fn lastExitCode(self: *Pane) ?i32 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    return self.terminal.last_command_exit_code;
+}
+
 /// Whether the shell is at a prompt, or null without shell integration.
 pub fn atPrompt(self: *Pane) !?bool {
     self.mutex.lock();

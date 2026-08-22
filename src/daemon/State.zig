@@ -431,6 +431,11 @@ pub fn paneCommandOutput(self: *State, pane_id: u64, alloc: Allocator) !?[]const
     return self.registry.commandOutput(pane_id, alloc);
 }
 
+/// The last command's exit status, when the shell reported one.
+pub fn paneExitCode(self: *State, pane_id: u64) !?i32 {
+    return self.registry.lastExitCode(pane_id);
+}
+
 /// Whether the shell is at a prompt, or null without shell integration.
 pub fn paneAtPrompt(self: *State, pane_id: u64) !?bool {
     return self.registry.atPrompt(pane_id);

@@ -158,3 +158,33 @@ test "OSC 133 marks reach the terminal through the stream amux uses" {
     try stream.nextSlice("\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
     try std.testing.expect(term.screens.active.cursor.semantic_content == .input);
 }
+
+test "the exit status on OSC 133;D is recorded" {
+    const alloc = std.testing.allocator;
+
+    var term = try Terminal.init(alloc, .{ .cols = 40, .rows = 5, .max_scrollback = 100 });
+    defer term.deinit(alloc);
+
+    const Handler = @typeInfo(@TypeOf(Terminal.vtHandler)).@"fn".return_type.?;
+    var stream: Stream(Handler) = .{
+        .handler = term.vtHandler(),
+        .parser = .init(),
+        .utf8decoder = .{},
+    };
+
+    // Nothing has finished yet.
+    try std.testing.expect(term.last_command_exit_code == null);
+
+    try stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07false\x1b]133;C\x07\r\n");
+    try stream.nextSlice("\x1b]133;D;1\x07");
+    try std.testing.expectEqual(@as(i32, 1), term.last_command_exit_code.?);
+
+    try stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n");
+    try stream.nextSlice("\x1b]133;D;0\x07");
+    try std.testing.expectEqual(@as(i32, 0), term.last_command_exit_code.?);
+
+    // A command that ends without a status clears it rather than leaving the
+    // previous one to be read as this command's.
+    try stream.nextSlice("\x1b]133;A\x07$ \x1b]133;B\x07x\x1b]133;C\x07\r\n\x1b]133;D\x07");
+    try std.testing.expect(term.last_command_exit_code == null);
+}

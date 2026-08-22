@@ -118,7 +118,7 @@ Currently when an agent runs a long command (like `apt upgrade`), it has to slee
 - [x] **Wake reason classification** — each wake event includes a `wake_reason` field (`output_stalled`, `tui_detected`, `prompt_waiting`, `command_complete`) so the agent can orient without re-reading everything
 - [x] **Periodic fallback timeout** — configurable max silence interval so the agent still gets woken up as a safety net
 - [x] **`amux-cli watch` command** — CLI interface that blocks until a wake event, prints the event + current terminal state
-- [ ] **Multi-pane watch** — monitor multiple surfaces simultaneously, wake the agent about whichever one needs attention first
+- [x] **Multi-pane watch** — monitor multiple surfaces simultaneously, wake the agent about whichever one needs attention first
 
 Done as `surface.watch` / `amux-cli watch`; see `docs/plan/README.md` and
 CLAUDE.md. Two items remain open. **Screen geometry shift** was not needed: the

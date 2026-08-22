@@ -313,6 +313,24 @@ stall timer), `tui_detected` (entered the alternate screen), `output_stalled`
 (output stopped with no prompt), `exited`, and `timeout` for the safety net.
 `--stall-ms` sets how long output must be stopped to count (default 2000).
 
+Several panes at once, answering about whichever needs attention first — an
+agent supervising a build and a server should not have to pick one:
+
+```bash
+amux-cli watch 3 5                 # from now
+amux-cli watch 3:12 5:40           # each from the gen its send reported
+```
+
+Generations are per-pane, so a multi-pane watch takes one baseline each. A pane
+closed while being watched is reported as `exited` for that pane rather than
+failing the call — its going away is news, and the others are still worth
+watching.
+
+Note that a command which simply goes quiet for a while — `sleep 30` mid-script,
+a build stage that produces nothing — reads as `output_stalled`, because from
+outside it is indistinguishable from waiting for input. Raise `--stall-ms` above
+the pauses you expect.
+
 Only `tui_detected` and `exited` are exact; the rest are heuristics, and
 `prompt_waiting` only inspects the **last** line — a question answered a moment
 ago is still on screen, and matching it again woke agents with the wrong reason.

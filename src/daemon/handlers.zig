@@ -23,6 +23,7 @@ const protocol = @import("../socket/protocol.zig");
 const PaneTree = @import("../pane_tree.zig");
 const History = @import("History.zig");
 const State = @import("State.zig");
+const Registry = @import("Registry.zig");
 const Workspace = @import("../workspace.zig");
 
 const log = std.log.scoped(.daemon_handlers);
@@ -888,6 +889,43 @@ fn surfaceResize(alloc: Allocator, state: *State, req: *const protocol.Request) 
     return protocol.successResponse(alloc, req.id, body);
 }
 
+/// Read the `surfaces` list: `[3, 5]` or `[{"id":3,"since_gen":12}, ...]`.
+///
+/// Both forms accepted because both are natural to write. Returns how many were
+/// filled in; zero means the request did not use the list form at all.
+fn parseWatchTargets(
+    req: *const protocol.Request,
+    out: *[Registry.max_watch_targets]Registry.WatchTarget,
+) usize {
+    const params = req.params orelse return 0;
+    const list = params.get("surfaces") orelse return 0;
+    if (list != .array) return 0;
+
+    var n: usize = 0;
+    for (list.array.items) |item| {
+        if (n >= out.len) break;
+        switch (item) {
+            .integer => |v| {
+                if (v <= 0) continue;
+                out[n] = .{ .id = @intCast(v) };
+                n += 1;
+            },
+            .object => |o| {
+                const id_val = o.get("id") orelse continue;
+                if (id_val != .integer or id_val.integer <= 0) continue;
+                var target: Registry.WatchTarget = .{ .id = @intCast(id_val.integer) };
+                if (o.get("since_gen")) |g| {
+                    if (g == .integer and g.integer >= 0) target.since_gen = @intCast(g.integer);
+                }
+                out[n] = target;
+                n += 1;
+            },
+            else => {},
+        }
+    }
+    return n;
+}
+
 /// Longest a watch may block. Longer than the screen protocol's ceiling because
 /// waiting is the whole point here: an agent watching a build wants one call,
 /// not a loop of reconnects.
@@ -915,14 +953,33 @@ fn surfaceWatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
     const prompt = req.getStringParam(alloc, "prompt_pattern");
     defer if (prompt) |p| alloc.free(p);
 
-    const pane_id = state.resolvePane(explicit) catch |err| return stateError(alloc, req.id, err);
-
-    const res = state.paneWatch(pane_id, alloc, .{
+    const opts: Registry.WatchOptions = .{
         .since_gen = since_gen,
         .stall_ms = stall,
         .timeout_ms = timeout,
         .prompt = prompt,
-    }) catch |err| return stateError(alloc, req.id, err);
+    };
+
+    // `surfaces` watches several at once and answers about whichever fires
+    // first. Each entry carries its own baseline, because generations are
+    // per-pane -- one number could not describe two terminals.
+    var targets: [Registry.max_watch_targets]Registry.WatchTarget = undefined;
+    const target_count = parseWatchTargets(req, &targets);
+
+    const res = if (target_count > 0)
+        state.paneWatchAny(targets[0..target_count], alloc, opts) catch |err|
+            return stateError(alloc, req.id, err)
+    else blk: {
+        const pane_id = state.resolvePane(explicit) catch |err| return stateError(alloc, req.id, err);
+        break :blk state.paneWatch(pane_id, alloc, opts) catch |err|
+            return stateError(alloc, req.id, err);
+    };
+
+    // Which pane the answer is about, for the reply when nothing fired.
+    const pane_id: u64 = if (target_count > 0)
+        targets[0].id
+    else
+        state.resolvePane(explicit) catch 0;
 
     if (res == null) {
         // The safety net fired. Reported as an event of its own rather than an
@@ -948,7 +1005,7 @@ fn surfaceWatch(alloc: Allocator, state: *State, req: *const protocol.Request) !
         "{{\"surface_id\":{d},\"reason\":\"{s}\",\"woke\":true," ++
             "\"idle_ms\":{d},\"alt_screen\":{s},\"exited\":{s},\"text\":\"{s}\"}}",
         .{
-            pane_id,
+            ev.surface_id,
             ev.reason.name(),
             ev.idle_ms,
             if (ev.alt_screen) "true" else "false",
@@ -1299,4 +1356,50 @@ fn historyDelete(alloc: Allocator, state: *State, req: *const protocol.Request) 
     const removed = hist.delete(raw) catch |err| return stateError(alloc, req.id, err);
     if (!removed) return protocol.errorResponse(alloc, req.id, "not_found", "No such session");
     return protocol.successResponse(alloc, req.id, "{\"deleted\":true}");
+}
+
+test "the surfaces list accepts both a bare id and an id with a baseline" {
+    const alloc = std.testing.allocator;
+
+    // Both shapes are natural to write, so both are read.
+    const line =
+        \\{"id":1,"method":"surface.watch","params":{"surfaces":[3,{"id":5,"since_gen":42}]}}
+    ;
+    var req = try protocol.Request.parse(alloc, line);
+    defer req.deinit(alloc);
+
+    var targets: [Registry.max_watch_targets]Registry.WatchTarget = undefined;
+    const n = parseWatchTargets(&req, &targets);
+
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u64, 3), targets[0].id);
+    try std.testing.expect(targets[0].since_gen == null);
+    try std.testing.expectEqual(@as(u64, 5), targets[1].id);
+    try std.testing.expectEqual(@as(u64, 42), targets[1].since_gen.?);
+}
+
+test "a request with no surfaces list falls back to the single-pane form" {
+    const alloc = std.testing.allocator;
+    const line =
+        \\{"id":1,"method":"surface.watch","params":{"surface_id":7}}
+    ;
+    var req = try protocol.Request.parse(alloc, line);
+    defer req.deinit(alloc);
+
+    var targets: [Registry.max_watch_targets]Registry.WatchTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 0), parseWatchTargets(&req, &targets));
+}
+
+test "junk in the surfaces list is skipped rather than trusted" {
+    const alloc = std.testing.allocator;
+    const line =
+        \\{"id":1,"method":"surface.watch","params":{"surfaces":[0,-4,"nope",{"nope":1},{"id":9}]}}
+    ;
+    var req = try protocol.Request.parse(alloc, line);
+    defer req.deinit(alloc);
+
+    var targets: [Registry.max_watch_targets]Registry.WatchTarget = undefined;
+    const n = parseWatchTargets(&req, &targets);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u64, 9), targets[0].id);
 }

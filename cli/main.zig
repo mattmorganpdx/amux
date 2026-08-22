@@ -45,7 +45,7 @@ const usage_text =
     \\  tree          Show workspace/pane hierarchy
     \\  workspace     Workspace management (list, create, current, select, close, rename,
     \\                  report-git, set-status, clear-status, add-log, clear-log, set-progress, set-pinned, set-color)
-    \\  watch         Block until a pane needs attention (--since, --timeout, --stall-ms, --prompt)
+    \\  watch         Block until a pane needs attention: watch [<id>[:<gen>] ...]
     \\  attach        Relay a daemon-owned pane through this terminal
     \\  surface       Surface management (list, current, search, read-text, screen, send-key, split, close)
     \\  pane          Pane management (list, break, join, resize, swap)
@@ -486,6 +486,8 @@ pub fn main() !void {
         var stall_ms: ?[]const u8 = null;
         var prompt_pat: ?[]const u8 = null;
         var since_gen: ?[]const u8 = null;
+        var pane_args: [16][]const u8 = undefined;
+        var pane_count: usize = 0;
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--timeout")) {
                 timeout_ms = args.next() orelse {
@@ -508,10 +510,17 @@ pub fn main() !void {
                     return;
                 };
             } else {
+                // Positional panes. `3` watches it from now, `3:12` from the
+                // generation a previous send reported -- generations are
+                // per-pane, so watching several needs one baseline each.
+                if (pane_count < pane_args.len) {
+                    pane_args[pane_count] = arg;
+                    pane_count += 1;
+                }
                 surface_id = arg;
             }
         }
-        var params_buf: [params_medium]u8 = undefined;
+        var params_buf: [params_large]u8 = undefined;
         var p = Params.init(&params_buf);
         if (since_gen) |g| {
             const v = argInt(g) orelse {
@@ -520,8 +529,55 @@ pub fn main() !void {
             };
             p.int("since_gen", v);
         }
-        if (surface_id) |sid| {
-            const v = argInt(sid) orelse {
+        if (pane_count > 1) {
+            // More than one pane: send the list form and let the daemon answer
+            // about whichever fires first.
+            var list_buf: [512]u8 = undefined;
+            var list_len: usize = 0;
+            list_len += (std.fmt.bufPrint(list_buf[list_len..], "[", .{}) catch {
+                try stderr.writeAll("Too many panes\n");
+                return;
+            }).len;
+            for (pane_args[0..pane_count], 0..) |spec, i| {
+                var id_part = spec;
+                var gen_part: ?[]const u8 = null;
+                if (std.mem.indexOfScalar(u8, spec, ':')) |at| {
+                    id_part = spec[0..at];
+                    gen_part = spec[at + 1 ..];
+                }
+                const id_v = argInt(id_part) orelse {
+                    try stderr.writeAll("Invalid pane: expected <id> or <id>:<gen>\n");
+                    return;
+                };
+                const sep: []const u8 = if (i == 0) "" else ",";
+                const written = if (gen_part) |g| blk: {
+                    const gv = argInt(g) orelse {
+                        try stderr.writeAll("Invalid generation in <id>:<gen>\n");
+                        return;
+                    };
+                    break :blk std.fmt.bufPrint(list_buf[list_len..], "{s}{{\"id\":{d},\"since_gen\":{d}}}", .{ sep, id_v, gv });
+                } else std.fmt.bufPrint(list_buf[list_len..], "{s}{{\"id\":{d}}}", .{ sep, id_v });
+                list_len += (written catch {
+                    try stderr.writeAll("Too many panes\n");
+                    return;
+                }).len;
+            }
+            list_len += (std.fmt.bufPrint(list_buf[list_len..], "]", .{}) catch {
+                try stderr.writeAll("Too many panes\n");
+                return;
+            }).len;
+            p.raw("surfaces", list_buf[0..list_len]);
+        } else if (surface_id) |sid| {
+            var id_part = sid;
+            if (std.mem.indexOfScalar(u8, sid, ':')) |at| {
+                id_part = sid[0..at];
+                const gv = argInt(sid[at + 1 ..]) orelse {
+                    try stderr.writeAll("Invalid generation in <id>:<gen>\n");
+                    return;
+                };
+                p.int("since_gen", gv);
+            }
+            const v = argInt(id_part) orelse {
                 try stderr.writeAll("Invalid surface id: must be an integer\n");
                 return;
             };
@@ -1255,6 +1311,16 @@ const Params = struct {
         self.putByte('"');
         self.escapeInto(value);
         self.putByte('"');
+    }
+
+    /// Add a value that is already JSON: an array or object this file built.
+    ///
+    /// Not escaped, unlike `str`, so the caller is responsible for it being
+    /// well-formed. Only used for structures assembled here from validated
+    /// integers -- never for anything a user typed.
+    fn raw(self: *Params, key: []const u8, json_value: []const u8) void {
+        self.putKey(key);
+        self.putAll(json_value);
     }
 
     /// Add a JSON-escaped string value assembled from two parts.

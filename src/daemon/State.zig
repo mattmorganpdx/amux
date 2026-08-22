@@ -415,6 +415,16 @@ pub fn paneWatch(
     return self.registry.watch(pane_id, alloc, opts);
 }
 
+/// Block until one of several panes needs attention. See `paneWatch`.
+pub fn paneWatchAny(
+    self: *State,
+    targets: []const Registry.WatchTarget,
+    alloc: Allocator,
+    opts: Registry.WatchOptions,
+) !?Registry.WatchEvent {
+    return self.registry.watchAny(targets, alloc, opts);
+}
+
 /// The pane's change counter, for a caller that wants to watch from here.
 pub fn paneGeneration(self: *State, pane_id: u64) !u64 {
     return self.registry.generation(pane_id);

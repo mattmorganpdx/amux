@@ -408,6 +408,27 @@ pub const Observation = struct {
     gen: u64,
 };
 
+/// The cheap half of `observe`: no allocation and no render rebuild.
+///
+/// Watching several panes means asking all of them on every tick, and most
+/// ticks have nothing to report. Dumping every screen to discover that is waste
+/// that grows with the number of panes being watched.
+pub const Pulse = struct {
+    gen: u64,
+    idle_ms: u64,
+    exited: bool,
+};
+
+pub fn pulse(self: *Pane) Pulse {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    return .{
+        .gen = self.gen.load(.acquire),
+        .idle_ms = if (self.since_output) |*t| t.read() / std.time.ns_per_ms else std.math.maxInt(u64),
+        .exited = self.exited.load(.acquire),
+    };
+}
+
 pub fn observe(self: *Pane, alloc: std.mem.Allocator) !Observation {
     self.mutex.lock();
     defer self.mutex.unlock();

@@ -295,11 +295,17 @@ pub fn output(
     }
 }
 
+/// Most panes a single watch will follow. Beyond this the extras are ignored
+/// rather than allocated for; nobody supervises sixteen terminals at once, and a
+/// stack buffer keeps a watch from allocating per call.
+pub const max_watch_targets = 16;
+
 pub const WatchOptions = struct {
     /// The pane generation the caller last saw, from `surface.send_text`.
     ///
     /// Without it the baseline is whenever the watch started, which loses a
     /// command that finished in the gap between sending it and watching for it.
+    /// Only used by the single-pane `watch`; `watchAny` carries one per target.
     since_gen: ?u64 = null,
     /// How long output must be stopped before it counts as stopped.
     stall_ms: u64 = 2000,
@@ -311,6 +317,8 @@ pub const WatchOptions = struct {
 };
 
 pub const WatchEvent = struct {
+    /// Which pane fired. Needed once more than one is being watched.
+    surface_id: u64,
     reason: wake.Reason,
     /// The screen at the moment of the decision, so the agent can orient
     /// without a second round trip that might see something different. Caller
@@ -321,64 +329,117 @@ pub const WatchEvent = struct {
     exited: bool,
 };
 
-/// Block until something happens on this pane worth an agent's attention.
+/// One pane to watch, and the point on it the caller cares about.
+pub const WatchTarget = struct {
+    id: u64,
+    /// The generation this caller last saw on *this* pane. Generations are
+    /// per-pane, so watching several means a baseline for each.
+    since_gen: ?u64 = null,
+};
+
+/// Block until one of these panes does something worth an agent's attention.
+///
+/// Answers about whichever fires first. An agent supervising a build in one pane
+/// and a server in another should not have to choose which to wait on, nor poll
+/// both.
 ///
 /// Null means the timeout passed with nothing to report. The waiting rules are
 /// the same as `screen` and `output`: the registry lock is held, `timedWait`
-/// releases it, and the pane is looked up again after every wake so a pane
-/// closed underneath a watcher is an error rather than a use-after-free.
-pub fn watch(
+/// releases it, and every pane is looked up again after each wake. A pane that
+/// disappears mid-watch is reported as `exited` rather than failing the call --
+/// its going away is news for the agent, and the other panes are still worth
+/// watching. A pane that does not exist when the call starts is an error,
+/// because that is a caller mistake rather than an event.
+pub fn watchAny(
     self: *Registry,
-    id: u64,
+    targets: []const WatchTarget,
     alloc: std.mem.Allocator,
     opts: WatchOptions,
 ) !?WatchEvent {
+    if (targets.len == 0) return Error.PaneNotFound;
+
     const total_ns = @as(u64, opts.timeout_ms) * std.time.ns_per_ms;
     var timer: ?std.time.Timer = std.time.Timer.start() catch null;
+
+    // Per-pane bookkeeping, sized to the request. Watching a handful of panes is
+    // the case; a stack buffer avoids an allocation per watch.
+    var start_gen_buf: [max_watch_targets]u64 = undefined;
+    var seen_gen_buf: [max_watch_targets]u64 = undefined;
+    const n = @min(targets.len, max_watch_targets);
 
     self.mutex.lock();
     defer self.mutex.unlock();
 
-    // The baseline: what was already true when the watch began is not news.
-    var start_gen: u64 = 0;
-    {
-        const pane = self.panes.get(id) orelse return Error.PaneNotFound;
-        const first = try pane.observe(alloc);
-        defer alloc.free(first.text);
-        start_gen = opts.since_gen orelse first.gen;
+    for (targets[0..n], 0..) |t, i| {
+        const pane = self.panes.get(t.id) orelse return Error.PaneNotFound;
+        if (t.since_gen) |g| {
+            start_gen_buf[i] = g;
+        } else {
+            const first = try pane.observe(alloc);
+            defer alloc.free(first.text);
+            start_gen_buf[i] = first.gen;
+        }
+        seen_gen_buf[i] = start_gen_buf[i];
     }
+
+    // Rotated each pass so a chatty pane cannot starve the others of attention.
+    var rotate: usize = 0;
 
     while (true) {
         if (self.stopping) return null;
-        const pane = self.panes.get(id) orelse return Error.PaneNotFound;
 
-        const o = try pane.observe(alloc);
-        var keep_text = false;
-        defer if (!keep_text) alloc.free(o.text);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const idx = (i + rotate) % n;
+            const t = targets[idx];
 
-        const reason = wake.classify(.{
-            .text = o.text,
-            .alt_screen = o.alt_screen,
-            // "Was it already full-screen?" is answered by when it changed, not
-            // by what it looked like when this call happened to start.
-            .was_alt_screen = o.alt_change_gen <= start_gen,
-            .exited = o.exited,
-            .saw_output = o.gen > start_gen,
-            .idle_ms = o.idle_ms,
-            .stall_ms = opts.stall_ms,
-            .prompt = opts.prompt,
-        });
-
-        if (reason) |r| {
-            keep_text = true;
-            return .{
-                .reason = r,
-                .text = o.text,
-                .idle_ms = o.idle_ms,
-                .alt_screen = o.alt_screen,
-                .exited = o.exited,
+            const pane = self.panes.get(t.id) orelse return .{
+                .surface_id = t.id,
+                .reason = .exited,
+                .text = try alloc.dupe(u8, ""),
+                .idle_ms = 0,
+                .alt_screen = false,
+                .exited = true,
             };
+
+            // Cheap first. Nothing new, nothing overdue and still alive means
+            // there is nothing this pane could be reporting.
+            const p = pane.pulse();
+            const saw_output = p.gen > start_gen_buf[idx];
+            const overdue = saw_output and p.idle_ms >= opts.stall_ms;
+            if (!p.exited and p.gen == seen_gen_buf[idx] and !overdue) continue;
+            seen_gen_buf[idx] = p.gen;
+
+            const o = try pane.observe(alloc);
+            var keep_text = false;
+            defer if (!keep_text) alloc.free(o.text);
+
+            const reason = wake.classify(.{
+                .text = o.text,
+                .alt_screen = o.alt_screen,
+                // "Was it already full-screen?" is answered by when it changed,
+                // not by what it looked like when this call happened to start.
+                .was_alt_screen = o.alt_change_gen <= start_gen_buf[idx],
+                .exited = o.exited,
+                .saw_output = o.gen > start_gen_buf[idx],
+                .idle_ms = o.idle_ms,
+                .stall_ms = opts.stall_ms,
+                .prompt = opts.prompt,
+            });
+
+            if (reason) |r| {
+                keep_text = true;
+                return .{
+                    .surface_id = t.id,
+                    .reason = r,
+                    .text = o.text,
+                    .idle_ms = o.idle_ms,
+                    .alt_screen = o.alt_screen,
+                    .exited = o.exited,
+                };
+            }
         }
+        rotate +%= 1;
 
         const elapsed = if (timer) |*t| t.read() else total_ns;
         if (elapsed >= total_ns) return null;
@@ -390,6 +451,17 @@ pub fn watch(
         const slice = @min(remaining, @min(wait_slice_ns * 4, opts.stall_ms * std.time.ns_per_ms));
         self.change.timedWait(&self.mutex, @max(slice, wait_slice_ns)) catch {};
     }
+}
+
+/// Watch a single pane. The common case, in terms of the general one.
+pub fn watch(
+    self: *Registry,
+    id: u64,
+    alloc: std.mem.Allocator,
+    opts: WatchOptions,
+) !?WatchEvent {
+    const targets = [_]WatchTarget{.{ .id = id, .since_gen = opts.since_gen }};
+    return self.watchAny(&targets, alloc, opts);
 }
 
 /// A pane's change counter. See `Pane.gen`.
@@ -742,4 +814,87 @@ test "a quiet pane reports nothing rather than inventing a reason" {
     if (ev) |e| alloc.free(e.text);
     try std.testing.expect(ev == null);
     try std.testing.expect(timer.read() >= 600 * std.time.ns_per_ms);
+}
+
+test "watching several panes answers about whichever one fires" {
+    const alloc = std.testing.allocator;
+    var reg = init(alloc);
+    defer reg.deinit();
+
+    try reg.open(1, .{ .argv = &.{"/bin/sh"} });
+    try reg.open(2, .{ .argv = &.{"/bin/sh"} });
+
+    var attach: std.ArrayListUnmanaged(u8) = .{};
+    defer attach.deinit(alloc);
+    _ = try reg.screen(1, alloc, &attach, .{});
+    _ = try reg.screen(2, alloc, &attach, .{});
+    _ = try settle(&reg, 1, alloc, 0);
+    _ = try settle(&reg, 2, alloc, 0);
+
+    const gen1 = try reg.generation(1);
+    const gen2 = try reg.generation(2);
+
+    // Only the second pane is given anything to do. The first cannot fire,
+    // because nothing has happened on it since its baseline -- which is also
+    // what stops a quiet pane reporting its old prompt as news.
+    try reg.write(2, "echo ONLY_HERE\n");
+
+    const targets = [_]WatchTarget{
+        .{ .id = 1, .since_gen = gen1 },
+        .{ .id = 2, .since_gen = gen2 },
+    };
+    const ev = try reg.watchAny(&targets, alloc, .{ .stall_ms = 400, .timeout_ms = 20_000 });
+    try std.testing.expect(ev != null);
+    defer alloc.free(ev.?.text);
+
+    try std.testing.expectEqual(@as(u64, 2), ev.?.surface_id);
+    try std.testing.expectEqual(wake.Reason.command_complete, ev.?.reason);
+    try std.testing.expect(std.mem.indexOf(u8, ev.?.text, "ONLY_HERE") != null);
+}
+
+test "a watched pane closed underneath is reported, not an error for the rest" {
+    const alloc = std.testing.allocator;
+    var reg = init(alloc);
+    defer reg.deinit();
+
+    try reg.open(1, .{ .argv = &.{"/bin/sh"} });
+    try reg.open(2, .{ .argv = &.{"/bin/sh"} });
+
+    var attach: std.ArrayListUnmanaged(u8) = .{};
+    defer attach.deinit(alloc);
+    _ = try reg.screen(1, alloc, &attach, .{});
+    _ = try reg.screen(2, alloc, &attach, .{});
+    const q1 = try settle(&reg, 1, alloc, 0);
+    const q2 = try settle(&reg, 2, alloc, 0);
+    _ = q1;
+    _ = q2;
+
+    const Closer = struct {
+        reg: *Registry,
+        fn run(self: *@This()) void {
+            std.Thread.sleep(400 * std.time.ns_per_ms);
+            self.reg.close(2) catch {};
+        }
+    };
+    var closer: Closer = .{ .reg = &reg };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    defer thread.join();
+
+    const targets = [_]WatchTarget{ .{ .id = 1 }, .{ .id = 2 } };
+    const ev = try reg.watchAny(&targets, alloc, .{ .stall_ms = 9000, .timeout_ms = 20_000 });
+
+    // A pane going away is news the agent wants, not a failure that should
+    // abandon the panes it is still watching.
+    try std.testing.expect(ev != null);
+    defer alloc.free(ev.?.text);
+    try std.testing.expectEqual(@as(u64, 2), ev.?.surface_id);
+    try std.testing.expectEqual(wake.Reason.exited, ev.?.reason);
+}
+
+test "watching no panes at all is a caller mistake" {
+    const alloc = std.testing.allocator;
+    var reg = init(alloc);
+    defer reg.deinit();
+    const empty = [_]WatchTarget{};
+    try std.testing.expectError(Error.PaneNotFound, reg.watchAny(&empty, alloc, .{}));
 }

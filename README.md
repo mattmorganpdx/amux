@@ -63,14 +63,31 @@ zig build        # produces zig-out/bin/{amux, amux-cli, amuxd}
 ### Install
 
 ```bash
-./install.sh     # copies amux and amux-cli to /usr/local/bin
+./install.sh     # symlinks amux, amux-cli and amuxd onto PATH
 ```
+
+Symlinks by default, into `~/.local/bin` when that is on your PATH (no sudo).
+A rebuild is then picked up automatically. Copies go stale silently — an old
+binary still launches, so the failure looks like a bug rather than a stale
+install — but `./install.sh --copy` is there if you want a fixed install, and
+`--prefix DIR` chooses where. The script warns if another `amux` is left
+elsewhere on PATH, because PATH order decides which one you get.
+
+### Run the daemon (recommended)
+
+```bash
+./dist/systemd/install.sh     # socket activation as a user unit
+```
+
+After this the first `amux-cli` call starts `amuxd` on demand. Terminals live in
+the daemon, so they keep running whether or not the GUI is open, and `amux-cli`
+works with no display and no window.
 
 ### Run
 
 ```bash
-amux             # launch the terminal
-amux-cli ping    # verify the socket is up (from another terminal)
+amux             # the GUI; attaches to the daemon if one is reachable
+amux-cli ping    # starts the daemon on demand under socket activation
 ```
 
 ## CLI reference

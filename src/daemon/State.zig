@@ -541,18 +541,31 @@ pub fn restoreSession(self: *State) !usize {
     };
     defer session.freeSessionSnapshot(self.alloc, &snap);
 
+    var highest_id: u64 = 0;
+
     for (snap.workspaces) |ws_snap| {
-        const ws = try self.tab_manager.createWorkspace();
+        // Rebuilt under the id it was saved with, rather than through
+        // `createWorkspace`, which allocates a fresh one. That renumbered every
+        // workspace on restart: pane ids survived, because they are pane-tree
+        // node ids that the layout carries, but workspace ids did not. Anything
+        // holding one across a restart then pointed somewhere else -- including
+        // the `workspace_id` recorded on every archived history row, which is
+        // how sessions are scoped when you go looking for them later.
+        //
+        // Building it directly also skips the root pane `createWorkspace` makes
+        // and the saved layout immediately replaces.
+        const ws = try self.alloc.create(Workspace);
+        errdefer self.alloc.destroy(ws);
+        ws.* = Workspace.initShared(self.alloc, ws_snap.id, &self.tab_manager.next_node_id);
+        errdefer ws.deinit();
+
         if (ws_snap.title.len > 0) ws.setTitle(ws_snap.title);
         if (ws_snap.cwd.len > 0) ws.setCwd(ws_snap.cwd);
         if (ws_snap.color.len > 0) ws.setColor(ws_snap.color);
         ws.pinned = ws_snap.pinned;
 
-        // Drop the auto-created root before rebuilding the saved layout, or it
-        // lingers unreachable in `nodes` and inflates paneCount.
-        ws.pane_tree.nodes.clearRetainingCapacity();
-        ws.pane_tree.root = null;
-        ws.pane_tree.focused_pane = null;
+        try self.tab_manager.workspaces.append(self.alloc, ws);
+        if (ws_snap.id > highest_id) highest_id = ws_snap.id;
 
         const root = session.restorePaneTree(&ws.pane_tree, &ws_snap) catch null;
         if (root == null) {
@@ -567,7 +580,19 @@ pub fn restoreSession(self: *State) !usize {
         for (ids.items) |pane_id| try self.spawnPaneLocked(pane_id, ws);
     }
 
-    if (snap.selected_workspace_index) |i| self.tab_manager.selectIndex(i);
+    // Never hand out an id that is already in use. The saved counter is the
+    // right answer; the max guards a session file written by an older build or
+    // edited by hand.
+    self.tab_manager.next_id = @max(snap.next_workspace_id, highest_id + 1);
+
+    if (snap.selected_workspace_index) |i| {
+        self.tab_manager.selectIndex(i);
+    } else if (self.tab_manager.workspaces.items.len > 0) {
+        // `createWorkspace` used to select the first one as a side effect. With
+        // the workspaces built directly, nothing would be selected and every
+        // call that resolves "the current workspace" would fail.
+        self.tab_manager.selectIndex(0);
+    }
     self.bumpLayoutLocked();
     log.info("restored {d} workspace(s)", .{snap.workspaces.len});
     return snap.workspaces.len;
@@ -730,6 +755,7 @@ test "closing a workspace takes its terminals with it" {
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "writes and reads reach the addressed pane" {
     const alloc = std.testing.allocator;
@@ -847,4 +873,70 @@ test "waiting on metadata reports a change, and reports nothing when there is no
     const got = state.waitForMeta(seq, 150);
     try std.testing.expect(got != null);
     try std.testing.expect(got.? > seq);
+}
+
+test "a restart keeps workspace ids, including the gaps" {
+    const alloc = std.testing.allocator;
+
+    // A session file of our own, so the test cannot touch a real one.
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/amux-idtest-{d}.json", .{std.os.linux.getpid()});
+    _ = setenv("AMUX_SESSION", path, 1);
+    _ = setenv("SHELL", "/bin/sh", 1);
+    defer {
+        _ = unsetenv("AMUX_SESSION");
+        std.fs.deleteFileAbsolute(path) catch {};
+    }
+    // Restore is what is under test, so make sure it is not switched off.
+    _ = unsetenv("AMUX_DISABLE_SESSION_RESTORE");
+
+    var saved_ids: [3]u64 = undefined;
+    {
+        var state = init(alloc);
+        defer state.deinit();
+
+        const a = try state.createWorkspace("first", null);
+        const b = try state.createWorkspace("second", null);
+        const c = try state.createWorkspace("third", null);
+
+        // Close the middle one, so the surviving ids are not 1..n. Renumbering
+        // is invisible when they are contiguous, which is exactly why it went
+        // unnoticed.
+        try state.closeWorkspace(b);
+        const d = try state.createWorkspace("fourth", null);
+
+        saved_ids = .{ a, c, d };
+        try std.testing.expect(c != 2); // the gap is real
+        try state.saveSession();
+    }
+
+    var restored = init(alloc);
+    defer restored.deinit();
+    const n = try restored.restoreSession();
+    try std.testing.expectEqual(@as(usize, 3), n);
+
+    var got: [3]u64 = undefined;
+    const Collect = struct {
+        out: *[3]u64,
+        i: usize = 0,
+        fn append(self: *@This(), ws: *Workspace, selected: bool, index: usize) anyerror!void {
+            _ = selected;
+            _ = index;
+            if (self.i < self.out.len) {
+                self.out[self.i] = ws.id;
+                self.i += 1;
+            }
+        }
+    };
+    var collect: Collect = .{ .out = &got };
+    try restored.withWorkspaces(&collect, Collect.append);
+
+    try std.testing.expectEqualSlices(u64, &saved_ids, &got);
+
+    // And the next workspace created must not collide with a restored one.
+    const next = try restored.createWorkspace("fifth", null);
+    for (saved_ids) |id| try std.testing.expect(next != id);
+
+    // Something has to be selected, or every "current workspace" call fails.
+    try std.testing.expect(restored.selectedWorkspaceId() != null);
 }

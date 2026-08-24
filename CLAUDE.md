@@ -170,7 +170,9 @@ places.
 
 **The GUI still runs its own socket server too, and both default to
 `/tmp/amux.sock`** — give one an `AMUX_SOCKET` override while both exist. The
-GUI becomes a client of the daemon in work-plan item 6.
+The GUI is a client of the daemon for terminals and layout (work-plan item 6);
+it keeps its own server for GUI-only chrome — the palette, window actions,
+sidebar toggles — which the daemon cannot execute.
 
 Each server's **session file is scoped to its socket**, so the two no longer
 overwrite each other's layout: `/tmp/amux.sock` keeps the historical
@@ -359,9 +361,17 @@ a build stage that produces nothing — reads as `output_stalled`, because from
 outside it is indistinguishable from waiting for input. Raise `--stall-ms` above
 the pauses you expect.
 
-Only `tui_detected` and `exited` are exact; the rest are heuristics, and
-`prompt_waiting` only inspects the **last** line — a question answered a moment
-ago is still on screen, and matching it again woke agents with the wrong reason.
+How much to trust each reason depends on shell integration:
+
+- `tui_detected` and `exited` are always exact — the VT engine reports the screen
+  type and the child's death as facts.
+- `command_complete` is exact **with** shell integration (the shell says it is at
+  a prompt) and a guess without it (does the last line look like a prompt?).
+- `prompt_waiting` and `output_stalled` are always heuristics. `prompt_waiting`
+  inspects only the **last** line, because a question answered a moment ago is
+  still on screen and matching it again woke agents with the wrong reason.
+
+The `shell_integration` field on each reply says which you got.
 
 ### Session history
 
@@ -392,10 +402,15 @@ Tests:
 zig build test
 ```
 
-37 tests covering what needs no GTK or libghostty: `src/vt.zig` (the seam onto
-the `ghostty-vt` headless engine) and the daemon — ptys, panes, the registry,
-state, the socket front door and the history store. The GUI still has to be
-exercised by running it.
+101 tests covering what needs no GTK or libghostty: `src/vt.zig` (the seam onto
+the `ghostty-vt` headless engine), `src/session.zig`, and the daemon — ptys,
+panes, the registry, state, the socket front door, the history store, the screen
+and paint encoders, wake classification, OSC 133 extraction and notifications.
+The GUI still has to be exercised by running it.
+
+Note that `zig build test` does **not** reinstall the binaries. Run `zig build`
+before testing a change against a live daemon, or you will be exercising the
+previous build — which has cost real debugging time.
 
 ### Rebuilding libghostty
 

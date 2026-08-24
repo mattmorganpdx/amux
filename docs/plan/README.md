@@ -8,6 +8,9 @@ without reading the others.
 
 Roughly dependency-ordered. **D** = de-risking, do early.
 
+**All eight are done.** Work that came after them is recorded in
+[After the plan](#after-the-plan) at the end of this file.
+
 | # | Item | Depends on |
 |---|------|-----------|
 | 1 | ~~**D** Prototype: Ghostty OpenGL renderer drawing an amux-owned `Terminal`~~ **done** | — |
@@ -177,9 +180,15 @@ shell integration emits OSC 133 marks and the VT engine already parses them, so
 the daemon could know exactly where output starts and stops instead of guessing.
 Worth doing when shell integration moves across.
 
+**Since done.** See "After the plan" below: `amux-cli shell-init` ships the
+integration, and `surface.run` reads output from the marks when a shell has them,
+falling back to this heuristic when it does not.
+
 ### Operational note
 
-The GUI still runs its own socket server until item 6, and both default to
+The GUI still runs its own socket server -- item 6 decided to keep it rather
+than delete it, since it is the only thing that can execute GUI chrome -- and
+both default to
 `/tmp/amux.sock`. They cannot both use the default path; give one an
 `AMUX_SOCKET` override while both exist.
 
@@ -291,8 +300,11 @@ debugging a daemon that is demonstrably running and demonstrably unreachable.
   stamps every row and sets `full`, so a client throws its grid away -- there is
   just no method to ask for one.
 - **The viewport only.** `RenderState` is viewport-specific, so this sends what
-  is on screen, not scrollback. Scrolling an attached client means moving the
-  daemon's viewport, which needs a method that does not exist yet. Item 6.
+  is on screen, not scrollback. Scrolling an attached client would mean moving
+  the daemon's viewport, which still has no method. Item 6 made this moot in
+  practice rather than solving it: the GUI attaches through a relay, so its own
+  terminal keeps the scrollback and scrolls locally. It would matter again for a
+  client that renders these cells directly.
 
 52 tests, 10 of them new. Verified by mutation: disabling the delta filter fails
 the delta test, and looking the pane up once instead of on every wake turns the
@@ -422,3 +434,86 @@ sequence again until it returned. A split blanked the sidebar for up to ten
 seconds. The rebuild now fetches metadata itself, which is right on its own terms
 -- that is the one moment we *know* the objects have lost it, rather than a
 moment when some thread might eventually notice.
+
+---
+
+## After the plan
+
+The eight items above separated the daemon from the GUI. What followed came from
+using the result, and is recorded here because none of it was planned.
+
+### Smart Wake — `surface.watch`
+
+An agent running a long command had to choose between sleeping and re-reading,
+which spends a turn on every dead poll, and a completion callback, which is worse
+because commands stop for reasons other than finishing. `surface.watch` blocks
+until something happens worth a turn and says which: `command_complete`,
+`prompt_waiting`, `tui_detected`, `output_stalled`, `exited`, or `timeout`.
+Several panes can be watched at once, answering about whichever fires first.
+
+The judgement lives in `src/daemon/wake.zig` as pure functions over an observed
+screen, so it is tested against synthetic terminals rather than by driving real
+programs and hoping.
+
+Three bugs only running it against real programs found, all the same shape --
+races between the command and the watch starting. The baseline cannot be
+"whenever the watch began", or a command that finishes in the gap is never
+reported; the alternate-screen check has the same problem, so panes record the
+generation at which the screen type changed; and matching a question anywhere in
+the last few lines re-matched one answered a moment ago, so only the last line
+counts.
+
+### OSC 133 shell integration
+
+`surface.run` worked out a command's output by matching the echoed command
+against the screen and looking for something prompt-shaped -- the heuristic
+recorded under item 4. With shell integration the shell marks its own boundaries
+and there is nothing to infer.
+
+`amux-cli shell-init bash` (and `zsh`) prints an integration to eval from an rc
+file. Nothing needed parsing: the readonly stream amux already drives handles
+OSC 133, so cells arrive tagged prompt, input or output.
+
+This also produced the one change to the ghostty fork: the parser already read
+the exit status off `OSC 133;D` but `end_command` discarded it, so `surface.run`
+could say what a command printed but not whether it worked. The fork now records
+it on the `Terminal`. Committed to `matt/linux-embedded-apprt`, the branch the
+submodule tracks.
+
+Both `surface.run` and `surface.watch` report `shell_integration` so a caller
+knows whether it got a fact or a guess, and both fall back unchanged for shells
+without it.
+
+### What dogfooding found
+
+Installing it and running this project's own build through it turned up three
+things in the first ten minutes, none of which any test here would have caught:
+
+- **Panes started in the wrong directory.** They inherited the daemon's cwd,
+  which under systemd is `$HOME`, so a fresh workspace could not build the
+  project it was created for. `workspace create` now sends the caller's
+  directory, as `tmux new-session` does.
+- **Every command ran under a 1024 open-file limit.** Panes inherit the daemon's
+  limits and systemd defaults `LimitNOFILE` low. Nothing failed loudly; the test
+  suite just took 300 seconds instead of 9, and then failed.
+- **Input sent immediately after creating a pane could be silently discarded.**
+  A shell flushes pending terminal input while setting up job control, and
+  creating a pane and immediately sending a command is the normal thing for an
+  agent to do. Panes now hold the first writes until the child speaks or a grace
+  period passes.
+
+A fourth came from the GUI: `install.sh` copied two of the three binaries into
+`/usr/local/bin`, so it went stale the moment you rebuilt and said nothing about
+it. An old binary still launches, which makes the failure look like a bug in the
+tool rather than a stale install.
+
+### Still open
+
+- **Multi-agent state detection.** amux knows what a *shell* is doing. It does
+  not classify what a *coding agent* is doing beyond the Claude hooks, which
+  require the wrapper. Other tools in this space infer it from per-agent output
+  manifests, which is broader and more brittle.
+- **Transparent command routing** (roadmap phase 2), now more tractable because
+  the prompt guessing it was going to be built on has been replaced.
+- **History rows archived before workspace ids were made stable** may reference a
+  workspace id that has since moved.

@@ -14,29 +14,46 @@ With amux, the agent sends the command to a terminal pane and reads the screen i
 amux-cli send --enter "ssh myserver"        # fire and forget
 amux-cli surface read-text                   # what's on screen?
 amux-cli send --enter "yes"                  # respond to host key prompt
-amux-cli surface read-text                   # connected!
-amux-cli send --enter "sudo apt upgrade -y"  # start the upgrade
-# ... go do other work in another pane ...
-amux-cli surface read-text                   # check back later
+
+GEN=$(amux-cli send --enter "sudo apt upgrade -y" | jq -r .result.gen)
+amux-cli watch --since $GEN --timeout 600000 # blocks until it needs you
 ```
 
 This is the async observe-and-react model. The agent is never blocked.
 
+`watch` is the part that saves turns. Rather than sleeping and re-reading —
+spending a turn on every dead poll — it returns the moment something happens
+worth looking at, and says which: the command finished, a prompt is waiting, a
+full-screen program took over, output stalled, or the process exited. Several
+panes can be watched at once, answering about whichever needs attention first.
+
 ## Features
 
-- **42 socket API methods** — JSON-RPC over Unix socket (`/tmp/amux.sock`)
-- **CLI tool** (`amux-cli`) — standalone binary, no runtime dependencies beyond libc
+- **A daemon that owns the terminals** (`amuxd`) — sessions keep running whether
+  or not any window is open, and survive it being closed and reopened.
+  Socket-activated under systemd, so the first call starts it (~40ms)
+- **41 socket API methods on the daemon** — JSON-RPC over a Unix socket, newline
+  delimited. `amux-cli` is a standalone binary needing nothing beyond libc, and
+  works with no display and no GUI running
+- **`watch`** — block until a pane needs attention, with the reason
+  (`command_complete`, `prompt_waiting`, `tui_detected`, `output_stalled`,
+  `exited`), across one pane or several
+- **OSC 133 shell integration** — the shell marks where prompts end and output
+  begins, so `run` returns exactly what a command printed **and its exit status**
+  rather than inferring both from the screen
+- **Session history** — scrollback archived to SQLite when a terminal ends, with
+  FTS5 full-text search over closed sessions
+- **The GUI as a view onto the daemon** — GTK4 with GPU-accelerated Ghostty
+  rendering; splits and workspaces made from the CLI appear in it live
 - **Split panes** — horizontal/vertical splits, resize, swap, navigate
 - **Workspaces** — create, switch, rename, pin, color-code, close
-- **Session persistence** — layout, titles, working directories survive restarts
-- **Sidebar** — git branch, status metadata, progress bars, log entries
+- **Sidebar** — git branch, status metadata, progress bars, log entries, fed by
+  the daemon so agents can report progress with no window open
 - **Command palette** — fuzzy search, keyboard shortcuts
-- **Terminal search** — integrated with Ghostty's search engine
-- **Shell integration** — bash/zsh scripts report git status to the sidebar
-- **Claude Code integration** — automatic session tracking and sidebar status
-- **Desktop notifications** — via libnotify
-- **Synchronous dispatch** — all mutating operations return real success/error responses
-- **Bash routing hook** — Claude Code `PreToolUse` hook that redirects interactive commands through amux
+- **Terminal search** — Ghostty's search engine for live panes, SQL/FTS5 for
+  closed ones
+- **Claude Code integration** — session tracking and sidebar status via hooks
+- **Desktop notifications** — via libnotify, from records the daemon keeps
 
 ## Protocol compatibility
 

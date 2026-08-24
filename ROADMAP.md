@@ -47,7 +47,7 @@ Everything below was completed while amux was still the `linux/` directory of th
 - [x] Unix domain socket server (`/tmp/amux.sock`)
 - [x] Newline-delimited JSON-RPC protocol (cmux V2 compatible)
 - [x] Background accept thread + per-client handler threads
-- [x] 42 API methods implemented (see CLI reference in README)
+- [x] Socket API implemented — 41 methods on the daemon, 43 on the GUI's chrome server (see the CLI reference in README)
 - [x] Handle registry for ref-string generation
 
 ### Phase 5: CLI Tool
@@ -96,7 +96,7 @@ The Bash routing hook (Phase 1 complete) proved the concept: intercepting comman
 **Phase 2: Transparent command routing**
 - [ ] Instead of blocking interactive commands, transparently rewrite them to run through amux-cli
 - [ ] Send command to a pane, poll `surface read-text` for shell prompt, return output
-- [ ] Handle "command is done" detection via prompt pattern matching
+- [x] Handle "command is done" detection — done better than planned: with shell integration the shell says where its prompt is (OSC 133), so this is a fact rather than pattern matching. Pattern matching remains as the fallback for unintegrated shells
 - [ ] Timeout fallback with partial output
 
 **`amux-cli run` command**
@@ -166,7 +166,7 @@ One of the key values of watching an agent work in amux is seeing what it does. 
 - [x] **Force `TERM=xterm-256color`** — Ghostty's resource directory resolver false-positives on ncurses-shipped terminfo entries (e.g. Arch Linux), setting `TERM=xterm-ghostty` which doesn't exist on most systems, breaking backspace and other keys. Fixed via `resources/ghostty.conf` loaded as amux defaults before user config.
 - [ ] **`workspace next`/`previous` wrap-around** — currently errors at boundaries, should optionally wrap
 - [ ] **Connection health monitoring** — detect when SSH sessions die, notify the agent
-- [ ] **Process status per pane** — track whether the shell is at a prompt or running a command
+- [x] **Process status per pane** — track whether the shell is at a prompt or running a command (exact via OSC 133; `surface.watch` reports it, and `surface.run` reports the exit status)
 - [ ] **Crash recovery** — if amux crashes, restore sessions from the last auto-save on relaunch
 
 ### Hardening
@@ -265,4 +265,4 @@ its own VT parser and the GUI does not need its own text renderer.
 
 ## Current state
 
-As of 2026-08-19: amux is a fully functional agent-first terminal multiplexer with 47 socket API methods, a complete CLI, session persistence with scrollback history, Claude Code integration, and a Phase 1 Bash routing hook. Terminal history is saved on pane close and app exit (with content deduplication to avoid redundant saves), and restored on session reload. An in-app history browser (Ctrl+Shift+H) lets users browse, preview, and restore past terminal sessions as new workspaces. The `amux-cli run` command enables agents to send a command and get output back in a single call with prompt detection. A full code review identified thread safety, input validation, and protocol hardening issues now tracked in the Hardening section — 31 are fixed, none open. The most significant round closed a use-after-free and data race on `pane_widgets` (all pane→surface resolution now happens on the GTK main thread), a path traversal through history entry IDs, unescaped user text in every CLI-built JSON request, and a per-connection thread leak in the socket server. The project pins Zig 0.15.2; Zig 0.16 cannot build it because translate-c fails on the GTK4 headers. TERM is forced to xterm-256color and dark mode is enabled by default. It is being actively dogfooded — this roadmap was written, and the bugs in it were found and fixed, by AI agents using amux as their own development environment.
+As of 2026-08-24: amux is split into a daemon that owns the terminals (`amuxd`), a GTK4 GUI that is a view onto it, and a CLI that works with neither running. The daemon is socket-activated under systemd, so the first call starts it in about 40ms; sessions keep running whether or not a window is open, and reopening the window shows them with the screen they had. It answers 41 socket methods; the GUI keeps a server of its own (43 methods) for chrome the daemon cannot execute — the command palette, window actions, sidebar toggles. Agents get `surface.watch`, which blocks until a pane needs attention and says why (`command_complete`, `prompt_waiting`, `tui_detected`, `output_stalled`, `exited`) across one pane or several, replacing the sleep-and-re-read loop that spent a turn on every dead poll. With OSC 133 shell integration (`amux-cli shell-init bash`) the shell marks its own boundaries, so `surface.run` returns exactly what a command printed and its exit status rather than inferring both from the screen; that required a one-field patch to the ghostty fork, which had been discarding the status. Scrollback is archived to SQLite with FTS5 search when a terminal ends. 101 tests cover everything that needs no GTK or libghostty, and the load-bearing assertions are checked by mutation. The eight-item daemon separation plan is complete (`docs/plan/README.md`). The project pins Zig 0.15.2; Zig 0.16 cannot build it because translate-c fails on the GTK4 headers. It is being actively dogfooded — which is where the last round of bugs came from: panes starting in the wrong directory, every command running under a 1024 open-file limit inherited from systemd, and input sent immediately after creating a pane being silently discarded.
